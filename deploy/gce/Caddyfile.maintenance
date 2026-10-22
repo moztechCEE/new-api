@@ -1,0 +1,6 @@
+{$NEW_API_HOST} {
+  header X-Content-Type-Options nosniff
+  header X-Frame-Options DENY
+  header Referrer-Policy no-referrer
+  respond "New API DEV setup in progress. Administrative access is restricted." 503
+}

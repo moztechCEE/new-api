@@ -1,0 +1,12 @@
+[Unit]
+Description=Isolated New API DEV PostgreSQL and configuration backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+WorkingDirectory=/opt/new-api-dev
+ExecStart=/usr/bin/python3 /opt/new-api-dev/backup.py
+NoNewPrivileges=true

@@ -1,0 +1,14 @@
+{$NEW_API_HOST} {
+  header X-Content-Type-Options nosniff
+  header X-Frame-Options DENY
+  header Referrer-Policy no-referrer
+  header Strict-Transport-Security "max-age=86400"
+  @setup_write {
+    method POST
+    path /api/setup
+  }
+  respond @setup_write 404
+  reverse_proxy new-api:3000 {
+    flush_interval -1
+  }
+}

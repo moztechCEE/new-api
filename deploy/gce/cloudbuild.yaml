@@ -19,7 +19,8 @@ steps:
     args:
       - -ceu
       - |
-        apk add --no-cache make git
+        apk add --no-cache make git python3
+        PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s deploy/gce -p 'test_*.py' -v
         mkdir -p web/dist
         touch web/dist/index.html
         go vet ./...
@@ -27,16 +28,28 @@ steps:
         (cd tokenkit && go vet ./... && go build ./...)
         go build ./...
         make test
+  - id: bun-tool
+    name: gcr.io/cloud-builders/docker
+    entrypoint: sh
+    args:
+      - -ceu
+      - |
+        mkdir -p /workspace/bin
+        docker create --name new-api-bun-tool oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
+        docker cp new-api-bun-tool:/usr/local/bin/bun /workspace/bin/bun
+        docker rm new-api-bun-tool
   - id: frontend
-    name: oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
+    name: node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
     dir: /workspace/source/web
     entrypoint: sh
     args:
       - -ceu
       - |
+        export PATH=/workspace/bin:$$PATH
+        node -e 'if (!process.versions.node || process.versions.bun) process.exit(1); console.log("Node runtime " + process.versions.node)'
         bun install --frozen-lockfile
         bun run typecheck
-        bun run test
+        node node_modules/vitest/vitest.mjs run
         DISABLE_ESLINT_PLUGIN=true bun run build
   - id: image
     name: gcr.io/cloud-builders/docker
@@ -47,4 +60,4 @@ timeout: 3600s
 options:
   logging: CLOUD_LOGGING_ONLY
   machineType: E2_HIGHCPU_8
-  diskSizeGb: 100
+  diskSizeGb: '100'

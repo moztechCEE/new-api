@@ -57,6 +57,24 @@ services:
     logging:
       driver: json-file
       options: {max-size: '10m', max-file: '3'}
+  caddy:
+    image: ${CADDY_IMAGE:?Set a pinned Caddy image digest}
+    profiles: ['https']
+    restart: unless-stopped
+    ports: ['80:80', '443:443']
+    volumes: ['./Caddyfile:/etc/caddy/Caddyfile:ro', './caddy/data:/data', './caddy/config:/config']
+    environment: ['NEW_API_HOST=newapi-dev.corely.cc']
+    networks:
+      default: {ipv4_address: 172.29.0.10}
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: {max-size: '10m', max-file: '3'}
 secrets:
   postgres_password: {file: ./secrets/postgres_password}
   redis_conf: {file: ./secrets/redis.conf}
+networks:
+  default:
+    ipam:
+      config: [{subnet: 172.29.0.0/24}]
