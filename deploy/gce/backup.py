@@ -27,7 +27,7 @@ try:
         subprocess.run(['docker', 'compose', 'exec', '-T', 'postgres', 'pg_dump', '-U', 'newapi', '-d', 'newapi', '--no-owner', '--no-acl'], cwd=root, stdout=stream, check=True, timeout=600)
     with tarfile.open(archive, 'x:gz') as backup:
         backup.add(dump, arcname='database.sql')
-        for name in ('compose.yaml', '.env', 'runtime.env', 'secrets', 'data'):
+        for name in ('compose.yaml', '.env', 'runtime.env', 'Caddyfile', 'secrets', 'data'):
             backup.add(root / name, arcname=name)
     metadata = urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor': 'Google'})
     with urllib.request.urlopen(metadata, timeout=15) as response:
