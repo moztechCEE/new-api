@@ -10,3 +10,12 @@ docs
 /web/node_modules
 /web/dist
 !THIRD-PARTY-LICENSES.md
+.env
+.env.*
+!.env.example
+.deploy-secrets
+data
+logs
+backups
+*.pem
+*.key

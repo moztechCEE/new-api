@@ -1,0 +1,62 @@
+name: new-api-dev
+services:
+  new-api:
+    image: ${NEW_API_IMAGE:?Set a pinned image digest}
+    restart: unless-stopped
+    command: ['--log-dir', '/app/logs']
+    ports: ['127.0.0.1:3000:3000']
+    env_file: ['runtime.env']
+    volumes: ['./data:/data', './logs:/app/logs']
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    security_opt: ['no-new-privileges:true']
+    cap_drop: ['ALL']
+    mem_limit: 1600m
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O - http://127.0.0.1:3000/api/status | grep -q ''"success":true''']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: {max-size: '10m', max-file: '3'}
+  postgres:
+    image: ${POSTGRES_IMAGE:?Set a pinned PostgreSQL image digest}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: newapi
+      POSTGRES_DB: newapi
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: ['postgres_password']
+    volumes: ['./postgres:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U newapi -d newapi']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options: {max-size: '10m', max-file: '3'}
+  redis:
+    image: ${REDIS_IMAGE:?Set a pinned Redis image digest}
+    restart: unless-stopped
+    command: ['redis-server', '/run/secrets/redis_conf']
+    secrets: ['redis_conf']
+    volumes: ['./redis:/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'REDISCLI_AUTH=$$(sed -n ''s/^requirepass //p'' /run/secrets/redis_conf) redis-cli ping | grep -qx PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: {max-size: '10m', max-file: '3'}
+secrets:
+  postgres_password: {file: ./secrets/postgres_password}
+  redis_conf: {file: ./secrets/redis.conf}

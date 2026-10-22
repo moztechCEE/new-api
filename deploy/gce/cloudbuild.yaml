@@ -1,0 +1,50 @@
+steps:
+  - id: source
+    name: gcr.io/cloud-builders/git
+    entrypoint: sh
+    args:
+      - -ceu
+      - |
+        git init /workspace/source
+        cd /workspace/source
+        git remote add origin https://github.com/moztechCEE/new-api.git
+        git fetch --depth=1 origin ${_SOURCE_SHA}
+        git checkout --detach FETCH_HEAD
+        test "$$(git rev-parse HEAD)" = '${_SOURCE_SHA}'
+  - id: backend
+    name: golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039
+    dir: /workspace/source
+    entrypoint: sh
+    env: ['GOWORK=off', 'CGO_ENABLED=0', 'GOEXPERIMENT=greenteagc']
+    args:
+      - -ceu
+      - |
+        apk add --no-cache make git
+        mkdir -p web/dist
+        touch web/dist/index.html
+        go vet ./...
+        (cd relaykit && go vet ./... && go build ./...)
+        (cd tokenkit && go vet ./... && go build ./...)
+        go build ./...
+        make test
+  - id: frontend
+    name: oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
+    dir: /workspace/source/web
+    entrypoint: sh
+    args:
+      - -ceu
+      - |
+        bun install --frozen-lockfile
+        bun run typecheck
+        bun run test
+        DISABLE_ESLINT_PLUGIN=true bun run build
+  - id: image
+    name: gcr.io/cloud-builders/docker
+    dir: /workspace/source
+    args: ['build', '--label', 'org.opencontainers.image.revision=${_SOURCE_SHA}', '--label', 'org.opencontainers.image.source=https://github.com/moztechCEE/new-api', '-t', '${_IMAGE}', '.']
+images: ['${_IMAGE}']
+timeout: 3600s
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 100
