@@ -1,6 +1,6 @@
 {
-  "observedAt": "2026-10-26T01:57:39+08:00",
-  "state": "public-https-ready-awaiting-authenticated-browser-acceptance",
+  "observedAt": "2026-10-26T02:16:18+08:00",
+  "state": "public-https-admin-browser-flow-accepted-provider-integration-pending",
   "repository": "https://github.com/moztechCEE/new-api",
   "branch": "codex/release-20261022",
   "upstreamRelease": "v1.0.0-rc.45",
@@ -54,7 +54,20 @@
     "adminPasswordAbsentFromApplicationLogs": true,
     "temporaryRegistryCredentialRemoved": true,
     "ports22_3000_5432_6379PubliclyReachable": false,
-    "browserLogin": "HTTPS sign-in page verified in Chrome; authenticated login, refresh and logout await human login",
+    "browserLogin": "PASS on 2026-10-26: human-entered admin login rendered authenticated dashboard in Chrome",
+    "browserReloadAndRefresh": "PASS: dashboard remained authenticated after reload; normal POST /api/user/auth/refresh returned HTTP 200 without disk cache",
+    "browserLogout": "PASS: normal confirmation dialog, POST /api/user/auth/logout HTTP 200 without disk cache, signed-out UI, refresh and session-hint cookies removed; reload and protected-page navigation require sign-in",
+    "browserLogoutServerReadback": {
+      "before": {"activeSessions": 1, "logoutRevokedSessions": 1},
+      "after": {"activeSessions": 0, "logoutRevokedSessions": 2},
+      "queryScope": "aggregate status and revoked_reason counts only; no session IDs, credential hashes, IPs or user agents selected"
+    },
+    "independentProfileRevocationAndOldCredentialReplay": "NOT TESTED; normal UI logout and aggregate revocation readback are not a retained-credential replay test",
+    "browserEvidence": {
+      "authenticatedDashboard": "newapi-dev-authenticated-20261026.jpg",
+      "signedOutProtectedPageRedirect": "newapi-dev-signed-out-20261026.jpg",
+      "networkObservation": "response pathname/status/cache metadata only; refresh event captured despite older buffer eviction, logout event captured without truncation; no response bodies or credential values recorded"
+    },
     "publicHttps": "PASS: trusted certificate, host/SAN match, HTTPS maintenance before proxy promotion",
     "tlsProbeProtocol": "TLSv1.2",
     "certificateNotAfterUtc": "2027-01-23T16:52:06Z",
@@ -75,8 +88,9 @@
       "httpOnly": true,
       "sameSite": "Strict",
       "path": "/api/user/auth",
-      "authenticatedIssuedCookie": "NOT VERIFIED"
+      "authenticatedIssuedCookie": "PASS on 2026-10-26: new_api_refresh domain newapi-dev.corely.cc, path /api/user/auth, Secure, HttpOnly, SameSite Strict, persistent; attributes inspected without recording value"
     },
+    "authenticatedSessionHintCookie": "PASS: new_api_has_session, observed domain newapi-dev.corely.cc, path /, Secure, SameSite Strict, intentionally non-HttpOnly non-secret hint; removed by logout",
     "unrecognizedHost": "HTTP 200 with empty body, no upstream Via or application request ID; no application response",
     "sessionCookieSecure": true,
     "sessionCookieTrustedUrl": "https://newapi-dev.corely.cc",
