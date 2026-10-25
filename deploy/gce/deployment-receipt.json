@@ -1,6 +1,6 @@
 {
-  "observedAt": "2026-10-22T17:21:56+08:00",
-  "state": "private-ready-awaiting-dns",
+  "observedAt": "2026-10-26T01:57:39+08:00",
+  "state": "public-https-ready-awaiting-authenticated-browser-acceptance",
   "repository": "https://github.com/moztechCEE/new-api",
   "branch": "codex/release-20261022",
   "upstreamRelease": "v1.0.0-rc.45",
@@ -28,8 +28,18 @@
     "network": "new-api-dev",
     "externalIp": "35.201.242.245",
     "domain": "newapi-dev.corely.cc",
-    "publicIngress": "IAP TCP22 only; HTTP/HTTPS not opened",
+    "publicIngress": "IAP-only TCP22; public TCP443 and TCP80 for ACME/HTTPS redirects only",
+    "webFirewallRule": "new-api-dev-web",
     "applicationBinding": "127.0.0.1:3000"
+  },
+  "dns": {
+    "record": "newapi-dev.corely.cc A 35.201.242.245",
+    "ttlSeconds": 600,
+    "recordAlreadyPresentAtAcceptance": true,
+    "recordModifiedByThisRun": false,
+    "authoritativeAndPublicResolverChecks": "PASS: ns21.domaincontrol.com, 1.1.1.1 and 8.8.8.8",
+    "aaaaRecordPresent": false,
+    "unrelatedRecordsModified": false
   },
   "acceptance": {
     "postgresVersion": "15.19",
@@ -38,14 +48,45 @@
     "applicationAndDatabaseHealth": "PASS",
     "containerRestartPersistence": "PASS",
     "adminUsername": "infoadmin",
-    "adminApiLogin": "PASS",
-    "bootstrapSessionLogout": "PASS",
+    "adminApiLogin": "PASS during private bootstrap on 2026-10-22; not rerun with credentials after HTTPS promotion",
+    "bootstrapSessionLogout": "PASS on 2026-10-22",
     "publicRegistrationDisabled": true,
     "adminPasswordAbsentFromApplicationLogs": true,
     "temporaryRegistryCredentialRemoved": true,
     "ports22_3000_5432_6379PubliclyReachable": false,
-    "browserLogin": "NOT VERIFIED: local browser URL policy blocked the private tunnel",
-    "publicHttps": "NOT ENABLED: DNS A record pending"
+    "browserLogin": "HTTPS sign-in page verified in Chrome; authenticated login, refresh and logout await human login",
+    "publicHttps": "PASS: trusted certificate, host/SAN match, HTTPS maintenance before proxy promotion",
+    "tlsProbeProtocol": "TLSv1.2",
+    "certificateNotAfterUtc": "2027-01-23T16:52:06Z",
+    "httpRedirect": "PASS: HTTP 308 to HTTPS, preserving path/query and issuing no cookie",
+    "hsts": "max-age=86400; no includeSubDomains",
+    "publicSetupPost": "PASS: HTTP 404",
+    "publicRegistrationPost": "PASS: disabled by administrator",
+    "unauthenticatedAdminRequest": "PASS: denied",
+    "refreshOriginGuard": {
+      "missing": 403,
+      "foreign": 403,
+      "null": 403,
+      "multiple": 403,
+      "sameOriginWithoutSession": 401
+    },
+    "refreshClearingCookieAttributes": {
+      "secure": true,
+      "httpOnly": true,
+      "sameSite": "Strict",
+      "path": "/api/user/auth",
+      "authenticatedIssuedCookie": "NOT VERIFIED"
+    },
+    "unrecognizedHost": "HTTP 200 with empty body, no upstream Via or application request ID; no application response",
+    "sessionCookieSecure": true,
+    "sessionCookieTrustedUrl": "https://newapi-dev.corely.cc",
+    "trustedProxies": "172.29.0.10/32",
+    "nonPublicRuntimeSettingsPreserved": true,
+    "effectiveImageDigestAndSourceReadback": "PASS; application image unchanged",
+    "runtimeVersionField": "empty upstream metadata; deployment identity verified by image digest and OCI revision",
+    "caddyfileSha256": "e41610bc710262107b14b9438139a0afebeeed46ecf889cc34806f7c4ec742ef",
+    "deploymentRegressionRerun": "8 tests PASS on 2026-10-26",
+    "streamingAndWebSocketUpstreamE2e": "NOT VERIFIED: no provider channels configured"
   },
   "backup": {
     "bucket": "moztech-new-api-dev-backups-249593319772",
@@ -56,7 +97,13 @@
     "independentPostgresRestore": "PASS",
     "restoreValidationDatabaseRemoved": true,
     "dailyTimerEnabled": true,
-    "cloudLifecycleDays": 30
+    "cloudLifecycleDays": 30,
+    "postHttpsBackup": {
+      "object": "daily/20261025T175720Z.tar.gz",
+      "sha256": "402cb2effee53cc8d677eb4e42cd8cb4623fd733a8650b451f69d6f2330e3f43",
+      "uploadSizeVerified": true,
+      "independentRestore": "NOT RERUN; parent restore evidence refers only to the original backup object"
+    }
   },
   "boundaries": {
     "upstreamProviderChannels": 0,
