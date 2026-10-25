@@ -28,7 +28,7 @@
     "network": "new-api-dev",
     "externalIp": "35.201.242.245",
     "domain": "newapi-dev.corely.cc",
-    "publicIngress": "IAP-only TCP22; public TCP443 and TCP80 for ACME/HTTPS redirects only",
+    "publicIngress": "TCP443 for HTTPS console; TCP80 only for ACME/HTTPS redirects; TCP22 via IAP only",
     "webFirewallRule": "new-api-dev-web",
     "applicationBinding": "127.0.0.1:3000"
   },
