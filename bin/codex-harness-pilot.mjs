@@ -17,7 +17,14 @@ const ERRORS = new Set(['INVALID_OPTIONS', 'UNSAFE_HOME', 'SPAWN_FAILED', 'PROTO
   'TOOL_USE_REJECTED', 'TURN_FAILED', 'INVALID_OUTPUT', 'INCOMPLETE_TURN', 'PROCESS_FAILED', 'INVALID_USAGE',
   'LOGIN_FAILED', 'UNEXPECTED_INSTRUCTIONS', 'MODEL_CHANGED']);
 export class HarnessError extends Error {
-  constructor(code) { super(ERRORS.has(code) ? code : 'PROTOCOL_ERROR'); this.code = this.message; }
+  constructor(code, diagnostic) {
+    super(ERRORS.has(code) ? code : 'PROTOCOL_ERROR'); this.code = this.message;
+    if (diagnostic && ['initialize', 'account/read', 'account/login/start', 'model/list', 'thread/start', 'turn/start'].includes(diagnostic.method)) {
+      this.diagnostic = Object.freeze({ method: diagnostic.method,
+        rpcCode: Number.isSafeInteger(diagnostic.rpcCode) ? diagnostic.rpcCode : null,
+        reason: ['EXPERIMENTAL_API_REQUIRED', 'INVALID_PARAMS', 'OTHER'].includes(diagnostic.reason) ? diagnostic.reason : 'OTHER' });
+    }
+  }
 }
 
 // Deliberately do not inherit API keys, access tokens, provider URLs, proxies,
@@ -138,7 +145,10 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
       const item = pending.get(msg.id);
       if (!item) return fail(new HarnessError('PROTOCOL_ERROR'));
       clearTimeout(item.timer); pending.delete(msg.id);
-      if (msg.error || !Object.hasOwn(msg, 'result')) item.reject(new HarnessError('RPC_FAILED'));
+      if (msg.error || !Object.hasOwn(msg, 'result')) item.reject(new HarnessError('RPC_FAILED', {
+        method: item.method, rpcCode: msg.error?.code,
+        reason: typeof msg.error?.message === 'string' && msg.error.message.includes('requires experimentalApi capability') ? 'EXPERIMENTAL_API_REQUIRED' : msg.error?.code === -32602 ? 'INVALID_PARAMS' : 'OTHER',
+      }));
       else item.resolve(msg.result);
     }
   });
@@ -146,7 +156,7 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
     if (terminalError || closed) return reject(terminalError ?? new HarnessError('PROCESS_FAILED'));
     const id = ++sequence;
     const timer = setTimeout(() => fail(new HarnessError('TIMEOUT')), 15000);
-    pending.set(id, { resolve: resolveCall, reject, timer });
+    pending.set(id, { resolve: resolveCall, reject, timer, method });
     child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
   });
   const wait = (method, timeout) => new Promise((resolveCall, reject) => {
@@ -163,7 +173,7 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
       const completed = wait('account/login/completed', 300000);
       // Attach rejection immediately to avoid an unhandled rejection on RPC error.
       completed.catch(() => {});
-      const ceremony = await rpc('account/login/start', { type: 'chatgpt' });
+      const ceremony = await rpc('account/login/start', { type: 'chatgpt', useHostedLoginSuccessPage: true, appBrand: 'codex' });
       let url;
       try { url = new URL(ceremony.authUrl); } catch { throw new HarnessError('LOGIN_FAILED'); }
       if (ceremony.type !== 'chatgpt' || !['https://auth.openai.com', 'https://chatgpt.com'].includes(url.origin) ||
@@ -264,7 +274,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       onLogin: async authUrl => { process.stdout.write(`${JSON.stringify({ status: 'NORMAL_CODEX_LOGIN_REQUIRED', authUrl })}\n`); } });
     process.stdout.write(`${JSON.stringify(receipt)}\n`);
   } catch (error) {
-    process.stdout.write(`${JSON.stringify({ status: 'HARNESS_FAILED', code: error instanceof HarnessError ? error.code : 'PROTOCOL_ERROR', apiFallbackUsed: false })}\n`);
+    process.stdout.write(`${JSON.stringify({ status: 'HARNESS_FAILED', code: error instanceof HarnessError ? error.code : 'PROTOCOL_ERROR',
+      ...(error instanceof HarnessError && error.diagnostic ? { diagnostic: error.diagnostic } : {}), apiFallbackUsed: false })}\n`);
     process.exitCode = 1;
   }
 }

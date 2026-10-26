@@ -183,6 +183,16 @@ test('unknown error text cannot escape through the public HarnessError receipt',
   assert.doesNotMatch(`${caught.message}\n${JSON.stringify(caught)}`, /synthetic-secret-token-or-upstream-body/);
 });
 
+test('RPC diagnostics keep only a known method, numeric code and fixed reason', () => {
+  const safe = new HarnessError('RPC_FAILED', { method: 'thread/start', rpcCode: -32602, reason: 'INVALID_PARAMS',
+    accessToken: 'synthetic-private', message: 'synthetic-private' });
+  assert.deepEqual(safe.diagnostic, { method: 'thread/start', rpcCode: -32602, reason: 'INVALID_PARAMS' });
+  const malicious = new HarnessError('RPC_FAILED', { method: 'thread/start', rpcCode: 'synthetic-private', reason: 'synthetic-private' });
+  assert.deepEqual(malicious.diagnostic, { method: 'thread/start', rpcCode: null, reason: 'OTHER' });
+  assert.equal(new HarnessError('RPC_FAILED', { method: 'synthetic-private' }).diagnostic, undefined);
+  assert.doesNotMatch(JSON.stringify(safe), /synthetic-private|accessToken/);
+});
+
 // The child below is a generated JSON-RPC fixture, not the real Codex CLI.
 // Its only reads are its own environment and the newly created empty home.
 async function withFakeHarness(scenario, action) {
