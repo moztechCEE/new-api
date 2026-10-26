@@ -24,10 +24,11 @@ synthetic success is not proof of hosted-customer-service eligibility.
   unverified plan, hidden/missing GPT-6.1 Sol, model rerouting, tool requests,
   incomplete turns and malformed output fail closed. There is no retry loop,
   account rotation or API fallback.
-- Unknown JSON-RPC notifications are non-authoritative metadata and are ignored,
-  not treated as completion or executable actions. Every server request and
-  unexpected item type is rejected. Only the exact known final item plus
-  completed turn/usage can pass, avoiding brittle per-notification patches.
+- Neutral JSON-RPC metadata is non-authoritative and cannot satisfy completion.
+  Unknown auth/model/tool/control events, all server requests and unexpected
+  item types fail closed. The exact disabled Code Mode host warning, bound to
+  the current thread, is recognized without enabling the execution host; all
+  other warnings fail. Only the exact final item plus completed turn/usage pass.
 - Protocol parameters are checked against the installed official runtime's
   generated schema. In runtime 0.162.0-alpha.17.2, thread-start sandbox mode is
   `read-only`, while the returned policy type is `readOnly`; these are different
@@ -78,3 +79,37 @@ review turn, equivalent evidence/freshness checks and full regression/E2E.
 This pilot does not modify Corely routing, New API cloud channels, deployed
 services, schema, FAQ, states or review mode. Normal DEV and production remain
 unchanged. No hosted usage or quota-exhaustion account switching is enabled by it.
+
+## Verified local result — 2026-10-26
+
+Runtime source `fc897301cf672a00de84682eee7ae673d878f49c`, official installed
+Codex `0.162.0-alpha.17.2`, completed one live fixed synthetic turn after normal
+Info sign-in with **Personal account** selected. The same official process
+verified ChatGPT authentication, exact expected account, Pro plan, visible
+`gpt-6.1-sol`, the selected model and final output, completed turn/usage, and the
+same account again. No API key, custom provider endpoint, token import or API
+fallback was used.
+
+```json
+{"status":"SYNTHETIC_HARNESS_PASSED","authMode":"chatgpt","expectedAccountMatch":true,"planType":"pro","model":"gpt-6.1-sol","generationCompleted":true,"outputMatched":true,"usage":{"inputTokens":9996,"outputTokens":12},"apiFallbackUsed":false,"exactPlanDebitAttested":false,"corelyConnected":false,"sendingEnabled":false,"learningEnabled":false}
+```
+
+Offline harness 76 + original SIWC 140 = **216 passing tests**. Exact source CI
+[40332402606](https://github.com/moztechCEE/new-api/actions/runs/40332402606)
+passed both Node 20 and 22. This focused CI does not run Go gateway or Corely
+regressions, and is not customer-service quality, latency or delivery acceptance.
+
+Seven preceding normal sign-in attempts did not produce a successful generation
+receipt: initial unclassified RPC failure; `thread/start` sandbox enum mismatch;
+`turn/start` unsupported readOnly.access override; lifecycle protocol mismatch;
+two unclassified unsupported-event failures; then the named disabled-host
+warning. These failures were preserved, not replaced by the successful result.
+Pre-turn errors were reproduced without credentials. Later failed attempts had
+issued turn/start and must not be described as zero model usage. All local
+processes and their temporary homes were ended/removed; no remote revocation is
+claimed from local cleanup.
+
+This proves the **official, owner-operated local harness route**, not a New API
+channel or automatic remotely hosted Corely backend. Exact included-plan debit,
+Eason/fallback routing, customer-quality evaluation and the Corely manual
+send/learning chain remain unverified. Existing API quality review is unchanged.
