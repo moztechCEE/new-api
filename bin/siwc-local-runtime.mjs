@@ -27,6 +27,15 @@ export class ProbeError extends Error {
     if (typeof diagnostic.clientRequestId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(diagnostic.clientRequestId)) safe.clientRequestId = diagnostic.clientRequestId;
     if (Number.isInteger(diagnostic.responseHeaderCount) && diagnostic.responseHeaderCount >= 0 && diagnostic.responseHeaderCount <= 256) safe.responseHeaderCount = diagnostic.responseHeaderCount;
     if (['basic', 'cors', 'default', 'error', 'opaque', 'opaqueredirect'].includes(diagnostic.fetchResponseType)) safe.fetchResponseType = diagnostic.fetchResponseType;
+    for (const key of ['completedEventVerified', 'finalTextMatchesExpected', 'deltaMatchesFinal']) {
+      if (typeof diagnostic[key] === 'boolean') safe[key] = diagnostic[key];
+    }
+    for (const key of ['finalTextLength', 'deltaTextLength']) {
+      if (Number.isInteger(diagnostic[key]) && diagnostic[key] >= 0 && diagnostic[key] <= 1_048_576) safe[key] = diagnostic[key];
+    }
+    for (const key of ['finalTextHash', 'deltaTextHash']) {
+      if (typeof diagnostic[key] === 'string' && /^[0-9a-f]{64}$/.test(diagnostic[key])) safe[key] = diagnostic[key];
+    }
     this.diagnostic = Object.freeze(safe);
   }
 }
@@ -265,7 +274,12 @@ export async function consumeProbeStream(body) {
   if (!Array.isArray(completed.output)) fail('INVALID_COMPLETION');
   const finalText = completed.output.filter(i => i?.type === 'message')
     .flatMap(i => i.content ?? []).filter(c => c.type === 'output_text').map(c => c.text).join('');
-  if (!finalText || finalText.trim() !== PROBE_OUTPUT || (text && text !== finalText)) fail('SYNTHETIC_OUTPUT_MISMATCH');
+  if (!finalText || finalText.trim() !== PROBE_OUTPUT || (text && text !== finalText)) {
+    throw new ProbeError('SYNTHETIC_OUTPUT_MISMATCH', { completedEventVerified: true,
+      finalTextMatchesExpected: finalText.trim() === PROBE_OUTPUT, deltaMatchesFinal: text === finalText,
+      finalTextLength: finalText.length, deltaTextLength: text.length,
+      finalTextHash: digest(finalText), deltaTextHash: digest(text) });
+  }
   let usage;
   if (completed.usage !== undefined && completed.usage !== null) {
     const source = completed.usage;

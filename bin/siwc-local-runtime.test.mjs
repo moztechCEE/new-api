@@ -498,6 +498,15 @@ test('missing MIME cannot turn empty, non-SSE, partial, error or mismatched infe
       assert.equal(error.diagnostic.clientRequestId, clientRequestId);
       assert.equal(error.diagnostic.contentTypeClass, 'MISSING');
       assert.equal(error.diagnostic.errorCode, name === 'quota terminal event' ? 'subscription_sharing_usage_limit_exceeded' : undefined);
+      if (name === 'wrong output') {
+        assert.equal(error.diagnostic.completedEventVerified, true);
+        assert.equal(error.diagnostic.finalTextMatchesExpected, false);
+        assert.equal(error.diagnostic.finalTextLength, 5);
+        assert.equal(error.diagnostic.finalTextHash, digest('wrong'));
+        assert.equal(error.diagnostic.deltaTextLength, 0);
+        assert.equal(error.diagnostic.deltaTextHash, digest(''));
+        assert.equal(error.diagnostic.deltaMatchesFinal, false);
+      }
       assert.equal(JSON.stringify(error).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
       return true;
     });

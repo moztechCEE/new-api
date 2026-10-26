@@ -42,6 +42,15 @@ After the compatibility correction the full fresh offline suite passes
 rejection, model/output consistency and safe usage receipts. A new live attempt
 must still succeed; this test total is not personal-plan/Corely acceptance.
 
+Runtime `96e71fc95cd909218f58ad10b7f07576752f5097` passed exact
+[Node20/22 CI40373860924](https://github.com/moztechCEE/new-api/actions/runs/40373860924).
+Its one fixed Info attempt reached a valid completed exact-model event, then
+held on `SYNTHETIC_OUTPUT_MISMATCH` (correlation
+`6afabc39-9811-4aa1-96ba-50c36ea75dbc`). No API fallback, and session revocation
+confirmed. A further bounded diagnostic records only final/delta lengths,
+hashes and equality flags to separate output assembly from model compliance;
+it does not admit a mismatching reply. The full fresh suite remains 537/537.
+
 ## 2026-10-27 hosted-use correction and local guard
 
 Fresh [official auth guidance](https://learn.chatgpt.com/docs/app-server#auth-endpoints)
