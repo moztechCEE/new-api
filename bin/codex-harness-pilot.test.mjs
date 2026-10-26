@@ -247,6 +247,8 @@ input.on('line', line => {
       threadId: 'synthetic-thread', turnId: 'synthetic-turn', command: 'synthetic-command' } });
     notify('thread/started', { thread: { id: 'synthetic-thread' } });
     notify('remoteControl/status/changed', { status: { enabled: false } });
+    notify('future/metadata', { text: 'synthetic-auth-field-must-not-escape', completed: true });
+    if (scenario.metadataOnly) return process.exit(0);
     notify('account/updated', { authMode: 'chatgpt', planType: 'pro' });
     notify('turn/started', { threadId: 'synthetic-thread', turn: { id: 'synthetic-turn' } });
     if (scenario.error) return notify('error', { threadId: 'synthetic-thread', turnId: 'synthetic-turn',
@@ -378,6 +380,7 @@ test('offline transport stops on tool approval, upstream error, oversized output
     ['incorrect final answer', { badAnswer: true }, 'INVALID_OUTPUT'],
     ['failed turn', { failedTurn: true }, 'TURN_FAILED'],
     ['early child exit', { earlyExit: true }, 'PROCESS_FAILED'],
+    ['metadata alone is not completion', { metadataOnly: true }, 'PROCESS_FAILED'],
   ]) await t.test(label, { timeout: 5000 }, () => withFakeHarness(scenario, async ({ executable, sourceEnv }) => {
     await assert.rejects(runPilot({ executable, sourceEnv, runSynthetic: true }), error => {
       assert.ok(error instanceof HarnessError);
