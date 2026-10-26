@@ -5,10 +5,12 @@ on:
     branches: ['codex/**']
     paths:
       - 'bin/siwc-local-*.mjs'
+      - 'bin/codex-harness-*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
   pull_request:
     paths:
       - 'bin/siwc-local-*.mjs'
+      - 'bin/codex-harness-*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
   workflow_dispatch:
 
@@ -32,5 +34,9 @@ jobs:
           node --check bin/siwc-local-runtime.mjs
           node --check bin/siwc-local-pilot.mjs
           node --check bin/siwc-local-runtime.test.mjs
+          node --check bin/codex-harness-pilot.mjs
+          node --check bin/codex-harness-pilot.test.mjs
       - name: Run synthetic offline protocol regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs
+      - name: Run synthetic offline harness regression
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-pilot.test.mjs
