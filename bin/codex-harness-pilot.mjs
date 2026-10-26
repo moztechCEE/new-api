@@ -255,7 +255,7 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
       // Reproduced with an empty unauthenticated home on the pinned runtime:
       // this warning confirms the intentionally disabled execution host. It
       // does not authorize enabling it. Other warnings remain fail-closed.
-      if (msg.method === 'warning' && p?.message === EXPECTED_DISABLED_TOOL_WARNING) return;
+      if (msg.method === 'warning' && p?.threadId === threadId && p?.message === EXPECTED_DISABLED_TOOL_WARNING) return;
       if (typeof msg.method !== 'string' || /^(item|account|auth|model|modelProvider|hook|mcpServer|app|process|command|fs|remoteControl)\//.test(msg.method) ||
           /error|warning|permission|approval/i.test(msg.method)) throw new HarnessError('UNSUPPORTED_EVENT', {
         method: 'notification', notification: msg.method,
