@@ -10,18 +10,37 @@ This is distinct from offering a paid/hosted app to other users; it does not
 automatically establish eligibility for Corely's multi-tenant hosted service.
 No Codex/Luna credential cache may be substituted for this registration.
 
-The next actual check uses the public SIWC Responses route and Info's normal
+The actual check uses the public SIWC Responses route and Info's normal
 authorization, with no API key fallback. A missing/incorrect Content-Type now
 receives a bounded 16 KiB / 3-second structural diagnostic instead of immediately
 discarding the body. Only fixed shape enums, hashed provider request IDs and a
-generated client correlation ID can leave the process. This revision still
-rejects wrong MIME, empty responses and SSE-shaped text without a verified
-completion; it does not relax inference success or provider eligibility.
+generated client correlation ID can leave the process.
+
+Diagnostic revision `5ef80dc9146430b61186d771f06ed39bcac5d317` passed exact
+[Node20/22 CI40373017842](https://github.com/moztechCEE/new-api/actions/runs/40373017842).
+Its single normal Info authorization and fixed inference returned HTTP200,
+19 response headers, missing Content-Type and `SSE_SHAPED` body; no API key was
+available. Client correlation: `cdf1175b-6ed2-495c-a9e5-6d64eb28382b`.
+Session revocation was confirmed, with no credentials persisted.
+
+The overly strict MIME guard was therefore a local compatibility defect, not
+proof of a provider admission failure. The [official SDK stream parser](https://github.com/openai/openai-node/blob/main/src/internal/parse.ts)
+chooses SSE parsing for stream requests before inspecting Content-Type. The
+compatibility fix allows only missing MIME or exact SSE, then still requires
+bounded valid events, exact model, matching final output and `response.completed`.
+Explicit JSON/HTML/other MIME, empty bodies, failed/partial/mismatched streams
+remain failures. Known plan-limit error codes are preserved without raw messages;
+optional completion usage is checked and reduced to three numeric counts.
 
 Fresh offline regression: **531/531**, zero fail/skip/cancel. The initial added
 fixture incorrectly passed a ReadableStream to Buffer.from; correcting that
 fixture did not change runtime success criteria. No live proof, VM credential
 transfer, New API upstream channel or Corely connection is claimed by tests.
+
+After the compatibility correction the full fresh offline suite passes
+**537/537**, including headerless real-protocol completion, empty/partial/error
+rejection, model/output consistency and safe usage receipts. A new live attempt
+must still succeed; this test total is not personal-plan/Corely acceptance.
 
 ## 2026-10-27 hosted-use correction and local guard
 

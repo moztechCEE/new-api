@@ -221,6 +221,7 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
 }
 
 export async function consumeProbeStream(body) {
+  if (!body) fail('MISSING_COMPLETED_EVENT');
   const decoder = new TextDecoder('utf8', { fatal: true });
   let buffer = '', total = 0, text = '', completed;
   function consume(frame) {
@@ -229,7 +230,9 @@ export async function consumeProbeStream(body) {
     let event;
     try { event = JSON.parse(data); } catch { fail('INVALID_STREAM_EVENT'); }
     if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string') fail('INVALID_STREAM_EVENT');
-    if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) fail('INFERENCE_NOT_COMPLETED');
+    if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) {
+      throw new ProbeError('INFERENCE_NOT_COMPLETED', { errorCode: event.response?.error?.code ?? event.error?.code ?? event.code });
+    }
     if (event.type === 'response.output_text.delta') {
       if (completed || typeof event.delta !== 'string') fail('INVALID_STREAM_EVENT');
       text += event.delta;
@@ -263,7 +266,14 @@ export async function consumeProbeStream(body) {
   const finalText = completed.output.filter(i => i?.type === 'message')
     .flatMap(i => i.content ?? []).filter(c => c.type === 'output_text').map(c => c.text).join('');
   if (!finalText || finalText.trim() !== PROBE_OUTPUT || (text && text !== finalText)) fail('SYNTHETIC_OUTPUT_MISMATCH');
-  return { completed: true, model: MODEL, responseIdHash: digest(completed.id), outputHash: digest(finalText) };
+  let usage;
+  if (completed.usage !== undefined && completed.usage !== null) {
+    const source = completed.usage;
+    if (!['input_tokens', 'output_tokens', 'total_tokens'].every(key => Number.isSafeInteger(source[key]) && source[key] >= 0) ||
+        source.input_tokens + source.output_tokens !== source.total_tokens) fail('INVALID_USAGE_RECEIPT');
+    usage = { inputTokens: source.input_tokens, outputTokens: source.output_tokens, totalTokens: source.total_tokens };
+  }
+  return { completed: true, model: MODEL, responseIdHash: digest(completed.id), outputHash: digest(finalText), ...(usage ? { usage } : {}) };
 }
 
 export async function runSyntheticProbe(session, fetchImpl = fetch, signal) {
@@ -281,6 +291,14 @@ export async function runSyntheticProbe(session, fetchImpl = fetch, signal) {
     responseHeaderCount: Math.min([...response.headers.keys()].length, 256), fetchResponseType: response.type });
   if (!response.ok) throw new ProbeError(`INFERENCE_HTTP_${response.status}`, await failureDiagnostic());
   const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
-  if (media !== 'text/event-stream') throw new ProbeError('INVALID_STREAM_CONTENT_TYPE', await failureDiagnostic());
-  return consumeProbeStream(response.body);
+  if (media && media !== 'text/event-stream') throw new ProbeError('INVALID_STREAM_CONTENT_TYPE', await failureDiagnostic());
+  // Official SDK stream requests parse SSE before inspecting Content-Type. Some plan
+  // responses omit it; the bounded event/completion validator remains authoritative.
+  try { return { ...await consumeProbeStream(response.body), clientRequestId,
+    contentTypeClass: media ? 'SSE' : 'MISSING' }; }
+  catch (error) {
+    throw new ProbeError(error instanceof ProbeError ? error.code : 'STREAM_INTERRUPTED', {
+      ...(error instanceof ProbeError ? error.diagnostic : {}), httpStatus: response.status,
+      contentTypeClass: media ? 'SSE' : 'MISSING', catalogModelVerified: true, clientRequestId });
+  }
 }

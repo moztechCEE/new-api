@@ -267,6 +267,11 @@ test('SSE accepts chunked CRLF data only after a completed exact-model response'
     responseIdHash: digest('resp_synthetic_fixture'), outputHash: digest(PROBE_OUTPUT) });
   assert.equal('responseId' in result, false);
   assert.equal('text' in result, false);
+  const withUsage = await consumeProbeStream(streamBody([completedEvent({ usage: {
+    input_tokens: 14, output_tokens: 8, total_tokens: 22, private: 'SYNTHETIC_SECRET_DO_NOT_EMIT',
+  } })]));
+  assert.deepEqual(withUsage.usage, { inputTokens: 14, outputTokens: 8, totalTokens: 22 });
+  assert.equal(JSON.stringify(withUsage).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
 });
 
 test('SSE fails closed on errors, missing completion, mismatch, interruption and bounds', async t => {
@@ -279,6 +284,7 @@ test('SSE fails closed on errors, missing completion, mismatch, interruption and
     ['invalid JSON', () => streamBody([], 'data: {not-json}\n\n'), 'INVALID_STREAM_EVENT'],
     ['wrong model', () => streamBody([completedEvent({ model: 'gpt-6-astra' })]), 'INVALID_COMPLETION'],
     ['wrong status', () => streamBody([completedEvent({ status: 'in_progress' })]), 'INVALID_COMPLETION'],
+    ['invalid usage', () => streamBody([completedEvent({ usage: { input_tokens: 1, output_tokens: 2, total_tokens: 2 } })]), 'INVALID_USAGE_RECEIPT'],
     ['missing response id', () => streamBody([completedEvent({ id: '' })]), 'INVALID_COMPLETION'],
     ['duplicate completion', () => streamBody([completedEvent(), completedEvent()]), 'INVALID_COMPLETION'],
     ['delta after completion', () => streamBody([completedEvent(), { type: 'response.output_text.delta', delta: 'late' }]), 'INVALID_STREAM_EVENT'],
@@ -407,15 +413,16 @@ test('typed probe errors expose only stable error codes', () => {
 });
 
 test('synthetic probe accepts case-insensitive exact SSE MIME with charset, never stream-like suffixes', async t => {
-  for (const mime of ['TEXT/EVENT-STREAM', 'Text/Event-Stream; Charset=UTF-8']) await t.test(mime, async () => {
+  for (const mime of ['TEXT/EVENT-STREAM', 'Text/Event-Stream; Charset=UTF-8', undefined]) await t.test(mime ?? 'missing MIME with completed protocol', async () => {
     const calls = [];
     const result = await runSyntheticProbe(eligibleSession(), async (url, init) => {
       calls.push(url);
       if (url === `${RESOURCE}/models`) return jsonResponse({ models: [{ slug: MODEL, visibility: 'list' }] });
       assert.equal(init.headers.Accept, 'text/event-stream');
-      return new Response(streamBody([completedEvent()]), { headers: { 'content-type': mime } });
+      return new Response(streamBody([completedEvent()]), { headers: mime ? { 'content-type': mime } : {} });
     });
     assert.equal(result.completed, true);
+    assert.equal(result.contentTypeClass, mime ? 'SSE' : 'MISSING');
     assert.deepEqual(calls, [`${RESOURCE}/models`, `${RESOURCE}/responses`]);
   });
   await t.test('streamx is not SSE', async () => {
@@ -444,11 +451,6 @@ test('successful HTTP without SSE is never inference completion or a reason to u
       output: completedEvent().response.output }), 200, 'JSON', 'RESPONSE_OBJECT', 'completed'],
     ['JSON detail', () => jsonResponse({ detail: 'synthetic-private-detail' }), 200, 'JSON', 'DETAIL_OBJECT'],
     ['HTML', () => new Response('<h1>synthetic-private-html</h1>', { headers: { 'content-type': 'text/html; charset=utf-8' } }), 200, 'HTML', 'HTML_SHAPED'],
-    ['missing MIME', () => new Response(Buffer.from('synthetic-private-body')), 200, 'MISSING', 'OTHER_TEXT'],
-    ['empty HTTP 200', () => new Response(null), 200, 'MISSING', 'EMPTY'],
-    ['no content 204', () => new Response(null, { status: 204 }), 204, 'MISSING', 'EMPTY'],
-    ['headerless SSE is diagnostic only', () => new Response(streamBody([completedEvent()])), 200, 'MISSING', 'SSE_SHAPED'],
-    ['headerless JSON error', () => new Response(Buffer.from(JSON.stringify({ error: { code: 'subscription_sharing_user_not_eligible' } }))), 200, 'MISSING', 'ERROR_OBJECT'],
   ];
   for (const [name, response, status, contentTypeClass, bodyShape, responseStatus] of cases) await t.test(name, async () => {
     const calls = [];
@@ -462,10 +464,41 @@ test('successful HTTP without SSE is never inference completion or a reason to u
       assert.match(clientRequestId, /^[0-9a-f-]{36}$/);
       assert.equal(responseHeaderCount, contentTypeClass === 'MISSING' ? 0 : 1);
       assert.equal(fetchResponseType, 'default');
-      assert.equal(errorCode, name === 'headerless JSON error' ? 'subscription_sharing_user_not_eligible' : undefined);
+      assert.equal(errorCode, undefined);
       assert.deepEqual(structural, { httpStatus: status, contentTypeClass, catalogModelVerified: true,
         bodyShape, ...(responseStatus ? { responseStatus } : {}) });
       assert.equal(JSON.stringify(error).includes('synthetic-private'), false);
+      return true;
+    });
+    assert.deepEqual(calls, [`${RESOURCE}/models`, `${RESOURCE}/responses`]);
+  });
+});
+
+test('missing MIME cannot turn empty, non-SSE, partial, error or mismatched inference into success', async t => {
+  const cases = [
+    ['empty 200', () => new Response(null), 'MISSING_COMPLETED_EVENT'],
+    ['empty 204', () => new Response(null, { status: 204 }), 'MISSING_COMPLETED_EVENT'],
+    ['plain text', () => new Response(Buffer.from('synthetic-private-body')), 'MISSING_COMPLETED_EVENT'],
+    ['JSON error', () => new Response(Buffer.from(JSON.stringify({ error: { code: 'subscription_sharing_user_not_eligible' } }))), 'MISSING_COMPLETED_EVENT'],
+    ['partial', () => new Response(streamBody([{ type: 'response.output_text.delta', delta: PROBE_OUTPUT }])), 'MISSING_COMPLETED_EVENT'],
+    ['quota terminal event', () => new Response(streamBody([{ type: 'response.failed', response: { error: { code: 'subscription_sharing_usage_limit_exceeded', message: 'SYNTHETIC_SECRET_DO_NOT_EMIT' } } }])), 'INFERENCE_NOT_COMPLETED'],
+    ['wrong model', () => new Response(streamBody([completedEvent({ model: 'gpt-6-astra' })])), 'INVALID_COMPLETION'],
+    ['wrong output', () => new Response(streamBody([completedEvent({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'wrong' }] }] })])), 'SYNTHETIC_OUTPUT_MISMATCH'],
+  ];
+  for (const [name, response, code] of cases) await t.test(name, async () => {
+    const calls = [];
+    let clientRequestId;
+    await assert.rejects(runSyntheticProbe(eligibleSession(), async (url, init) => {
+      calls.push(url);
+      if (url === `${RESOURCE}/models`) return jsonResponse({ models: [{ slug: MODEL, visibility: 'list' }] });
+      clientRequestId = init.headers['X-Client-Request-Id'];
+      return response();
+    }), error => {
+      assert.equal(error.code, code);
+      assert.equal(error.diagnostic.clientRequestId, clientRequestId);
+      assert.equal(error.diagnostic.contentTypeClass, 'MISSING');
+      assert.equal(error.diagnostic.errorCode, name === 'quota terminal event' ? 'subscription_sharing_usage_limit_exceeded' : undefined);
+      assert.equal(JSON.stringify(error).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
       return true;
     });
     assert.deepEqual(calls, [`${RESOURCE}/models`, `${RESOURCE}/responses`]);

@@ -154,7 +154,7 @@ export async function startLocalPilot() {
       const result = await runSyntheticProbe(session, fetch, abort.signal);
       phase = 'LOCAL_DIRECT_PROBE_COMPLETED';
       safe({ status: phase, ...result, planScopeGranted: true, accountMatchesInfo: true,
-        authorizationPath: 'SIWC_PLAN_GRANT', planDebitVerified: false,
+        authorizationPath: 'SIWC_PLAN_GRANT', planAuthorizedInferenceVerified: true, planDebitVerified: false,
         newApiRelayTested: false, hostedCorelyTested: false,
         exactDebitAmountVerified: false, apiKeyFallbackUsed: false, credentialsPersisted: false,
         completedAt: new Date().toISOString() });
