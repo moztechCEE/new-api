@@ -16,6 +16,7 @@ const canonical = value => Array.isArray(value) ? value.map(canonical) : value &
   ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
 const sha = value => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 const schema = () => ({ type: 'object', properties: { answer: { type: 'string', minLength: 1 } }, required: ['answer'], additionalProperties: false });
+const remoteStatus = status => ({ status, installationId: 'synthetic-installation', serverName: 'synthetic-server', environmentId: null });
 let sequence = 0;
 function request(overrides = {}) {
   const content = { version: 1, callId: `synthetic-call-${++sequence}`, workload: 'REPLY_LLM', purpose: 'reply_generation',
@@ -48,7 +49,8 @@ function complete(params) {
   if (scenario.unknownAction) return notify('item/futureToolAction',{threadId,turnId});
   if (scenario.reroute) return notify('model/rerouted',{threadId,turnId,fromModel:'gpt-6.1-sol',toModel:'another-model'});
   if (scenario.authDriftEvent) return notify('account/updated',{authMode:'apiKey'});
-  if (scenario.activeRemote) return notify('remoteControl/status/changed',{status:{enabled:true}});
+  if (scenario.activeRemoteParams !== undefined) return notify('remoteControl/status/changed',scenario.activeRemoteParams);
+  notify('remoteControl/status/changed',${JSON.stringify(remoteStatus('disabled'))});
   if (scenario.otherWarning) return notify('warning',{threadId,message:'synthetic-secret-warning-not-for-output'});
   notify('warning',{threadId,message:${JSON.stringify('Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.')}});
   notify('future/metadata',{syntheticSecret:'must not enter receipt',completed:true});
@@ -78,7 +80,7 @@ function complete(params) {
 readline.createInterface({input:process.stdin}).on('line',line=>{
   const message=JSON.parse(line),{id,method,params}=message;
   record({kind:'request',method,params});
-  if(method==='initialize') return reply(id,{});
+  if(method==='initialize') { reply(id,{}); return notify('remoteControl/status/changed',${JSON.stringify(remoteStatus('disabled'))}); }
   if(method==='initialized') return;
   if(method==='account/read') {
     reads++;
@@ -94,7 +96,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     return notify('account/login/completed',{success:true,loginId:scenario.badLoginId ? 'wrong-login' : 'synthetic-login'});
   }
   if(method==='model/list') {
-    if (scenario.idleRemote) notify('remoteControl/status/changed',{status:{enabled:true}});
+    if (scenario.idleRemoteParams !== undefined) notify('remoteControl/status/changed',scenario.idleRemoteParams);
     return reply(id,{data:scenario.noModel ? [] : [{model:'gpt-6.1-sol',hidden:scenario.hidden === true,
       defaultReasoningEffort:'low',supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'high'}],inputModalities:['text','image']}],nextCursor:null});
   }
@@ -352,7 +354,7 @@ test('adversarial model/tool/protocol/account/source events hold without leaking
     { otherWarning: true }, { crossThread: true }, { crossTurn: true }, { missingTurnId: true }, { badEcho: true }, { noFinal: true },
     { noUsage: true }, { noItems: true }, { duplicateFinal: true }, { finalMismatch: true }, { completeWrongTurn: true },
     { failed: true }, { earlyExit: true }, { overflow: true }, { driftAfter: 3 }, { wrongRoots: true }, { wrongProfile: true },
-    { persistent: true }, { wrongModel: true }, { network: true }, { instructions: true }, { badCanary: true }, { hashDrift: true }, { lateQuota: true }, { activeRemote: true }, { prematureTurn: true },
+    { persistent: true }, { wrongModel: true }, { network: true }, { instructions: true }, { badCanary: true }, { hashDrift: true }, { lateQuota: true }, { prematureTurn: true },
     { usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 2 } }, { usage: { inputTokens: -1, outputTokens: 1, cachedInputTokens: 0 } }]) {
     await t.test(JSON.stringify(scenario), async () => fixture(scenario, async ({ options }) => {
       const session = await createManagedModelSession(options);
@@ -365,10 +367,24 @@ test('adversarial model/tool/protocol/account/source events hold without leaking
   }
 });
 
-test('remote-control enablement is rejected even before a model port becomes ready', async () => {
-  await fixture({ idleRemote: true }, async ({ options, records }) => {
-    await assert.rejects(createManagedModelSession(options), { code: 'UNSUPPORTED_EVENT' });
-    assert.equal((await records()).some(row => ['thread/start', 'turn/start'].includes(row.method)), false);
+test('only documented native disabled remote status is accepted in both idle and active phases', async t => {
+  const adversaries = [
+    ['connecting', remoteStatus('connecting')], ['connected', remoteStatus('connected')], ['errored', remoteStatus('errored')],
+    ['unknown enum', remoteStatus('future-status')], ['legacy nested false', remoteStatus({ enabled: false })],
+    ['missing required metadata', { status: 'disabled', serverName: 'synthetic-server' }],
+    ['invalid metadata type', { ...remoteStatus('disabled'), environmentId: 42 }],
+  ];
+  for (const phase of ['idle', 'active']) for (const [label, params] of adversaries) await t.test(`${phase}: ${label}`, async () => {
+    await fixture({ [`${phase}RemoteParams`]: params }, async ({ options, records }) => {
+      if (phase === 'idle') {
+        await assert.rejects(createManagedModelSession(options), { code: 'UNSUPPORTED_EVENT' });
+        assert.equal((await records()).some(row => ['thread/start', 'turn/start'].includes(row.method)), false);
+      } else {
+        const session = await createManagedModelSession(options);
+        try { await assert.rejects(session.generate(request(), new AbortController().signal), { code: 'UNSUPPORTED_EVENT' }); }
+        finally { await session.close(); }
+      }
+    });
   });
 });
 

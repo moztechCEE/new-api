@@ -252,3 +252,34 @@ candidate grant is not a general model-job grant. Cross-service authenticated
 DEV producers and server-enrolled synthetic SQL read fences are still needed
 for candidate preparation, normal API manual final review and Worker jobs.
 Normal DEV, New API VM, production and existing data remain unchanged.
+
+### First native reusable-session attempt
+
+Runtime `1bf304d8575dcdfce349c55b7d15119a954a0824` passed exact
+[CI40348428192](https://github.com/moztechCEE/new-api/actions/runs/40348428192),
+both Node 20/22 jobs. The main-agent native two-phase fixed synthetic probe then
+held at **startup / `UNSUPPORTED_EVENT`**, before a login URL or generation.
+The local process/temp home closed; no new account grant, model response, API
+fallback, Corely connection, sending or learning was obtained. This first
+failure is retained. It is being diagnosed using an empty-home/no-login native
+startup and public notification classes only, not raw params or error text;
+do not weaken unknown-event rejection or count CI as a native success.
+
+The no-login diagnostic subsequently identified a concrete shape mismatch:
+installed `RemoteControlStatusChangedNotification` defines a string status enum,
+and the native startup sent `status: "disabled"`; the fake fixture/guard had
+expected a nested `status.enabled: false`. Only public method/field types and
+the static enum match were retained, not installation ID/server-name values or
+raw params. Native `account/read` was null and no login/model/turn/API request
+was made. The repair must accept only the documented disabled shape and keep
+connecting/connected/errored/unknown/malformed states rejected; a new exact
+source/CI and native preflight are required before another model attempt.
+
+The minimal compatibility repair now passes **408/408** clean Node 20 offline
+tests, zero fail/skip/cancel. Default fake flows emit the real native disabled
+shape both idle and active, while connecting/connected/errored/unknown, the old
+nested shape and malformed metadata remain rejected. The actual native
+credential-free session factory now stops at expected `AUTH_REQUIRED`, not the
+prior unsupported event; login-start/model/turn/API counts remain zero and its
+local process/temp home were cleaned. Only the model-session pair changed;
+exact new runtime CI is still required before the two-phase model retry.

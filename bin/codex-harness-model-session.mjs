@@ -294,7 +294,11 @@ class ManagedModelSession {
   }
   notification(method, p) {
     if (method === 'remoteControl/status/changed') {
-      if (p?.status?.enabled !== false) held('UNSUPPORTED_EVENT');
+      // Installed v2 RemoteControlStatusChangedNotification uses a string
+      // enum, not { enabled: false }. Disabled metadata grants no capability.
+      if (!p || typeof p !== 'object' || Array.isArray(p) || p.status !== 'disabled' ||
+          typeof p.installationId !== 'string' || typeof p.serverName !== 'string' ||
+          (p.environmentId !== undefined && p.environmentId !== null && typeof p.environmentId !== 'string')) held('UNSUPPORTED_EVENT');
       return;
     }
     if (method === 'account/updated') {
