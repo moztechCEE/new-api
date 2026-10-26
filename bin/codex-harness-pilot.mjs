@@ -201,6 +201,16 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
     generationHandler = msg => {
       const p = msg.params;
       if (p?.threadId !== undefined && p.threadId !== threadId) throw new HarnessError('PROTOCOL_ERROR');
+      if (msg.method === 'thread/started') {
+        if (p?.thread?.id !== threadId) throw new HarnessError('PROTOCOL_ERROR');
+        return;
+      }
+      if (msg.method === 'account/updated') {
+        if (p?.authMode !== 'chatgpt' || (p.planType !== undefined && p.planType !== identity.planType)) {
+          throw new HarnessError('AUTH_MODE_REJECTED');
+        }
+        return;
+      }
       if (msg.method === 'turn/started') {
         if (turnId || typeof p?.turn?.id !== 'string') throw new HarnessError('PROTOCOL_ERROR');
         turnId = p.turn.id;

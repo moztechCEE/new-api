@@ -244,6 +244,8 @@ input.on('line', line => {
     if (scenario.overflow) return process.stdout.write('x'.repeat(1024 * 1024 + 1));
     if (scenario.tool) return send({ id: 900, method: 'item/commandExecution/requestApproval', params: {
       threadId: 'synthetic-thread', turnId: 'synthetic-turn', command: 'synthetic-command' } });
+    notify('thread/started', { thread: { id: 'synthetic-thread' } });
+    notify('account/updated', { authMode: 'chatgpt', planType: 'pro' });
     notify('turn/started', { threadId: 'synthetic-thread', turn: { id: 'synthetic-turn' } });
     if (scenario.error) return notify('error', { threadId: 'synthetic-thread', turnId: 'synthetic-turn',
       message: 'synthetic-auth-field-must-not-escape' });
