@@ -389,8 +389,16 @@ Companion Corely authorization runtime
 [CI40356718251](https://github.com/moztechCEE/service-orchestrator/actions/runs/40356718251),
 including ephemeral PostgreSQL authorization-snapshot and full integration
 stability checks; local fresh **6,888/6,888** and forced build/types/lint pass.
-The new client still requires its own frozen source/exact CI before any normal
-connection attempt. Neither authorization source is deployed. New API VM
+The client is frozen/pushed as
+**d406277d7aea198c186d9eb29aad261760c4f940**; exact
+[CI40361803882](https://github.com/moztechCEE/new-api/actions/runs/40361803882)
+was read back with matching head SHA and both Node20/22 jobs SUCCESS.
+Neither authorization source is deployed. New API VM
 channel/provider configuration remains unchanged. Model-job HTTP operations,
 trusted DEV producers, server-owned synthetic read fences and normal
 API/Worker/manual-final-review registration are still open.
+
+This source/result checkpoint was queued to the authorized secondary shared
+inbox as `3fb1a936-fb90-487d-8f41-27fd9bc8b8ae`. One receipt check is pending,
+without read/ACK or native delivery; secondary remains paused. New cloud/IAM
+scope must be separately confirmed, not inherited from old approvals.
