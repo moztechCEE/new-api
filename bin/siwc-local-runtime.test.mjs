@@ -346,6 +346,7 @@ test('synthetic probe calls only models and Responses using the authorized plan 
     assert.equal(url, `${RESOURCE}/responses`);
     assert.equal(init.method, 'POST');
     assert.equal(init.headers.Accept, 'text/event-stream');
+    assert.match(init.headers['X-Client-Request-Id'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     assert.deepEqual(JSON.parse(init.body), syntheticRequest());
     return new Response(streamBody([completedEvent()]), { headers: { 'content-type': 'text/event-stream' } });
   });
@@ -425,8 +426,12 @@ test('synthetic probe accepts case-insensitive exact SSE MIME with charset, neve
       return new Response(streamBody([completedEvent()]), { headers: { 'content-type': 'text/event-streamx' } });
     }), error => {
       assert.equal(error.code, 'INVALID_STREAM_CONTENT_TYPE');
-      assert.deepEqual(error.diagnostic, { httpStatus: 200, contentTypeClass: 'OTHER',
-        catalogModelVerified: true, bodyShape: 'NOT_PARSED' });
+      const { clientRequestId, responseHeaderCount, fetchResponseType, ...structural } = error.diagnostic;
+      assert.match(clientRequestId, /^[0-9a-f-]{36}$/);
+      assert.equal(responseHeaderCount, 1);
+      assert.equal(fetchResponseType, 'default');
+      assert.deepEqual(structural, { httpStatus: 200, contentTypeClass: 'OTHER',
+        catalogModelVerified: true, bodyShape: 'SSE_SHAPED' });
       return true;
     });
     assert.deepEqual(calls, [`${RESOURCE}/models`, `${RESOURCE}/responses`]);
@@ -438,9 +443,12 @@ test('successful HTTP without SSE is never inference completion or a reason to u
     ['JSON response object', () => jsonResponse({ object: 'response', status: 'completed',
       output: completedEvent().response.output }), 200, 'JSON', 'RESPONSE_OBJECT', 'completed'],
     ['JSON detail', () => jsonResponse({ detail: 'synthetic-private-detail' }), 200, 'JSON', 'DETAIL_OBJECT'],
-    ['HTML', () => new Response('<h1>synthetic-private-html</h1>', { headers: { 'content-type': 'text/html; charset=utf-8' } }), 200, 'HTML', 'NOT_PARSED'],
-    ['missing MIME', () => new Response(Buffer.from('synthetic-private-body')), 200, 'MISSING', 'NOT_PARSED'],
-    ['no content 204', () => new Response(null, { status: 204 }), 204, 'MISSING', 'NOT_PARSED'],
+    ['HTML', () => new Response('<h1>synthetic-private-html</h1>', { headers: { 'content-type': 'text/html; charset=utf-8' } }), 200, 'HTML', 'HTML_SHAPED'],
+    ['missing MIME', () => new Response(Buffer.from('synthetic-private-body')), 200, 'MISSING', 'OTHER_TEXT'],
+    ['empty HTTP 200', () => new Response(null), 200, 'MISSING', 'EMPTY'],
+    ['no content 204', () => new Response(null, { status: 204 }), 204, 'MISSING', 'EMPTY'],
+    ['headerless SSE is diagnostic only', () => new Response(streamBody([completedEvent()])), 200, 'MISSING', 'SSE_SHAPED'],
+    ['headerless JSON error', () => new Response(Buffer.from(JSON.stringify({ error: { code: 'subscription_sharing_user_not_eligible' } }))), 200, 'MISSING', 'ERROR_OBJECT'],
   ];
   for (const [name, response, status, contentTypeClass, bodyShape, responseStatus] of cases) await t.test(name, async () => {
     const calls = [];
@@ -450,7 +458,12 @@ test('successful HTTP without SSE is never inference completion or a reason to u
       return response();
     }), error => {
       assert.equal(error.code, 'INVALID_STREAM_CONTENT_TYPE');
-      assert.deepEqual(error.diagnostic, { httpStatus: status, contentTypeClass, catalogModelVerified: true,
+      const { clientRequestId, responseHeaderCount, fetchResponseType, errorCode, ...structural } = error.diagnostic;
+      assert.match(clientRequestId, /^[0-9a-f-]{36}$/);
+      assert.equal(responseHeaderCount, contentTypeClass === 'MISSING' ? 0 : 1);
+      assert.equal(fetchResponseType, 'default');
+      assert.equal(errorCode, name === 'headerless JSON error' ? 'subscription_sharing_user_not_eligible' : undefined);
+      assert.deepEqual(structural, { httpStatus: status, contentTypeClass, catalogModelVerified: true,
         bodyShape, ...(responseStatus ? { responseStatus } : {}) });
       assert.equal(JSON.stringify(error).includes('synthetic-private'), false);
       return true;
@@ -505,20 +518,22 @@ test('inference diagnostic hashes request IDs and never returns raw headers', as
   assert.equal('requestIdHash' in await inferenceFailureDiagnostic(excessive), false);
 });
 
-test('inference diagnostic enforces 16 KiB JSON bound and cancels over-limit bodies', async () => {
+test('inference diagnostic enforces the 16 KiB bound regardless of MIME and cancels over-limit bodies', async () => {
   const payload = JSON.stringify({ detail: 'synthetic-private-detail' });
   const atLimit = `${payload}${' '.repeat(16384 - Buffer.byteLength(payload))}`;
   assert.equal((await inferenceFailureDiagnostic(new Response(atLimit, {
     headers: { 'content-type': 'Application/JSON; charset=UTF-8' },
   }))).bodyShape, 'DETAIL_OBJECT');
-  let canceled = false;
-  const body = new ReadableStream({
-    start(controller) { controller.enqueue(new Uint8Array(16385)); },
-    cancel() { canceled = true; },
-  });
-  const result = await inferenceFailureDiagnostic(new Response(body, { headers: { 'content-type': 'application/json' } }));
-  assert.equal(result.bodyShape, 'OVER_LIMIT');
-  assert.equal(canceled, true);
+  for (const headers of [{ 'content-type': 'application/json' }, {}]) {
+    let canceled = false;
+    const body = new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(16385)); },
+      cancel() { canceled = true; },
+    });
+    const result = await inferenceFailureDiagnostic(new Response(body, { headers }));
+    assert.equal(result.bodyShape, 'OVER_LIMIT');
+    assert.equal(canceled, true);
+  }
 });
 
 test('inference diagnostic terminates unreadable, interrupted or stalled bodies without private errors', { timeout: 2000 }, async () => {
@@ -533,26 +548,28 @@ test('inference diagnostic terminates unreadable, interrupted or stalled bodies 
   assert.equal((await inferenceFailureDiagnostic(new Response(interrupted, {
     headers: { 'content-type': 'application/json' },
   }))).bodyShape, 'UNREADABLE');
-  let canceled = false;
-  const stalled = new ReadableStream({ cancel() { canceled = true; } });
-  const diagnostic = await inferenceFailureDiagnostic(new Response(stalled, {
-    headers: { 'content-type': 'application/json' },
-  }), 5);
-  assert.equal(diagnostic.bodyShape, 'UNREADABLE');
-  assert.equal(canceled, true);
-  assert.equal(JSON.stringify(diagnostic).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
+  for (const headers of [{ 'content-type': 'application/json' }, {}]) {
+    let canceled = false;
+    const stalled = new ReadableStream({ cancel() { canceled = true; } });
+    const diagnostic = await inferenceFailureDiagnostic(new Response(stalled, { headers }), 5);
+    assert.equal(diagnostic.bodyShape, 'UNREADABLE');
+    assert.equal(canceled, true);
+    assert.equal(JSON.stringify(diagnostic).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
+  }
 });
 
 test('ProbeError accepts only safe diagnostic fields and rejects untrusted constructor extras', () => {
   const diagnostic = { httpStatus: 403, contentTypeClass: 'JSON', bodyShape: 'ERROR_OBJECT',
     catalogModelVerified: true, errorCode: 'subscription_sharing_user_not_eligible', responseStatus: 'failed',
     requestIdHash: digest('synthetic-request'),
+    clientRequestId: '01234567-89ab-4cde-8f01-23456789abcd', responseHeaderCount: 0, fetchResponseType: 'basic',
     message: 'SYNTHETIC_SECRET_DO_NOT_EMIT', detail: 'SYNTHETIC_SECRET_DO_NOT_EMIT',
     token: 'SYNTHETIC_SECRET_DO_NOT_EMIT', requestId: 'req_private', headers: { authorization: 'private' } };
   const error = new ProbeError('INFERENCE_HTTP_403', diagnostic);
   assert.deepEqual(error.diagnostic, { httpStatus: 403, contentTypeClass: 'JSON', bodyShape: 'ERROR_OBJECT',
     catalogModelVerified: true, errorCode: 'subscription_sharing_user_not_eligible', responseStatus: 'failed',
-    requestIdHash: digest('synthetic-request') });
+    requestIdHash: digest('synthetic-request'),
+    clientRequestId: '01234567-89ab-4cde-8f01-23456789abcd', responseHeaderCount: 0, fetchResponseType: 'basic' });
   assert.equal(Object.isFrozen(error.diagnostic), true);
   assert.equal(error.message, 'INFERENCE_HTTP_403');
   assert.equal(JSON.stringify(error).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
@@ -560,6 +577,7 @@ test('ProbeError accepts only safe diagnostic fields and rejects untrusted const
     httpStatus: 600, contentTypeClass: 'application/json', bodyShape: 'raw-private-body',
     catalogModelVerified: false, errorCode: 'unknown-private-code', responseStatus: 'private-status',
     requestIdHash: 'raw-id', arbitrary: 'SYNTHETIC_SECRET_DO_NOT_EMIT',
+    clientRequestId: 'SYNTHETIC_SECRET_DO_NOT_EMIT', responseHeaderCount: 257, fetchResponseType: 'private-type',
   }).diagnostic, {});
 });
 

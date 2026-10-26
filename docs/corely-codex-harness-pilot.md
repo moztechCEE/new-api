@@ -1,12 +1,36 @@
 # Local Codex harness pilot
 
+## 2026-10-27 SIWC VM clarification and bounded inference diagnosis
+
+The managed native app-server restriction below must not be generalized to all
+SIWC use. Official [self-hosted VM guidance](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
+explicitly describes an open-source app on its owner's remote VM, using a
+separate stable VM host identity and the selected tool's normal OAuth session.
+This is distinct from offering a paid/hosted app to other users; it does not
+automatically establish eligibility for Corely's multi-tenant hosted service.
+No Codex/Luna credential cache may be substituted for this registration.
+
+The next actual check uses the public SIWC Responses route and Info's normal
+authorization, with no API key fallback. A missing/incorrect Content-Type now
+receives a bounded 16 KiB / 3-second structural diagnostic instead of immediately
+discarding the body. Only fixed shape enums, hashed provider request IDs and a
+generated client correlation ID can leave the process. This revision still
+rejects wrong MIME, empty responses and SSE-shaped text without a verified
+completion; it does not relax inference success or provider eligibility.
+
+Fresh offline regression: **531/531**, zero fail/skip/cancel. The initial added
+fixture incorrectly passed a ReadableStream to Buffer.from; correcting that
+fixture did not change runtime success criteria. No live proof, VM credential
+transfer, New API upstream channel or Corely connection is claimed by tests.
+
 ## 2026-10-27 hosted-use correction and local guard
 
 Fresh [official auth guidance](https://learn.chatgpt.com/docs/app-server#auth-endpoints)
 explicitly excludes commercial/hosted services from app-server authentication.
 The [SIWC public plan-usage terms](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt#usage-policy-and-terms)
-limit that route to local OSS/personal projects; remotely hosted/paid apps need
-access first. Do not turn this local factory into Corely's cloud job relay or
+require access confirmation before offering remotely hosted/paid apps to users;
+the owner-operated OSS VM path is clarified above. Do not turn the managed
+native-auth factory into Corely's cloud job relay or
 use stock type57 credential import as a substitute. A normal Corely grant,
 synthetic scope or operator approval does not confer provider access.
 

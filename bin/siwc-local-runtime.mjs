@@ -1,5 +1,5 @@
 // Local personal-project SIWC probe. Not a hosted-service credential importer.
-import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, verify } from 'node:crypto';
 
 export const ISSUER = 'https://auth.openai.com';
 export const RESOURCE = 'https://api.openai.com/v1';
@@ -19,11 +19,14 @@ export class ProbeError extends Error {
     const safe = {};
     if (Number.isInteger(diagnostic.httpStatus) && diagnostic.httpStatus >= 100 && diagnostic.httpStatus <= 599) safe.httpStatus = diagnostic.httpStatus;
     if (['SSE', 'JSON', 'HTML', 'TEXT', 'BINARY', 'OTHER', 'MISSING'].includes(diagnostic.contentTypeClass)) safe.contentTypeClass = diagnostic.contentTypeClass;
-    if (['NOT_PARSED', 'OVER_LIMIT', 'ARRAY', 'SCALAR', 'ERROR_OBJECT', 'DETAIL_OBJECT', 'RESPONSE_OBJECT', 'OTHER_OBJECT', 'UNREADABLE'].includes(diagnostic.bodyShape)) safe.bodyShape = diagnostic.bodyShape;
+    if (['NOT_PARSED', 'EMPTY', 'SSE_SHAPED', 'HTML_SHAPED', 'OTHER_TEXT', 'OVER_LIMIT', 'ARRAY', 'SCALAR', 'ERROR_OBJECT', 'DETAIL_OBJECT', 'RESPONSE_OBJECT', 'OTHER_OBJECT', 'UNREADABLE'].includes(diagnostic.bodyShape)) safe.bodyShape = diagnostic.bodyShape;
     if (diagnostic.catalogModelVerified === true) safe.catalogModelVerified = true;
     if (PLAN_ERROR_CODES.has(diagnostic.errorCode)) safe.errorCode = diagnostic.errorCode;
     if (['completed', 'in_progress', 'failed', 'incomplete', 'queued'].includes(diagnostic.responseStatus)) safe.responseStatus = diagnostic.responseStatus;
     if (typeof diagnostic.requestIdHash === 'string' && /^[0-9a-f]{64}$/.test(diagnostic.requestIdHash)) safe.requestIdHash = diagnostic.requestIdHash;
+    if (typeof diagnostic.clientRequestId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(diagnostic.clientRequestId)) safe.clientRequestId = diagnostic.clientRequestId;
+    if (Number.isInteger(diagnostic.responseHeaderCount) && diagnostic.responseHeaderCount >= 0 && diagnostic.responseHeaderCount <= 256) safe.responseHeaderCount = diagnostic.responseHeaderCount;
+    if (['basic', 'cors', 'default', 'error', 'opaque', 'opaqueredirect'].includes(diagnostic.fetchResponseType)) safe.fetchResponseType = diagnostic.fetchResponseType;
     this.diagnostic = Object.freeze(safe);
   }
 }
@@ -184,7 +187,6 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
     catalogModelVerified: true, bodyShape: 'NOT_PARSED' };
   const requestId = response.headers.get('x-request-id');
   if (requestId && requestId.length <= 1024) diagnostic.requestIdHash = digest(requestId);
-  if (media !== 'application/json') { void response.body?.cancel().catch(() => {}); return diagnostic; }
   const bytes = [];
   let length = 0, reader, timer;
   try {
@@ -197,7 +199,15 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
       if (length > 16384) { diagnostic.bodyShape = 'OVER_LIMIT'; return diagnostic; }
       bytes.push(Buffer.from(part.value));
     }
-    const body = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(Buffer.concat(bytes)));
+    const text = new TextDecoder('utf8', { fatal: true }).decode(Buffer.concat(bytes));
+    if (!text.trim()) { diagnostic.bodyShape = 'EMPTY'; return diagnostic; }
+    // Inspect only bounded shape when MIME is absent/wrong; never treat this as a completed inference.
+    if (media !== 'application/json' && !/^[\s]*[\[{]/.test(text)) {
+      diagnostic.bodyShape = /^(?:event:|data:|:)/m.test(text) ? 'SSE_SHAPED' :
+        /^\s*(?:<!doctype\s+html\b|<html\b|<[a-z][^>]*>)/i.test(text) ? 'HTML_SHAPED' : 'OTHER_TEXT';
+      return diagnostic;
+    }
+    const body = JSON.parse(text);
     diagnostic.bodyShape = Array.isArray(body) ? 'ARRAY' : body === null || typeof body !== 'object' ? 'SCALAR' :
       body.error && typeof body.error === 'object' && !Array.isArray(body.error) ? 'ERROR_OBJECT' :
       Object.hasOwn(body, 'detail') ? 'DETAIL_OBJECT' : body.object === 'response' ? 'RESPONSE_OBJECT' : 'OTHER_OBJECT';
@@ -261,13 +271,16 @@ export async function runSyntheticProbe(session, fetchImpl = fetch, signal) {
   const headers = { Authorization: `Bearer ${session.accessToken}` };
   const catalog = await publicJson(`${RESOURCE}/models`, { headers }, fetchImpl, signal);
   selectExactModel(catalog);
+  const clientRequestId = randomUUID();
   let response;
   try {
-    response = await fetchImpl(`${RESOURCE}/responses`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    response = await fetchImpl(`${RESOURCE}/responses`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Accept: 'text/event-stream', 'X-Client-Request-Id': clientRequestId },
       body: JSON.stringify(syntheticRequest()), redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000) });
   } catch { fail('INFERENCE_REQUEST_FAILED'); }
-  if (!response.ok) throw new ProbeError(`INFERENCE_HTTP_${response.status}`, await inferenceFailureDiagnostic(response));
+  const failureDiagnostic = async () => ({ ...await inferenceFailureDiagnostic(response), clientRequestId,
+    responseHeaderCount: Math.min([...response.headers.keys()].length, 256), fetchResponseType: response.type });
+  if (!response.ok) throw new ProbeError(`INFERENCE_HTTP_${response.status}`, await failureDiagnostic());
   const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
-  if (media !== 'text/event-stream') throw new ProbeError('INVALID_STREAM_CONTENT_TYPE', await inferenceFailureDiagnostic(response));
+  if (media !== 'text/event-stream') throw new ProbeError('INVALID_STREAM_CONTENT_TYPE', await failureDiagnostic());
   return consumeProbeStream(response.body);
 }
