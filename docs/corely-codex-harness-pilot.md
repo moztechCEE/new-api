@@ -314,3 +314,35 @@ Companion Corely `d2beac8c29c0e68463f3f51d67ea8897ec816419` exact
 has passed. The separately approved DEV model-job grant is being implemented;
 it does not complete producer/read-fence wiring or make New API a connected
 personal upstream channel. Normal DEV, VM, production and existing data remain unchanged.
+
+### Actual per-account generation and independent review (2026-10-26/27)
+
+The empty-roots engine was frozen as `14dc1021f0ae04bf1550606d659b1a74c360ce01`.
+Exact [CI40353251316](https://github.com/moztechCEE/new-api/actions/runs/40353251316)
+passed on Node 20/22. Main independently reran all **411/411** offline tests,
+zero fail/skip/cancel, then ran one fixed two-phase synthetic probe per account.
+Each used a separate fresh managed process/home, normal official account
+selection and **personal account**, not the company workspace. No existing
+Codex/Luna auth cache or Platform API key was supplied.
+
+| Native account receipt | Model | Generation | Separate-thread review |
+| --- | --- | ---: | ---: |
+| Info / managed ChatGPT / Pro | `gpt-6.1-sol` | 7,971 ms | 4,880 ms |
+| Eason / managed ChatGPT / Pro | `gpt-6.1-sol` | 5,480 ms | 11,108 ms |
+
+Both completed with schema-valid output, supported/answered independent review,
+same-account checks and input/output usage receipts. Generator input/output
+tokens were 5,793/30 and 5,791/30; reviewer input/output were 5,835/20 and
+5,833/20, cached input zero. Both used the same verified official binary SHA
+`0d5ac7aae20c4eda6242428d5e218c55ba96d8763fda2a271088ff37104b9d28`.
+Their local sessions and temporary homes closed after testing. This cleanup is
+not a claimed provider-side remote revocation.
+
+These are actual managed-personal execution receipts without API fallback,
+not just a model menu or login success. They are **not** exact plan-debit
+attestation, a Corely-connected conversation, original-50 quality/latency
+acceptance, live quota exhaustion/automatic failover, image support, manual
+sending or learning proof. `exactPlanDebitAttested:false`,
+`apiFallbackUsed:false`, `corelyConnected:false`, sending/learning false.
+The earlier protocol and sandbox holds remain above and are not erased by
+these successful probes. No cloud/VM/normal DEV/production changes occurred.
