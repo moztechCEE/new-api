@@ -24,6 +24,10 @@ synthetic success is not proof of hosted-customer-service eligibility.
   unverified plan, hidden/missing GPT-6.1 Sol, model rerouting, tool requests,
   incomplete turns and malformed output fail closed. There is no retry loop,
   account rotation or API fallback.
+- Protocol parameters are checked against the installed official runtime's
+  generated schema. In runtime 0.162.0-alpha.17.2, thread-start sandbox mode is
+  `read-only`, while turn-start sandbox policy type is `readOnly`; these are
+  different protocol types, not interchangeable spellings.
 - Shell, MCP apps/plugins, browsers, computer use, hooks and memory are not
   enabled. The turn is read-only with restricted reads of only the empty
   workspace. No candidate is saved, sent, approved or learned.

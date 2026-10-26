@@ -185,7 +185,9 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
     const identity = verifyAccount(await rpc('account/read', { refreshToken: false }));
     verifyModel(await rpc('model/list', { includeHidden: false, limit: 100 }));
     if (!runSynthetic) return { status: 'PREFLIGHT_PASSED', ...identity, model: MODEL, modelRequestMade: false, apiFallbackUsed: false };
-    const source = await rpc('thread/start', { model: MODEL, cwd, ephemeral: true, approvalPolicy: 'never', sandbox: 'readOnly',
+    // ThreadStartParams.SandboxMode uses kebab-case in the installed protocol;
+    // TurnStartParams.SandboxPolicy below uses a camel-case tagged union.
+    const source = await rpc('thread/start', { model: MODEL, cwd, ephemeral: true, approvalPolicy: 'never', sandbox: 'read-only',
       serviceName: 'corely_local_synthetic', developerInstructions: PROMPT });
     const threadId = source?.thread?.id;
     if (source.model !== MODEL || source?.thread?.modelProvider !== 'openai' || source?.thread?.ephemeral !== true ||

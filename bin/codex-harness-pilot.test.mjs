@@ -346,6 +346,7 @@ test('offline transport binds discovery and one exact synthetic turn to the same
     assert.equal(start.ephemeral, true);
     assert.equal(start.model, 'gpt-6.1-sol');
     assert.equal(start.approvalPolicy, 'never');
+    assert.equal(start.sandbox, 'read-only');
     assert.equal(turn.input.length, 1);
     assert.ok(turn.input[0].text.endsWith(`Reply with exactly: ${OUTPUT}`));
     assert.deepEqual(turn.sandboxPolicy, { type: 'readOnly', access: { type: 'restricted',
