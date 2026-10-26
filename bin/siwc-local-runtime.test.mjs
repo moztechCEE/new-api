@@ -300,6 +300,32 @@ test('SSE fails closed on errors, missing completion, mismatch, interruption and
   });
 });
 
+test('completed stream output items reconstruct terminal-empty responses without accepting partial deltas', async t => {
+  const index = { output_index: 0, content_index: 0, item_id: 'msg_synthetic' };
+  const delta = { type: 'response.output_text.delta', ...index, delta: PROBE_OUTPUT };
+  const done = { type: 'response.output_text.done', ...index, text: PROBE_OUTPUT };
+  const item = { type: 'response.output_item.done', output_index: 0,
+    item: { id: 'msg_synthetic', type: 'message', status: 'completed',
+      content: [{ type: 'output_text', text: PROBE_OUTPUT }] } };
+  for (const end of [[done], [item], [done, item]]) {
+    const result = await consumeProbeStream(streamBody([delta, ...end, completedEvent({ output: [] })]));
+    assert.equal(result.completed, true);
+    assert.equal(result.outputHash, digest(PROBE_OUTPUT));
+  }
+  for (const [name, events, code] of [
+    ['delta alone', [delta, completedEvent({ output: [] })], 'SYNTHETIC_OUTPUT_MISMATCH'],
+    ['no completion', [delta, done, item], 'MISSING_COMPLETED_EVENT'],
+    ['contradicting done', [delta, { ...done, text: 'wrong' }, completedEvent({ output: [] })], 'INVALID_STREAM_EVENT'],
+    ['changed item identity', [delta, { ...done, item_id: 'msg_other' }, completedEvent({ output: [] })], 'INVALID_STREAM_EVENT'],
+    ['delta after part done', [delta, done, delta, completedEvent({ output: [] })], 'INVALID_STREAM_EVENT'],
+    ['noncompleted item', [delta, { ...item, item: { ...item.item, status: 'in_progress' } }, completedEvent({ output: [] })], 'INVALID_STREAM_EVENT'],
+    ['contradicting snapshot', [delta, done, completedEvent({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'wrong' }] }] })], 'SYNTHETIC_OUTPUT_MISMATCH'],
+    ['wrong model', [delta, done, completedEvent({ output: [], model: 'gpt-6-astra' })], 'INVALID_COMPLETION'],
+    ['invalid index', [{ ...delta, output_index: -1 }, done, completedEvent({ output: [] })], 'INVALID_STREAM_EVENT'],
+    ['changed response identity', [{ type: 'response.created', response: { id: 'resp_other', model: MODEL } }, delta, done, completedEvent({ output: [] })], 'INVALID_COMPLETION'],
+  ]) await t.test(name, async () => assert.rejects(consumeProbeStream(streamBody(events)), { code }));
+});
+
 test('publicJson pins an exact official endpoint and refuses redirects without following them', async () => {
   let calls = 0;
   const fetchMock = async (url, init) => {

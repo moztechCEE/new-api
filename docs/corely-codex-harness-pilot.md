@@ -51,6 +51,22 @@ confirmed. A further bounded diagnostic records only final/delta lengths,
 hashes and equality flags to separate output assembly from model compliance;
 it does not admit a mismatching reply. The full fresh suite remains 537/537.
 
+Runtime `efc6b89470ad348eb3974f2395d0410832868eca` passed exact
+[Node20/22 CI40374445300](https://github.com/moztechCEE/new-api/actions/runs/40374445300).
+Its one normal Info attempt verified account and plan scope, completed the exact
+model, and exposed the actual assembly defect: terminal text length0, streamed
+text length27. The streamed hash
+`dda11e5f4241434fdd59c7726c7d6bad22141f13a877ff053de4b9ea71f187fb`
+exactly matches the fixed expected answer. Correlation:
+`452fd656-5feb-4c1b-9efd-909ce6e6c1e5`. Revocation confirmed; no API key.
+
+The next parser revision reconstructs text from indexed, identity-bound
+`response.output_text.done` / completed output items when the terminal snapshot
+contains no text, as the [official stream accumulator](https://github.com/openai/openai-node/blob/main/src/lib/responses/ResponseStream.ts)
+does. It never accepts a delta alone: a terminal exact-model completion and
+closed consistent output parts are required. Contradicting text, changed item or
+response identity, partial/error/late data and bounds remain fail-closed.
+
 ## 2026-10-27 hosted-use correction and local guard
 
 Fresh [official auth guidance](https://learn.chatgpt.com/docs/app-server#auth-endpoints)

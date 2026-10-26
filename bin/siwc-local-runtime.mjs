@@ -232,13 +232,39 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
 export async function consumeProbeStream(body) {
   if (!body) fail('MISSING_COMPLETED_EVENT');
   const decoder = new TextDecoder('utf8', { fatal: true });
-  let buffer = '', total = 0, text = '', completed;
+  let buffer = '', total = 0, text = '', completed, responseId;
+  const parts = new Map(), identities = new Map();
+  function partFor(outputIndex, contentIndex, itemId) {
+    if (!Number.isSafeInteger(outputIndex) || outputIndex < 0 || outputIndex > 63 ||
+        !Number.isSafeInteger(contentIndex) || contentIndex < 0 || contentIndex > 63 ||
+        typeof itemId !== 'string' || !itemId || itemId.length > 256) fail('INVALID_STREAM_EVENT');
+    if (identities.has(outputIndex) && identities.get(outputIndex) !== itemId) fail('INVALID_STREAM_EVENT');
+    identities.set(outputIndex, itemId);
+    const key = `${outputIndex}:${contentIndex}`;
+    if (!parts.has(key)) {
+      if (parts.size >= 64) fail('OUTPUT_TOO_LARGE');
+      parts.set(key, { outputIndex, contentIndex, delta: '', done: undefined });
+    }
+    return parts.get(key);
+  }
+  function closePart(outputIndex, contentIndex, itemId, value) {
+    const part = partFor(outputIndex, contentIndex, itemId);
+    if (typeof value !== 'string' || value.length > 65536 ||
+        (part.delta && part.delta !== value) || (part.done !== undefined && part.done !== value)) fail('INVALID_STREAM_EVENT');
+    part.done = value;
+  }
   function consume(frame) {
     const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
     if (!data || data === '[DONE]') return;
     let event;
     try { event = JSON.parse(data); } catch { fail('INVALID_STREAM_EVENT'); }
     if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string') fail('INVALID_STREAM_EVENT');
+    if (['response.created', 'response.queued', 'response.in_progress', 'response.completed'].includes(event.type)) {
+      if (typeof event.response?.id !== 'string' || !event.response.id ||
+          (responseId && responseId !== event.response.id) ||
+          (event.response.model !== undefined && event.response.model !== MODEL)) fail('INVALID_COMPLETION');
+      responseId = event.response.id;
+    }
     if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) {
       throw new ProbeError('INFERENCE_NOT_COMPLETED', { errorCode: event.response?.error?.code ?? event.error?.code ?? event.code });
     }
@@ -246,6 +272,21 @@ export async function consumeProbeStream(body) {
       if (completed || typeof event.delta !== 'string') fail('INVALID_STREAM_EVENT');
       text += event.delta;
       if (text.length > 65536) fail('OUTPUT_TOO_LARGE');
+      if (event.output_index !== undefined || event.content_index !== undefined || event.item_id !== undefined) {
+        const part = partFor(event.output_index, event.content_index, event.item_id);
+        if (part.done !== undefined) fail('INVALID_STREAM_EVENT');
+        part.delta += event.delta;
+      }
+    }
+    if (event.type === 'response.output_text.done') {
+      if (completed) fail('INVALID_STREAM_EVENT');
+      closePart(event.output_index, event.content_index, event.item_id, event.text);
+    }
+    if (event.type === 'response.output_item.done' && event.item?.type === 'message') {
+      if (completed || event.item.status !== 'completed' || !Array.isArray(event.item.content)) fail('INVALID_STREAM_EVENT');
+      event.item.content.forEach((part, index) => {
+        if (part?.type === 'output_text') closePart(event.output_index, index, event.item.id, part.text);
+      });
     }
     if (event.type === 'response.completed') {
       if (completed || event.response?.status !== 'completed' || event.response?.model !== MODEL ||
@@ -272,13 +313,19 @@ export async function consumeProbeStream(body) {
   }
   if (!completed) fail('MISSING_COMPLETED_EVENT');
   if (!Array.isArray(completed.output)) fail('INVALID_COMPLETION');
-  const finalText = completed.output.filter(i => i?.type === 'message')
+  const snapshotText = completed.output.filter(i => i?.type === 'message')
     .flatMap(i => i.content ?? []).filter(c => c.type === 'output_text').map(c => c.text).join('');
-  if (!finalText || finalText.trim() !== PROBE_OUTPUT || (text && text !== finalText)) {
+  const ordered = [...parts.values()].sort((a, b) => a.outputIndex - b.outputIndex || a.contentIndex - b.contentIndex);
+  const allPartsClosed = ordered.length > 0 && ordered.every(part => part.done !== undefined);
+  const itemText = allPartsClosed ? ordered.map(part => part.done).join('') : '';
+  const finalText = snapshotText || itemText;
+  const streamText = ordered.length ? ordered.map(part => part.delta).join('') : text;
+  if (!finalText || finalText.trim() !== PROBE_OUTPUT || (streamText && streamText !== finalText) ||
+      (snapshotText && itemText && snapshotText !== itemText)) {
     throw new ProbeError('SYNTHETIC_OUTPUT_MISMATCH', { completedEventVerified: true,
-      finalTextMatchesExpected: finalText.trim() === PROBE_OUTPUT, deltaMatchesFinal: text === finalText,
-      finalTextLength: finalText.length, deltaTextLength: text.length,
-      finalTextHash: digest(finalText), deltaTextHash: digest(text) });
+      finalTextMatchesExpected: finalText.trim() === PROBE_OUTPUT, deltaMatchesFinal: streamText === finalText,
+      finalTextLength: finalText.length, deltaTextLength: streamText.length,
+      finalTextHash: digest(finalText), deltaTextHash: digest(streamText) });
   }
   let usage;
   if (completed.usage !== undefined && completed.usage !== null) {
