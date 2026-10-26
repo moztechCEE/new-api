@@ -12,6 +12,7 @@ import { pathToFileURL } from 'node:url';
 export const MODEL = 'gpt-6.1-sol';
 export const EXPECTED_ACCOUNT = 'info@moztech.cc';
 export const EXPECTED_OUTPUT = 'Corely Codex harness probe OK.';
+const EXPECTED_DISABLED_TOOL_WARNING = 'Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.';
 const PROMPT = `This is a local, owner-operated synthetic integration test. Do not inspect files, invoke tools, access websites, modify anything, or use prior conversation history. Reply with exactly: ${EXPECTED_OUTPUT}`;
 const ERRORS = new Set(['INVALID_OPTIONS', 'UNSAFE_HOME', 'SPAWN_FAILED', 'PROTOCOL_ERROR', 'RPC_FAILED', 'TIMEOUT',
   'OUTPUT_LIMIT', 'AUTH_REQUIRED', 'AUTH_MODE_REJECTED', 'WRONG_ACCOUNT', 'PLAN_UNVERIFIED', 'MODEL_UNAVAILABLE',
@@ -251,6 +252,10 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
         'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta'].includes(msg.method)) return;
       if (msg.method === 'model/rerouted') throw new HarnessError('MODEL_CHANGED');
       if (msg.method === 'error') throw new HarnessError('TURN_FAILED');
+      // Reproduced with an empty unauthenticated home on the pinned runtime:
+      // this warning confirms the intentionally disabled execution host. It
+      // does not authorize enabling it. Other warnings remain fail-closed.
+      if (msg.method === 'warning' && p?.message === EXPECTED_DISABLED_TOOL_WARNING) return;
       if (typeof msg.method !== 'string' || /^(item|account|auth|model|modelProvider|hook|mcpServer|app|process|command|fs|remoteControl)\//.test(msg.method) ||
           /error|warning|permission|approval/i.test(msg.method)) throw new HarnessError('UNSUPPORTED_EVENT', {
         method: 'notification', notification: msg.method,
