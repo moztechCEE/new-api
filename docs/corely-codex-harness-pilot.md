@@ -20,13 +20,17 @@ Existing fixed local proofs remain local proofs, with exact debit unverified.
 Author and main each reran fresh **528/528** offline SIWC+harness tests, zero
 fail/skip/cancel; targeted134 and independent21 checks also pass. No real login,
 model, API fallback, existing credential cache, cloud or Go channel mutation.
-Exact new source/CI is required before using this changed factory.
+Frozen runtime **c30668cf45590b11911e0e90834af2ffc4826114** passed exact
+[CI40369464872](https://github.com/moztechCEE/new-api/actions/runs/40369464872),
+matching head SHA and Node20/22 SUCCESS. This is not a live model/billing test.
 
 Normal UI currently shows New API channels0 / requests0, no Work connection
 receipt, and existing SIWC support under account/workspace/client technical
 review, not access confirmation. No extra inference retries were made. The
 previous forward plan needs a supported hosted provider and resolved public
 SIWC inference, not just a new DEV identity. Whole Corely is still BLOCKED.
+Correction notice `5f401138-ef8d-41b5-8791-f7d4f1c47bc6` was queued to secondary,
+one receipt pending, no read/ACK/native delivery; secondary remains paused.
 
 This is a **local, owner-operated synthetic integration pilot** of the official
 Codex agent, not an HTTP proxy, New API channel, automatic account pool or
