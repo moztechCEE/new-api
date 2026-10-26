@@ -43,6 +43,8 @@ jobs:
           node --check bin/codex-harness-corely-client.test.mjs
           node --check bin/codex-harness-model-session.mjs
           node --check bin/codex-harness-model-session.test.mjs
+          node --check bin/codex-harness-model-job-client.mjs
+          node --check bin/codex-harness-model-job-client.test.mjs
       - name: Run synthetic offline protocol regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs
       - name: Run synthetic offline harness regression

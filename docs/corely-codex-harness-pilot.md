@@ -346,3 +346,51 @@ sending or learning proof. `exactPlanDebitAttested:false`,
 `apiFallbackUsed:false`, `corelyConnected:false`, sending/learning false.
 The earlier protocol and sandbox holds remain above and are not erased by
 these successful probes. No cloud/VM/normal DEV/production changes occurred.
+
+### Separate DEV model-job OAuth client — authorization only (2026-10-27)
+
+`bin/codex-harness-model-job-client.mjs` implements the newly approved separate
+`corely:dev-model-jobs` grant, not an expansion of the old three-capability
+candidate client. It pins the exact isolated DEV issuer/resource, public client
+`corely-local-model-jobs-dev` and literal loopback callback at port 47632. S256,
+random state, exact issuer/code namespaces, one-use callback, no redirect
+following, strict four-field/900-second token response and memory-only bearer
+storage are enforced. No existing account credentials are read or imported.
+
+The returned frozen object exposes only `receipt()` and `revoke()`: no bearer
+accessor, resource read, job operation, provider call, customer send, approval or
+learning ability. Its safe receipt explicitly says current server authority
+`NOT_CHECKED` and job operations `NOT_IMPLEMENTED`; a connection is not personal
+model execution, billing or whole-Corely proof. Expiry, invalid/backward clocks,
+abort and failed revocation hold. Known grants in malformed bounded responses
+are revoked; unknown token-exchange or cleanup outcomes stay explicitly
+uncertain. Cleanup fanout, callback connections/attempts, body sizes and all
+waits (including an uncooperative UI callback/fetch/body) are bounded.
+
+Independent review identified a potential callback-response flush race before
+release. The callback now settles only after response finish, followed by
+graceful bounded listener shutdown; forced cleanup is not reported as success.
+This was a source-level finding, not a reproduced live-browser failure. Offline
+delayed-finish review and actual synthetic loopback tests pass.
+
+Targeted client tests pass **90/90**; final clean Node20 SIWC+harness regression
+passes **501/501**, zero failures/skips/cancels. Main independently reran all
+501 with the external-network denial guard and matched the frozen file hashes.
+All 14 workflow syntax checks
+and diff check pass. Main separately paired the actual Corely
+`PersonalModelJobOAuth` source with this client: fake current administrator,
+direct in-process token/revoke calls and only the synthetic callback over
+loopback. One PKCE exchange, narrow descriptor, principal acceptance, confirmed
+revoke and subsequent principal rejection passed. No live Corely admin, cloud
+grant, ChatGPT account/model, send, learning or API fallback was used.
+
+Companion Corely authorization runtime
+`0d44d507919d3e43f1777b3c066ea33d6e59a0c9` passed exact
+[CI40356718251](https://github.com/moztechCEE/service-orchestrator/actions/runs/40356718251),
+including ephemeral PostgreSQL authorization-snapshot and full integration
+stability checks; local fresh **6,888/6,888** and forced build/types/lint pass.
+The new client still requires its own frozen source/exact CI before any normal
+connection attempt. Neither authorization source is deployed. New API VM
+channel/provider configuration remains unchanged. Model-job HTTP operations,
+trusted DEV producers, server-owned synthetic read fences and normal
+API/Worker/manual-final-review registration are still open.
