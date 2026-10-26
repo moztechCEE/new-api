@@ -1,5 +1,7 @@
 // Local, owner-operated official Codex model port. No listener, API provider,
 // token import, existing credential cache, account rotation or command entrypoint.
+// Recognizable hosted invocation is rejected; absence of a marker does not
+// attest local-use eligibility or authorize a commercial/hosted service.
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
@@ -15,7 +17,10 @@ const DISABLED_WARNING = 'Code Mode is unavailable because code-mode host is dis
 const DISABLED = ['shell_tool', 'unified_exec', 'apps', 'plugins', 'hooks', 'browser_use', 'browser_use_external',
   'computer_use', 'image_generation', 'code_mode_host', 'multi_agent', 'multi_agent_v2', 'memories', 'chronicle',
   'skill_search', 'view_image', 'sleep_tool', 'in_app_browser', 'unbounded_connection_retries'];
+const HOSTED_EXECUTION_MARKERS = ['K_SERVICE', 'K_REVISION', 'K_CONFIGURATION', 'CLOUD_RUN_JOB', 'CLOUD_RUN_EXECUTION',
+  'CLOUD_RUN_TASK_INDEX', 'CLOUD_RUN_TASK_ATTEMPT', 'CLOUD_RUN_TASK_COUNT', 'CLOUD_RUN_WORKER_POOL', 'CLOUD_RUN_REVISION'];
 const CODES = new Set(['INVALID_OPTIONS', 'INVALID_REQUEST', 'SCOPE_NOT_ADMITTED', 'UNSUPPORTED_CAPABILITY', 'INPUT_MISMATCH',
+  'HOSTED_EXECUTION_REJECTED',
   'AUTH_REQUIRED', 'LOGIN_FAILED', 'WRONG_ACCOUNT', 'AUTH_MODE_REJECTED', 'PLAN_UNVERIFIED', 'MODEL_UNAVAILABLE', 'MODEL_CHANGED',
   'SANDBOX_UNVERIFIED', 'RUNTIME_CHANGED', 'UNEXPECTED_INSTRUCTIONS', 'SPAWN_FAILED', 'PROCESS_FAILED', 'PROTOCOL_ERROR',
   'RPC_FAILED', 'TIMEOUT', 'OUTPUT_LIMIT', 'TOOL_USE_REJECTED', 'UNSUPPORTED_EVENT', 'THREAD_MISMATCH', 'TURN_MISMATCH',
@@ -507,6 +512,16 @@ class ManagedModelSession {
 export async function createManagedModelSession({ executable, account, login = false, onLogin,
   sourceEnv = process.env, permissionCanary = runPermissionsCanary, rpcTimeoutMs = 15000, turnTimeoutMs = 60000,
   cleanupTimeoutMs = 2000, loginTimeoutMs = 300000 } = {}) {
+  // Check the real parent environment as well as supplied inputs before the
+  // environment allowlist strips deployment metadata. A "local" sourceEnv or
+  // caller-declared approval cannot hide a recognizable hosted parent process.
+  try {
+    if ([process.env, sourceEnv].some(env => env && typeof env === 'object' &&
+        HOSTED_EXECUTION_MARKERS.some(key => key in env))) held('HOSTED_EXECUTION_REJECTED');
+  } catch (error) {
+    if (error instanceof ModelSessionError) throw error;
+    held('INVALID_OPTIONS');
+  }
   if (typeof executable !== 'string' || !isAbsolute(executable) || !Object.hasOwn(HARNESS_ACCOUNTS, account) || typeof login !== 'boolean' ||
       (login && typeof onLogin !== 'function') || typeof permissionCanary !== 'function' || !sourceEnv || typeof sourceEnv !== 'object' ||
       [rpcTimeoutMs, turnTimeoutMs, cleanupTimeoutMs, loginTimeoutMs].some(value => !Number.isSafeInteger(value) || value <= 0) ||

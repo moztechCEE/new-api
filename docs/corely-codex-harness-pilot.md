@@ -1,5 +1,33 @@
 # Local Codex harness pilot
 
+## 2026-10-27 hosted-use correction and local guard
+
+Fresh [official auth guidance](https://learn.chatgpt.com/docs/app-server#auth-endpoints)
+explicitly excludes commercial/hosted services from app-server authentication.
+The [SIWC public plan-usage terms](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt#usage-policy-and-terms)
+limit that route to local OSS/personal projects; remotely hosted/paid apps need
+access first. Do not turn this local factory into Corely's cloud job relay or
+use stock type57 credential import as a substitute. A normal Corely grant,
+synthetic scope or operator approval does not confer provider access.
+
+The factory now checks both real process.env and supplied sourceEnv for ten
+known Cloud Run service/job/worker markers before filtering, filesystem/canary,
+spawn, login or model execution. Presence including false/empty/inherited values
+holds at `HOSTED_EXECUTION_REJECTED`; no approval override. This is bounded
+misuse prevention, not arbitrary VM detection or an eligibility attestation.
+Existing fixed local proofs remain local proofs, with exact debit unverified.
+
+Author and main each reran fresh **528/528** offline SIWC+harness tests, zero
+fail/skip/cancel; targeted134 and independent21 checks also pass. No real login,
+model, API fallback, existing credential cache, cloud or Go channel mutation.
+Exact new source/CI is required before using this changed factory.
+
+Normal UI currently shows New API channels0 / requests0, no Work connection
+receipt, and existing SIWC support under account/workspace/client technical
+review, not access confirmation. No extra inference retries were made. The
+previous forward plan needs a supported hosted provider and resolved public
+SIWC inference, not just a new DEV identity. Whole Corely is still BLOCKED.
+
 This is a **local, owner-operated synthetic integration pilot** of the official
 Codex agent, not an HTTP proxy, New API channel, automatic account pool or
 production customer-service backend. The fixed trusted smoke remains the only

@@ -156,6 +156,44 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   finally { await rm(root, { recursive: true, force: true }); }
 }
 
+test('recognizable Cloud Run service, job and worker context holds before canary, spawn, account or model', async t => {
+  const markers = ['K_SERVICE', 'K_REVISION', 'K_CONFIGURATION', 'CLOUD_RUN_JOB', 'CLOUD_RUN_EXECUTION',
+    'CLOUD_RUN_TASK_INDEX', 'CLOUD_RUN_TASK_ATTEMPT', 'CLOUD_RUN_TASK_COUNT', 'CLOUD_RUN_WORKER_POOL', 'CLOUD_RUN_REVISION'];
+  for (const marker of markers) await t.test(`sourceEnv ${marker}`, async () => {
+    await fixture({}, async ({ options, records, canaries }) => {
+      let loginStarted = false;
+      await assert.rejects(createManagedModelSession({ ...options, sourceEnv: { ...options.sourceEnv, [marker]: 'synthetic-hosted-marker' },
+        login: true, onLogin: async () => { loginStarted = true; } }), { code: 'HOSTED_EXECUTION_REJECTED' });
+      assert.equal(canaries(), 0); assert.equal(loginStarted, false); assert.deepEqual(await records(), []);
+    });
+  });
+  for (const marker of markers) await t.test(`real process ${marker} cannot be hidden by local options`, async () => {
+    const present = Object.hasOwn(process.env, marker), previous = process.env[marker];
+    try {
+      process.env[marker] = 'synthetic-hosted-marker';
+      await fixture({}, async ({ options, records, canaries }) => {
+        await assert.rejects(createManagedModelSession({ ...options, sourceEnv: { LANG: 'en_US.UTF-8', TZ: 'UTC' },
+          hostedApproved: true, allowHosted: true, localOnly: true }), { code: 'HOSTED_EXECUTION_REJECTED' });
+        assert.equal(canaries(), 0); assert.deepEqual(await records(), []);
+      });
+    } finally { if (present) process.env[marker] = previous; else delete process.env[marker]; }
+  });
+  for (const value of ['', '0', false, null, undefined]) await t.test(`marker presence is not an approval boolean: ${String(value)}`, async () => {
+    await fixture({}, async ({ options, records, canaries }) => {
+      await assert.rejects(createManagedModelSession({ ...options, sourceEnv: { K_SERVICE: value,
+        CORELY_PERSONAL_HOSTED_APPROVED: 'true', CORELY_PERSONAL_LOCAL_ONLY: 'true' } }), { code: 'HOSTED_EXECUTION_REJECTED' });
+      assert.equal(canaries(), 0); assert.deepEqual(await records(), []);
+    });
+  });
+  await t.test('inherited hosted marker cannot masquerade as stripped local environment', async () => {
+    await fixture({}, async ({ options, records, canaries }) => {
+      await assert.rejects(createManagedModelSession({ ...options, sourceEnv: Object.create({ CLOUD_RUN_WORKER_POOL: 'synthetic-worker' }) }),
+        { code: 'HOSTED_EXECUTION_REJECTED' });
+      assert.equal(canaries(), 0); assert.deepEqual(await records(), []);
+    });
+  });
+});
+
 test('immutable request snapshot reproduces full Corely canonical hashes without invoking accessors', () => {
   const input = request({ responseFormat: 'json', responseSchema: schema() });
   const snapshot = snapshotModelRequest(input);
