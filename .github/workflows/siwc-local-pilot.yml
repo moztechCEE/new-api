@@ -36,7 +36,14 @@ jobs:
           node --check bin/siwc-local-runtime.test.mjs
           node --check bin/codex-harness-pilot.mjs
           node --check bin/codex-harness-pilot.test.mjs
+          node --check bin/codex-harness-permissions-canary.mjs
+          node --check bin/codex-harness-permissions-canary.test.mjs
+          node --check bin/codex-harness-candidate-contract.mjs
+          node --check bin/codex-harness-corely-client.mjs
+          node --check bin/codex-harness-corely-client.test.mjs
+          node --check bin/codex-harness-model-session.mjs
+          node --check bin/codex-harness-model-session.test.mjs
       - name: Run synthetic offline protocol regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs
       - name: Run synthetic offline harness regression
-        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-pilot.test.mjs
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs
