@@ -1,5 +1,27 @@
 # Local Codex harness pilot
 
+## Latest actual result — Info direct SIWC inference passes (2026-10-27)
+
+Runtime **d5b8f6d2b153b88c6517b0a56275a87ce061ac65** passed fresh548/548
+offline tests and exact [Node20/22 CI40375664817](https://github.com/moztechCEE/new-api/actions/runs/40375664817).
+Normal Info OAuth then produced a real completed `gpt-6.1-sol` response through
+the public SIWC plan route: input17 / output11 / total28 tokens, expected output
+hash `dda11e5f4241434fdd59c7726c7d6bad22141f13a877ff053de4b9ea71f187fb`.
+Signed Info identity and granted plan scopes were verified; the process had no
+API key, no fallback, and confirmed renewable-session revocation after the test.
+Client correlation: `f907b636-f694-416b-8359-6edb2297c0b0`;
+completion time `2026-10-26T18:14:23.185Z`.
+
+The two resolved local defects were premature rejection of missing Content-Type
+and assuming the terminal snapshot repeats previously completed output parts.
+Neither required removing quality checks or changing FAQ/stage data.
+This verifies an actual personal-plan-authorized inference, not the precise
+subscription/credit debit amount, a New API gateway call, hosted Corely,
+account failover or manual-edit/send/learning acceptance. No cloud change.
+The next boundary is an explicitly approved persistent, owner-only SIWC session
+on the dedicated New API DEV VM for synthetic Corely integration; no Codex/Luna
+cache import. This question is pending, not an issued persistent authorization.
+
 ## 2026-10-27 SIWC VM clarification and bounded inference diagnosis
 
 The managed native app-server restriction below must not be generalized to all
