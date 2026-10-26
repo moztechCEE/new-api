@@ -246,6 +246,7 @@ input.on('line', line => {
     if (scenario.tool) return send({ id: 900, method: 'item/commandExecution/requestApproval', params: {
       threadId: 'synthetic-thread', turnId: 'synthetic-turn', command: 'synthetic-command' } });
     notify('thread/started', { thread: { id: 'synthetic-thread' } });
+    notify('remoteControl/status/changed', { status: { enabled: false } });
     notify('account/updated', { authMode: 'chatgpt', planType: 'pro' });
     notify('turn/started', { threadId: 'synthetic-thread', turn: { id: 'synthetic-turn' } });
     if (scenario.error) return notify('error', { threadId: 'synthetic-thread', turnId: 'synthetic-turn',
@@ -373,7 +374,7 @@ test('offline transport stops on tool approval, upstream error, oversized output
     ['tool approval request', { tool: true }, 'TOOL_USE_REJECTED'],
     ['upstream error', { error: true }, 'TURN_FAILED'],
     ['oversized output', { overflow: true }, 'OUTPUT_LIMIT'],
-    ['wrong thread', { crossThread: true }, 'PROTOCOL_ERROR'],
+    ['wrong thread', { crossThread: true }, 'THREAD_MISMATCH'],
     ['incorrect final answer', { badAnswer: true }, 'INVALID_OUTPUT'],
     ['failed turn', { failedTurn: true }, 'TURN_FAILED'],
     ['early child exit', { earlyExit: true }, 'PROCESS_FAILED'],

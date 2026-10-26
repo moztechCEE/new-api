@@ -15,7 +15,8 @@ const PROMPT = `This is a local, owner-operated synthetic integration test. Do n
 const ERRORS = new Set(['INVALID_OPTIONS', 'UNSAFE_HOME', 'SPAWN_FAILED', 'PROTOCOL_ERROR', 'RPC_FAILED', 'TIMEOUT',
   'OUTPUT_LIMIT', 'AUTH_REQUIRED', 'AUTH_MODE_REJECTED', 'WRONG_ACCOUNT', 'PLAN_UNVERIFIED', 'MODEL_UNAVAILABLE',
   'TOOL_USE_REJECTED', 'TURN_FAILED', 'INVALID_OUTPUT', 'INCOMPLETE_TURN', 'PROCESS_FAILED', 'INVALID_USAGE',
-  'LOGIN_FAILED', 'UNEXPECTED_INSTRUCTIONS', 'MODEL_CHANGED']);
+  'LOGIN_FAILED', 'UNEXPECTED_INSTRUCTIONS', 'MODEL_CHANGED', 'SANDBOX_UNVERIFIED',
+  'THREAD_MISMATCH', 'TURN_MISMATCH', 'INPUT_MISMATCH', 'UNSUPPORTED_EVENT']);
 export class HarnessError extends Error {
   constructor(code, diagnostic) {
     super(ERRORS.has(code) ? code : 'PROTOCOL_ERROR'); this.code = this.message;
@@ -192,7 +193,7 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
     const threadId = source?.thread?.id;
     if (source.model !== MODEL || source?.thread?.modelProvider !== 'openai' || source?.thread?.ephemeral !== true ||
         typeof threadId !== 'string' || !threadId) throw new HarnessError('MODEL_CHANGED');
-    if (source.sandbox?.type !== 'readOnly' || source.sandbox.networkAccess !== false) throw new HarnessError('PROTOCOL_ERROR');
+    if (source.sandbox?.type !== 'readOnly' || source.sandbox.networkAccess !== false) throw new HarnessError('SANDBOX_UNVERIFIED');
     if (!Array.isArray(source.instructionSources) || source.instructionSources.length) throw new HarnessError('UNEXPECTED_INSTRUCTIONS');
     const accumulator = createExecAccumulator();
     accumulator.consume({ type: 'thread.started', thread_id: threadId });
@@ -201,7 +202,7 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
     completed.catch(() => {});
     generationHandler = msg => {
       const p = msg.params;
-      if (p?.threadId !== undefined && p.threadId !== threadId) throw new HarnessError('PROTOCOL_ERROR');
+      if (p?.threadId !== undefined && p.threadId !== threadId) throw new HarnessError('THREAD_MISMATCH');
       if (msg.method === 'thread/started') {
         if (p?.thread?.id !== threadId) throw new HarnessError('PROTOCOL_ERROR');
         return;
@@ -217,11 +218,11 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
         turnId = p.turn.id;
         accumulator.consume({ type: 'turn.started' }); return;
       }
-      if (p?.turnId !== undefined && p.turnId !== turnId) throw new HarnessError('PROTOCOL_ERROR');
+      if (p?.turnId !== undefined && p.turnId !== turnId) throw new HarnessError('TURN_MISMATCH');
       if (msg.method === 'item/started' || msg.method === 'item/completed') {
         if (p?.item?.type === 'userMessage') {
           if (p.item.content?.length !== 1 || p.item.content[0]?.type !== 'text' || p.item.content[0].text !== PROMPT) {
-            throw new HarnessError('PROTOCOL_ERROR');
+            throw new HarnessError('INPUT_MISMATCH');
           }
           return;
         }
@@ -237,11 +238,11 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
         accumulator.consume({ type: 'turn.completed', usage: { input_tokens: usage?.inputTokens, output_tokens: usage?.outputTokens } });
         turnFinished = true; return;
       }
-      if (['thread/status/changed', 'account/rateLimits/updated', 'item/agentMessage/delta',
+      if (['thread/status/changed', 'remoteControl/status/changed', 'account/rateLimits/updated', 'item/agentMessage/delta',
         'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta'].includes(msg.method)) return;
       if (msg.method === 'model/rerouted') throw new HarnessError('MODEL_CHANGED');
       if (msg.method === 'error') throw new HarnessError('TURN_FAILED');
-      throw new HarnessError('PROTOCOL_ERROR');
+      throw new HarnessError('UNSUPPORTED_EVENT');
     };
     // Inherit the verified read-only/no-network thread policy. This installed
     // protocol does not support the newer ReadOnlyAccess override. The fixed
