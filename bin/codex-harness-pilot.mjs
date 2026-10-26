@@ -242,6 +242,8 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
         'item/reasoning/summaryTextDelta', 'item/reasoning/summaryPartAdded', 'item/reasoning/textDelta'].includes(msg.method)) return;
       if (msg.method === 'model/rerouted') throw new HarnessError('MODEL_CHANGED');
       if (msg.method === 'error') throw new HarnessError('TURN_FAILED');
+      if (typeof msg.method !== 'string' || /^(item|account|auth|model|modelProvider|hook|mcpServer|app|process|command|fs|remoteControl)\//.test(msg.method) ||
+          /error|warning|permission|approval/i.test(msg.method)) throw new HarnessError('UNSUPPORTED_EVENT');
       // JSON-RPC notifications may grow across official runtime releases.
       // Unknown metadata is never accepted as evidence or executed. Only the
       // strict known item/completion contract above can establish success;
