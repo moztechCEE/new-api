@@ -112,7 +112,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     }
     return reply(id,{model:scenario.wrongModel ? 'other-model' : 'gpt-6.1-sol',modelProvider:'openai',
       thread:{id:threadId,modelProvider:'openai',ephemeral:scenario.persistent ? false : true},
-      cwd:params.cwd,runtimeWorkspaceRoots:scenario.wrongRoots ? [] : params.runtimeWorkspaceRoots,
+      cwd:params.cwd,runtimeWorkspaceRoots:scenario.missingRoots ? undefined : Object.hasOwn(scenario,'rootValue') ? scenario.rootValue
+        : scenario.wrongRoots ? [params.cwd] : params.environments?.length === 0 ? [] : params.runtimeWorkspaceRoots,
       approvalPolicy:params.approvalPolicy,activePermissionProfile:{id:scenario.wrongProfile ? 'broad' : ${JSON.stringify(CANARY_PROFILE)}},
       sandbox:{type:'readOnly',networkAccess:scenario.network === true},instructionSources:scenario.instructions ? ['/synthetic/unexpected'] : []});
   }
@@ -215,7 +216,12 @@ test('warm session keeps auth in distinct empty homes and independently isolates
         assert.equal(row.params.permissions, CANARY_PROFILE); assert.equal(row.params.ephemeral, true);
         assert.equal(row.params.allowProviderModelFallback, false); assert.equal(row.params.modelProvider, 'openai');
         assert.deepEqual(row.params.dynamicTools, []); assert.deepEqual(row.params.environments, []);
+        assert.deepEqual(row.params.runtimeWorkspaceRoots, []);
         assert.equal(row.params.sandbox, undefined);
+      }
+      for (const turn of calls.filter(row => row.method === 'turn/start')) {
+        assert.deepEqual(turn.params.runtimeWorkspaceRoots, []);
+        assert.deepEqual(turn.params.environments, []);
       }
       const order = calls.filter(row => ['thread/start', 'turn/start', 'thread/unsubscribe'].includes(row.method)).map(row => row.method);
       assert.deepEqual(order, ['thread/start', 'turn/start', 'thread/unsubscribe', 'thread/start', 'turn/start', 'thread/unsubscribe']);
@@ -353,7 +359,7 @@ test('adversarial model/tool/protocol/account/source events hold without leaking
   for (const scenario of [{ toolRequest: true }, { toolItem: true }, { unknownAction: true }, { reroute: true }, { authDriftEvent: true },
     { otherWarning: true }, { crossThread: true }, { crossTurn: true }, { missingTurnId: true }, { badEcho: true }, { noFinal: true },
     { noUsage: true }, { noItems: true }, { duplicateFinal: true }, { finalMismatch: true }, { completeWrongTurn: true },
-    { failed: true }, { earlyExit: true }, { overflow: true }, { driftAfter: 3 }, { wrongRoots: true }, { wrongProfile: true },
+    { failed: true }, { earlyExit: true }, { overflow: true }, { driftAfter: 3 }, { wrongProfile: true },
     { persistent: true }, { wrongModel: true }, { network: true }, { instructions: true }, { badCanary: true }, { hashDrift: true }, { lateQuota: true }, { prematureTurn: true },
     { usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 2 } }, { usage: { inputTokens: -1, outputTokens: 1, cachedInputTokens: 0 } }]) {
     await t.test(JSON.stringify(scenario), async () => fixture(scenario, async ({ options }) => {
@@ -362,6 +368,19 @@ test('adversarial model/tool/protocol/account/source events hold without leaking
         await assert.rejects(session.generate(request(), new AbortController().signal), error => {
           assert.ok(error instanceof ModelSessionError); assert.doesNotMatch(JSON.stringify(error), /synthetic-(?:secret|private|upstream)|auth-value/); return true;
         });
+      } finally { await session.close(); }
+    }));
+  }
+});
+
+test('text-only native empty-roots contract rejects unexpected or unverifiable roots before starting a turn', async t => {
+  for (const [label, scenario] of [['unexpected workspace grant', { wrongRoots: true }],
+    ['missing roots metadata', { missingRoots: true }], ['malformed roots metadata', { rootValue: null }]]) {
+    await t.test(label, async () => fixture(scenario, async ({ options, records }) => {
+      const session = await createManagedModelSession(options);
+      try {
+        await assert.rejects(session.generate(request(), new AbortController().signal), { code: 'SANDBOX_UNVERIFIED' });
+        assert.equal((await records()).some(row => row.method === 'turn/start'), false);
       } finally { await session.close(); }
     }));
   }

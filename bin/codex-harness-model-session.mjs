@@ -424,8 +424,11 @@ class ManagedModelSession {
       if (!this.modelInfo.efforts.has(effort)) held('UNSUPPORTED_CAPABILITY');
       workspace = await mkdtemp(join(this.root, 'call-'));
       workspace = await realpath(workspace);
+      // This text-only port has no environment or file inputs. Explicit empty
+      // environments materialize no runtime roots in the native protocol; do
+      // not request contradictory roots or enable an environment to echo them.
       const source = await wait(() => this.channel.rpc('thread/start', { model: MODEL, modelProvider: 'openai', allowProviderModelFallback: false,
-        cwd: workspace, runtimeWorkspaceRoots: [workspace], permissions: CANARY_PROFILE, ephemeral: true, approvalPolicy: 'never',
+        cwd: workspace, runtimeWorkspaceRoots: [], permissions: CANARY_PROFILE, ephemeral: true, approvalPolicy: 'never',
         dynamicTools: [], environments: [], selectedCapabilityRoots: [], baseInstructions: request.system,
         developerInstructions: BOUNDARY + (request.responseFormat === 'json' && !request.responseSchema ? ' Return exactly one valid JSON object, with no surrounding prose.' : ''),
         serviceName: 'corely_local_synthetic_model', config: { model_reasoning_effort: effort, ...(request.verbosity ? { model_verbosity: request.verbosity } : {}) } }));
@@ -435,11 +438,11 @@ class ManagedModelSession {
       if (source.model !== MODEL || source.modelProvider !== 'openai' || source.thread.modelProvider !== 'openai' || source.thread.ephemeral !== true) held('MODEL_CHANGED');
       if (source.activePermissionProfile?.id !== CANARY_PROFILE || source.activePermissionProfile.extends != null ||
           source.sandbox?.type !== 'readOnly' || source.sandbox.networkAccess !== false || source.cwd !== workspace ||
-          JSON.stringify(source.runtimeWorkspaceRoots) !== JSON.stringify([workspace]) || source.approvalPolicy !== 'never') held('SANDBOX_UNVERIFIED');
+          !Array.isArray(source.runtimeWorkspaceRoots) || source.runtimeWorkspaceRoots.length !== 0 || source.approvalPolicy !== 'never') held('SANDBOX_UNVERIFIED');
       if (!Array.isArray(source.instructionSources) || source.instructionSources.length) held('UNEXPECTED_INSTRUCTIONS');
       for (const event of state.early.splice(0)) this.notification(...event);
       const started = await wait(() => { state.turnRequested = true; return this.channel.rpc('turn/start', { threadId: id, input: [{ type: 'text', text: request.user }], model: MODEL,
-        effort, approvalPolicy: 'never', permissions: CANARY_PROFILE, runtimeWorkspaceRoots: [workspace], environments: [],
+        effort, approvalPolicy: 'never', permissions: CANARY_PROFILE, runtimeWorkspaceRoots: [], environments: [],
         ...(request.responseSchema ? { outputSchema: request.responseSchema } : {}) }); });
       if (typeof started?.turn?.id !== 'string' || (state.turnId && started.turn.id !== state.turnId)) held('TURN_MISMATCH');
       state.turnId ??= started.turn.id;

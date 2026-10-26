@@ -283,3 +283,34 @@ credential-free session factory now stops at expected `AUTH_REQUIRED`, not the
 prior unsupported event; login-start/model/turn/API counts remain zero and its
 local process/temp home were cleaned. Only the model-session pair changed;
 exact new runtime CI is still required before the two-phase model retry.
+
+### Native empty-environment / runtime-root compatibility
+
+The disabled-notification repair was frozen as `a8972df2f1ecb648b6e2e72bc95892172302256e`
+and exact [CI40350293131](https://github.com/moztechCEE/new-api/actions/runs/40350293131)
+passed on Node 20/22. The next fixed two-phase attempt completed the normal
+Info personal-account selection, then held at **generation / `SANDBOX_UNVERIFIED`**
+before `turn/start`. The local session closed; no candidate, review, API backup,
+Corely connection, send or learning result was obtained. This failure is retained.
+
+Credential-free public-schema and native A/B controls identified the exact
+contradiction: `environments: []` disables environment access and returns empty
+`runtimeWorkspaceRoots`, even when a nonempty root was requested. Omitting the
+environment override echoed the root, but would enable an environment and was
+not chosen. The text-only engine now explicitly requests **empty roots** in both
+thread and turn and requires the native thread response to contain exactly an
+empty array. Unexpected, missing or malformed roots still hold before any turn.
+The profile, no-network, empty environments/tools, canary, binary hash, fresh cwd,
+ephemeral thread and no external instruction-source checks remain in force.
+No file inputs or image capability are added. This is a stricter no-workspace
+contract, not a permission relaxation to make the test pass.
+
+The exact-empty no-auth native control matches all policy metadata and cleans
+its thread/process/temp files; login/model-list/turn requests are zero. Clean
+Node 20 focused SIWC+harness regression now passes **411/411**, zero fail/skip/
+cancel. A new exact source CI is still required before another real model turn.
+Companion Corely `d2beac8c29c0e68463f3f51d67ea8897ec816419` exact
+[CI40348015374](https://github.com/moztechCEE/service-orchestrator/actions/runs/40348015374)
+has passed. The separately approved DEV model-job grant is being implemented;
+it does not complete producer/read-fence wiring or make New API a connected
+personal upstream channel. Normal DEV, VM, production and existing data remain unchanged.
