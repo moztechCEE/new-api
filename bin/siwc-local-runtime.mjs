@@ -7,9 +7,25 @@ export const MODEL = 'gpt-6.1-sol';
 export const PROBE_INPUT = 'Reply with exactly: Corely local plan probe OK.';
 export const PROBE_OUTPUT = 'Corely local plan probe OK.';
 export const SCOPES = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct';
+const PLAN_ERROR_CODES = new Set(['subscription_sharing_user_not_eligible', 'subscription_sharing_usage_limit_exceeded',
+  'subscription_sharing_usage_unavailable', 'subscription_sharing_unsupported_capability', 'subscription_sharing_route_not_supported',
+  'subscription_sharing_invalid_user', 'chatpass_v2_scope_not_authorized', 'chatpass_v2_invalid_authorization_context',
+  'subscription_sharing_user_unavailable']);
 
 export class ProbeError extends Error {
-  constructor(code) { super(code); this.code = code; }
+  constructor(code, diagnostic) {
+    super(code); this.code = code;
+    if (!diagnostic || typeof diagnostic !== 'object') return;
+    const safe = {};
+    if (Number.isInteger(diagnostic.httpStatus) && diagnostic.httpStatus >= 100 && diagnostic.httpStatus <= 599) safe.httpStatus = diagnostic.httpStatus;
+    if (['SSE', 'JSON', 'HTML', 'TEXT', 'BINARY', 'OTHER', 'MISSING'].includes(diagnostic.contentTypeClass)) safe.contentTypeClass = diagnostic.contentTypeClass;
+    if (['NOT_PARSED', 'OVER_LIMIT', 'ARRAY', 'SCALAR', 'ERROR_OBJECT', 'DETAIL_OBJECT', 'RESPONSE_OBJECT', 'OTHER_OBJECT', 'UNREADABLE'].includes(diagnostic.bodyShape)) safe.bodyShape = diagnostic.bodyShape;
+    if (diagnostic.catalogModelVerified === true) safe.catalogModelVerified = true;
+    if (PLAN_ERROR_CODES.has(diagnostic.errorCode)) safe.errorCode = diagnostic.errorCode;
+    if (['completed', 'in_progress', 'failed', 'incomplete', 'queued'].includes(diagnostic.responseStatus)) safe.responseStatus = diagnostic.responseStatus;
+    if (typeof diagnostic.requestIdHash === 'string' && /^[0-9a-f]{64}$/.test(diagnostic.requestIdHash)) safe.requestIdHash = diagnostic.requestIdHash;
+    this.diagnostic = Object.freeze(safe);
+  }
 }
 const fail = code => { throw new ProbeError(code); };
 export const digest = value => createHash('sha256').update(value).digest('hex');
@@ -159,6 +175,41 @@ export function syntheticRequest() {
   return { model: MODEL, input: [{ role: 'user', content: PROBE_INPUT }], store: false, stream: true };
 }
 
+// Fixed enums and hashes only: never retain raw headers, bodies, messages or credentials.
+export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
+  const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() ?? '';
+  const mediaClasses = new Map([['text/event-stream', 'SSE'], ['application/json', 'JSON'],
+    ['text/html', 'HTML'], ['text/plain', 'TEXT'], ['application/octet-stream', 'BINARY']]);
+  const diagnostic = { httpStatus: response.status, contentTypeClass: media ? mediaClasses.get(media) ?? 'OTHER' : 'MISSING',
+    catalogModelVerified: true, bodyShape: 'NOT_PARSED' };
+  const requestId = response.headers.get('x-request-id');
+  if (requestId && requestId.length <= 1024) diagnostic.requestIdHash = digest(requestId);
+  if (media !== 'application/json') { void response.body?.cancel().catch(() => {}); return diagnostic; }
+  const bytes = [];
+  let length = 0, reader, timer;
+  try {
+    const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new ProbeError('DIAGNOSTIC_TIMEOUT')), Math.max(1, Math.min(timeoutMs, 3000))); });
+    reader = response.body?.getReader();
+    while (reader) {
+      const part = await Promise.race([reader.read(), deadline]);
+      if (part.done) break;
+      length += part.value.length;
+      if (length > 16384) { diagnostic.bodyShape = 'OVER_LIMIT'; return diagnostic; }
+      bytes.push(Buffer.from(part.value));
+    }
+    const body = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(Buffer.concat(bytes)));
+    diagnostic.bodyShape = Array.isArray(body) ? 'ARRAY' : body === null || typeof body !== 'object' ? 'SCALAR' :
+      body.error && typeof body.error === 'object' && !Array.isArray(body.error) ? 'ERROR_OBJECT' :
+      Object.hasOwn(body, 'detail') ? 'DETAIL_OBJECT' : body.object === 'response' ? 'RESPONSE_OBJECT' : 'OTHER_OBJECT';
+    if (PLAN_ERROR_CODES.has(body?.error?.code)) diagnostic.errorCode = body.error.code;
+    if (body?.object === 'response' && ['completed', 'in_progress', 'failed', 'incomplete', 'queued'].includes(body.status)) {
+      diagnostic.responseStatus = body.status;
+    }
+  } catch { diagnostic.bodyShape = 'UNREADABLE'; }
+  finally { clearTimeout(timer); void reader?.cancel().catch(() => {}); }
+  return diagnostic;
+}
+
 export async function consumeProbeStream(body) {
   const decoder = new TextDecoder('utf8', { fatal: true });
   let buffer = '', total = 0, text = '', completed;
@@ -212,10 +263,11 @@ export async function runSyntheticProbe(session, fetchImpl = fetch, signal) {
   selectExactModel(catalog);
   let response;
   try {
-    response = await fetchImpl(`${RESOURCE}/responses`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    response = await fetchImpl(`${RESOURCE}/responses`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
       body: JSON.stringify(syntheticRequest()), redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000) });
   } catch { fail('INFERENCE_REQUEST_FAILED'); }
-  if (!response.ok) fail(`INFERENCE_HTTP_${response.status}`);
-  if (!response.headers.get('content-type')?.includes('text/event-stream')) fail('INVALID_STREAM_CONTENT_TYPE');
+  if (!response.ok) throw new ProbeError(`INFERENCE_HTTP_${response.status}`, await inferenceFailureDiagnostic(response));
+  const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+  if (media !== 'text/event-stream') throw new ProbeError('INVALID_STREAM_CONTENT_TYPE', await inferenceFailureDiagnostic(response));
   return consumeProbeStream(response.body);
 }

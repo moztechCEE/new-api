@@ -161,7 +161,8 @@ export async function startLocalPilot() {
     } catch (error) {
       phase = 'PROBE_FAILED';
       process.exitCode = 1;
-      safe({ status: phase, code: error instanceof ProbeError ? error.code : 'INTERNAL_ERROR', apiKeyFallbackUsed: false });
+      safe({ status: phase, code: error instanceof ProbeError ? error.code : 'INTERNAL_ERROR',
+        diagnostic: error instanceof ProbeError ? error.diagnostic : undefined, apiKeyFallbackUsed: false });
     } finally { await stop(); }
   }
   server.requestTimeout = 10000;
