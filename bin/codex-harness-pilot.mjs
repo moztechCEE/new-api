@@ -192,6 +192,7 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
     const threadId = source?.thread?.id;
     if (source.model !== MODEL || source?.thread?.modelProvider !== 'openai' || source?.thread?.ephemeral !== true ||
         typeof threadId !== 'string' || !threadId) throw new HarnessError('MODEL_CHANGED');
+    if (source.sandbox?.type !== 'readOnly' || source.sandbox.networkAccess !== false) throw new HarnessError('PROTOCOL_ERROR');
     if (!Array.isArray(source.instructionSources) || source.instructionSources.length) throw new HarnessError('UNEXPECTED_INSTRUCTIONS');
     const accumulator = createExecAccumulator();
     accumulator.consume({ type: 'thread.started', thread_id: threadId });
@@ -242,8 +243,11 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
       if (msg.method === 'error') throw new HarnessError('TURN_FAILED');
       throw new HarnessError('PROTOCOL_ERROR');
     };
+    // Inherit the verified read-only/no-network thread policy. This installed
+    // protocol does not support the newer ReadOnlyAccess override. The fixed
+    // trusted smoke has no file/command tools or arbitrary customer input.
     const started = await rpc('turn/start', { threadId, input: [{ type: 'text', text: PROMPT }], model: MODEL, effort: 'low',
-      approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly', access: { type: 'restricted', includePlatformDefaults: false, readableRoots: [cwd] } } });
+      approvalPolicy: 'never' });
     if (turnId !== undefined && started?.turn?.id !== turnId) throw new HarnessError('PROTOCOL_ERROR');
     await completed;
     if (terminalError) throw terminalError;

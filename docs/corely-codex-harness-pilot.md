@@ -26,11 +26,15 @@ synthetic success is not proof of hosted-customer-service eligibility.
   account rotation or API fallback.
 - Protocol parameters are checked against the installed official runtime's
   generated schema. In runtime 0.162.0-alpha.17.2, thread-start sandbox mode is
-  `read-only`, while turn-start sandbox policy type is `readOnly`; these are
-  different protocol types, not interchangeable spellings.
+  `read-only`, while the returned policy type is `readOnly`; these are different
+  protocol types, not interchangeable spellings. This runtime does not expose
+  the newer restricted `ReadOnlyAccess` override. Turn-start inherits the thread's
+  verified read-only/no-network policy instead of passing that unsupported field.
 - Shell, MCP apps/plugins, browsers, computer use, hooks and memory are not
-  enabled. The turn is read-only with restricted reads of only the empty
-  workspace. No candidate is saved, sent, approved or learned.
+  enabled. The turn inherits read-only/no-network sandboxing. This old runtime
+  does not prove a restricted read-root policy; therefore only the fixed trusted
+  smoke is accepted, never untrusted/arbitrary customer input or file tools.
+  No candidate is saved, sent, approved or learned.
 - Raw notifications, error messages, auth caches and model reasoning are never
   printed. Only the normal sign-in URL and fixed allowlisted result are exposed.
   The sign-in URL must not be copied into public issues or documentation.

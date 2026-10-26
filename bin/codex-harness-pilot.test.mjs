@@ -237,6 +237,7 @@ input.on('line', line => {
   if (method === 'model/list') return reply(id, { data: scenario.noModel ? [] : [{ model: 'gpt-6.1-sol', hidden: false }] });
   if (method === 'thread/start') return reply(id, { model: scenario.rerouted ? 'other-model' : 'gpt-6.1-sol',
     thread: { id: 'synthetic-thread', modelProvider: 'openai', ephemeral: true },
+    sandbox: { type: 'readOnly', networkAccess: false },
     instructionSources: scenario.instructions ? [{ type: 'synthetic-file' }] : [] });
   if (method === 'turn/start') {
     reply(id, { turn: { id: 'synthetic-turn' } });
@@ -351,8 +352,7 @@ test('offline transport binds discovery and one exact synthetic turn to the same
     assert.equal(start.sandbox, 'read-only');
     assert.equal(turn.input.length, 1);
     assert.ok(turn.input[0].text.endsWith(`Reply with exactly: ${OUTPUT}`));
-    assert.deepEqual(turn.sandboxPolicy, { type: 'readOnly', access: { type: 'restricted',
-      includePlatformDefaults: false, readableRoots: [log[0].cwd] } });
+    assert.equal(turn.sandboxPolicy, undefined);
     assert.doesNotMatch(JSON.stringify(receipt), /accessToken|synthetic-auth-field|authUrl|loginId/);
   });
 });
