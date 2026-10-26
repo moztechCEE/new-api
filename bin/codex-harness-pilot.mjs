@@ -3,6 +3,7 @@
 // Codex owns its normal sign-in lifecycle. This program never reads auth caches,
 // imports tokens, accepts arbitrary prompts, exposes HTTP, or enables fallback.
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -17,13 +18,21 @@ const ERRORS = new Set(['INVALID_OPTIONS', 'UNSAFE_HOME', 'SPAWN_FAILED', 'PROTO
   'TOOL_USE_REJECTED', 'TURN_FAILED', 'INVALID_OUTPUT', 'INCOMPLETE_TURN', 'PROCESS_FAILED', 'INVALID_USAGE',
   'LOGIN_FAILED', 'UNEXPECTED_INSTRUCTIONS', 'MODEL_CHANGED', 'SANDBOX_UNVERIFIED',
   'THREAD_MISMATCH', 'TURN_MISMATCH', 'INPUT_MISMATCH', 'UNSUPPORTED_EVENT']);
+const SAFE_CONTROL_NAMES = new Set(['warning', 'guardianWarning', 'configWarning', 'deprecationNotice',
+  'model/verification', 'model/safetyBuffering/updated', 'modelProvider/authRecoveryStarted', 'modelProvider/authRecoveryCompleted',
+  'item/autoApprovalReview/started', 'item/autoApprovalReview/completed', 'autoApprovalReview/strictReviewRequired',
+  'hook/started', 'hook/completed', 'mcpServer/startupStatus/updated', 'app/list/updated', 'account/gatewayOAuth/changed', 'fs/changed']);
 export class HarnessError extends Error {
   constructor(code, diagnostic) {
     super(ERRORS.has(code) ? code : 'PROTOCOL_ERROR'); this.code = this.message;
-    if (diagnostic && ['initialize', 'account/read', 'account/login/start', 'model/list', 'thread/start', 'turn/start'].includes(diagnostic.method)) {
+    if (diagnostic && ['initialize', 'account/read', 'account/login/start', 'model/list', 'thread/start', 'turn/start', 'notification'].includes(diagnostic.method)) {
       this.diagnostic = Object.freeze({ method: diagnostic.method,
         rpcCode: Number.isSafeInteger(diagnostic.rpcCode) ? diagnostic.rpcCode : null,
-        reason: ['EXPERIMENTAL_API_REQUIRED', 'INVALID_PARAMS', 'OTHER'].includes(diagnostic.reason) ? diagnostic.reason : 'OTHER' });
+        reason: ['EXPERIMENTAL_API_REQUIRED', 'INVALID_PARAMS', 'OTHER'].includes(diagnostic.reason) ? diagnostic.reason : 'OTHER',
+        ...(diagnostic.method === 'notification' ? {
+          notification: SAFE_CONTROL_NAMES.has(diagnostic.notification) ? diagnostic.notification : 'UNKNOWN',
+          notificationHash: /^[0-9a-f]{64}$/.test(diagnostic.notificationHash ?? '') ? diagnostic.notificationHash : null,
+        } : {}) });
     }
   }
 }
@@ -243,7 +252,10 @@ async function runSession(executable, env, cwd, { login, runSynthetic, onLogin }
       if (msg.method === 'model/rerouted') throw new HarnessError('MODEL_CHANGED');
       if (msg.method === 'error') throw new HarnessError('TURN_FAILED');
       if (typeof msg.method !== 'string' || /^(item|account|auth|model|modelProvider|hook|mcpServer|app|process|command|fs|remoteControl)\//.test(msg.method) ||
-          /error|warning|permission|approval/i.test(msg.method)) throw new HarnessError('UNSUPPORTED_EVENT');
+          /error|warning|permission|approval/i.test(msg.method)) throw new HarnessError('UNSUPPORTED_EVENT', {
+        method: 'notification', notification: msg.method,
+        notificationHash: createHash('sha256').update(typeof msg.method === 'string' ? msg.method : '').digest('hex'),
+      });
       // JSON-RPC notifications may grow across official runtime releases.
       // Unknown metadata is never accepted as evidence or executed. Only the
       // strict known item/completion contract above can establish success;

@@ -191,6 +191,11 @@ test('RPC diagnostics keep only a known method, numeric code and fixed reason', 
   assert.deepEqual(malicious.diagnostic, { method: 'thread/start', rpcCode: null, reason: 'OTHER' });
   assert.equal(new HarnessError('RPC_FAILED', { method: 'synthetic-private' }).diagnostic, undefined);
   assert.doesNotMatch(JSON.stringify(safe), /synthetic-private|accessToken/);
+  const notification = new HarnessError('UNSUPPORTED_EVENT', { method: 'notification', notification: 'synthetic-private',
+    notificationHash: 'b'.repeat(64), payload: 'synthetic-private' });
+  assert.equal(notification.diagnostic.notification, 'UNKNOWN');
+  assert.equal(notification.diagnostic.notificationHash, 'b'.repeat(64));
+  assert.doesNotMatch(JSON.stringify(notification), /synthetic-private|payload/);
 });
 
 // The child below is a generated JSON-RPC fixture, not the real Codex CLI.
