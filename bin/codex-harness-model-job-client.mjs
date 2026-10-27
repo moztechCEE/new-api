@@ -1,6 +1,7 @@
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { performance } from 'node:perf_hooks';
+import { snapshotModelRequest, snapshotModelResult } from './corely-model-contract.mjs';
 
 export const CORELY_MODEL_JOB_RESOURCE = 'https://moztech-api-dev-candidates-sp5g377smq-de.a.run.app/work-candidates/model-jobs';
 export const CORELY_MODEL_JOB_ISSUER = `${CORELY_MODEL_JOB_RESOURCE}/oauth`;
@@ -12,7 +13,8 @@ const TOKEN_PATTERN = /^models_access_[A-Za-z0-9_-]{43}$/;
 const MAX_BODY = 16_384;
 const CODES = new Set(['INVALID_OPTIONS', 'INVALID_CALLBACK', 'AUTHORIZATION_DENIED', 'AUTHORIZATION_TIMEOUT',
   'AUTHORIZATION_FAILED', 'ABORTED', 'LOOPBACK_UNAVAILABLE', 'LOOPBACK_CLEANUP_UNCONFIRMED',
-  'TOKEN_RESPONSE_INVALID', 'TOKEN_EXCHANGE_UNCERTAIN', 'REVOKE_UNCONFIRMED', 'GRANT_EXPIRED', 'GRANT_CLOSED']);
+  'TOKEN_RESPONSE_INVALID', 'TOKEN_EXCHANGE_UNCERTAIN', 'REVOKE_UNCONFIRMED', 'GRANT_EXPIRED', 'GRANT_CLOSED',
+  'RESOURCE_REQUEST_UNCERTAIN', 'RESOURCE_RESPONSE_INVALID', 'MODEL_JOB_NOT_CURRENT']);
 
 export class ModelJobClientError extends Error {
   constructor(code) { super(CODES.has(code) ? code : 'INVALID_OPTIONS'); this.name = 'ModelJobClientError'; this.code = this.message; }
@@ -120,8 +122,49 @@ async function credentialRequest(operation, form, { fetchImpl, requestTimeoutMs,
   }
 }
 
-/** Auth-only milestone: normal owner-operated OAuth, in-memory grant, no
- * resource read, model job, provider, sending, learning or API fallback. */
+/** Fixed model-job resource only. No caller URL, arbitrary request method,
+ * credential getter, redirects, retries, customer read or producer operation. */
+async function modelResourceRequest(operation, body, token, { fetchImpl, requestTimeoutMs, signal }) {
+  if (!['status', 'enroll', 'claim', 'complete'].includes(operation)) throw failure('INVALID_OPTIONS');
+  const endpoint = `${CORELY_MODEL_JOB_RESOURCE}/${operation}`, controller = new AbortController();
+  const abort = () => controller.abort(failure('ABORTED'));
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
+  const timer = setTimeout(() => controller.abort(failure('RESOURCE_REQUEST_UNCERTAIN')), requestTimeoutMs);
+  let reader, response;
+  try {
+    controller.signal.throwIfAborted();
+    response = await untilAborted(Promise.resolve().then(() => {
+      controller.signal.throwIfAborted();
+      return fetchImpl(endpoint, { method: operation === 'status' ? 'GET' : 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
+        headers: { authorization: `Bearer ${token}`, Accept: 'application/json', ...(operation === 'status' ? {} : { 'Content-Type': 'application/json' }) },
+        ...(operation === 'status' ? {} : { body: JSON.stringify(body) }), signal: controller.signal });
+    }), controller.signal);
+    if (!response || response.status !== 200 || response.redirected || (response.url && response.url !== endpoint) ||
+        !/^application\/json(?:\s*;|$)/i.test(response.headers?.get('content-type') ?? '') || !response.body?.getReader) throw failure('RESOURCE_RESPONSE_INVALID');
+    reader = response.body.getReader(); let size = 0; const chunks = [];
+    for (;;) {
+      const part = await untilAborted(reader.read(), controller.signal); if (part.done) break;
+      if (!(part.value instanceof Uint8Array) || (size += part.value.byteLength) > 1024 * 1024) throw failure('RESOURCE_RESPONSE_INVALID');
+      chunks.push(part.value);
+    }
+    const result = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+    if (!result || typeof result !== 'object' || Array.isArray(result)) throw failure('RESOURCE_RESPONSE_INVALID');
+    return result;
+  } catch (error) {
+    if (error instanceof ModelJobClientError) throw error;
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw failure('RESOURCE_REQUEST_UNCERTAIN');
+  } finally {
+    clearTimeout(timer); signal?.removeEventListener('abort', abort);
+    if (reader) { try { Promise.resolve(reader.cancel()).catch(() => {}); reader.releaseLock(); } catch { /* No late output becomes a result. */ } }
+    else if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
+  }
+}
+
+/** Normal owner-operated OAuth. Tokens remain closure-only. Resource methods
+ * can enroll/claim/complete separately enabled synthetic work, never produce
+ * jobs, read customers, send, approve, learn or select a paid API fallback. */
 export async function connectCorelyModelJobs(options = {}) {
   const keys = options && typeof options === 'object' && !Array.isArray(options) ? Object.keys(options) : [];
   if (!options || keys.some(key => !['onAuthorize', 'fetchImpl', 'signal', 'timeoutMs', 'requestTimeoutMs', 'now'].includes(key))) throw failure('INVALID_OPTIONS');
@@ -231,19 +274,72 @@ export async function connectCorelyModelJobs(options = {}) {
     clearTimeout(timer); signal?.removeEventListener('abort', abort);
   }
   let closed = false, revokePromise, revocationFailed = false;
+  const leases = new Map();
+  const live = () => {
+    if (revocationFailed) throw failure('REVOKE_UNCONFIRMED');
+    if (closed || !token) throw failure('GRANT_CLOSED');
+    if (signal?.aborted) throw failure('ABORTED');
+    if (readClock() >= expiresAt || performance.now() - tokenStarted >= 900_000) throw failure('GRANT_EXPIRED');
+  };
+  const resource = async (operation, body, operationSignal) => {
+    live();
+    if (operationSignal !== undefined && !(operationSignal instanceof AbortSignal)) throw failure('INVALID_OPTIONS');
+    const active = signal && operationSignal ? AbortSignal.any([signal, operationSignal]) : signal ?? operationSignal;
+    const value = await modelResourceRequest(operation, body, token, { fetchImpl, requestTimeoutMs, signal: active });
+    live(); return value;
+  };
   const session = Object.freeze({
     receipt() {
-      if (revocationFailed) throw failure('REVOKE_UNCONFIRMED');
-      if (closed || !token) throw failure('GRANT_CLOSED');
-      if (signal?.aborted) throw failure('ABORTED');
-      if (readClock() >= expiresAt || performance.now() - tokenStarted >= 900_000) throw failure('GRANT_EXPIRED');
+      live();
       return Object.freeze({ status: 'CORELY_MODEL_JOB_GRANT_CONNECTED', scope: CORELY_MODEL_JOB_SCOPE, resource: CORELY_MODEL_JOB_RESOURCE,
         tenantId: 'moztech', brandId: 'moztech-test', syntheticOnly: true, currentServerAuthority: 'NOT_CHECKED',
-        jobOperations: 'NOT_IMPLEMENTED', customerDataAccessed: false, modelExecuted: false, apiFallbackUsed: false,
+        jobOperations: 'REQUIRES_RESOURCE_HANDSHAKE', customerDataAccessed: false, modelExecuted: false, apiFallbackUsed: false,
         sendingPerformed: false, learningPerformed: false });
     },
+    async modelStatus(operationSignal) {
+      const value = await resource('status', undefined, operationSignal);
+      if (value.status !== 'SYNTHETIC_MODEL_TRANSPORT' || value.scope !== CORELY_MODEL_JOB_SCOPE || value.tenantId !== 'moztech' ||
+          value.brandId !== 'moztech-test' || value.authMode !== 'siwc_plan' || value.syntheticOnly !== true ||
+          typeof value.enrolled !== 'boolean' || typeof value.producerConnected !== 'boolean' || value.apiFallbackEnabled !== false ||
+          value.sendingCapability !== false || value.learningCapability !== false || Object.keys(value).length !== 11) throw failure('RESOURCE_RESPONSE_INVALID');
+      return Object.freeze({ ...value });
+    },
+    async enrollModels(operationSignal) {
+      const value = await resource('enroll', {}, operationSignal);
+      if (value.enrolled !== true || value.authMode !== 'siwc_plan' || value.syntheticOnly !== true || value.apiFallbackEnabled !== false ||
+          value.sendingCapability !== false || value.learningCapability !== false || !Number.isSafeInteger(value.expiresAt) ||
+          value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs || Object.keys(value).length !== 7) throw failure('RESOURCE_RESPONSE_INVALID');
+      return Object.freeze({ ...value });
+    },
+    async claimModel(accountAlias, operationSignal) {
+      live(); if (!['info', 'eason'].includes(accountAlias)) throw failure('INVALID_OPTIONS');
+      for (const [id, lease] of leases) if (lease.expiresAt <= readClock()) leases.delete(id);
+      if (leases.size >= 32) throw failure('MODEL_JOB_NOT_CURRENT');
+      const value = await resource('claim', { accountAlias }, operationSignal);
+      if (value.authMode !== 'siwc_plan' || Object.keys(value).length !== 2) throw failure('RESOURCE_RESPONSE_INVALID');
+      if (value.lease === null) return null;
+      const lease = value.lease;
+      if (!lease || typeof lease !== 'object' || Array.isArray(lease) || Object.keys(lease).length !== 4 ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(lease.leaseId ?? '') || lease.accountAlias !== accountAlias ||
+          !Number.isSafeInteger(lease.expiresAt) || lease.expiresAt <= readClock() || lease.expiresAt > Math.min(expiresAt + requestTimeoutMs, readClock() + 60_000) ||
+          leases.has(lease.leaseId)) throw failure('RESOURCE_RESPONSE_INVALID');
+      let request; try { request = snapshotModelRequest(lease.request); } catch { throw failure('RESOURCE_RESPONSE_INVALID'); }
+      const owned = Object.freeze({ leaseId: lease.leaseId, accountAlias, expiresAt: lease.expiresAt, request });
+      leases.set(owned.leaseId, owned); return owned;
+    },
+    async completeModel(leaseId, input, operationSignal) {
+      live(); const lease = leases.get(leaseId);
+      if (!lease || lease.expiresAt <= readClock()) throw failure('MODEL_JOB_NOT_CURRENT');
+      let result; try { result = snapshotModelResult(input, lease.request, lease.accountAlias, 'siwc_plan'); }
+      catch { throw failure('RESOURCE_RESPONSE_INVALID'); }
+      const expected = createHash('sha256').update(JSON.stringify(result)).digest('hex');
+      const value = await resource('complete', { leaseId, result }, operationSignal);
+      if (lease.expiresAt <= readClock() || value.accepted !== true || typeof value.replayed !== 'boolean' ||
+          value.callId !== lease.request.callId || value.resultSha256 !== expected || Object.keys(value).length !== 4) throw failure('RESOURCE_RESPONSE_INVALID');
+      return Object.freeze({ ...value });
+    },
     async revoke() {
-      closed = true;
+      closed = true; leases.clear();
       if (!revokePromise) revokePromise = revokeTokens().then(() => { token = ''; revocationFailed = false; signal?.removeEventListener('abort', lifetimeAbort); },
         () => { revokePromise = undefined; revocationFailed = true; throw failure('REVOKE_UNCONFIRMED'); });
       await revokePromise;

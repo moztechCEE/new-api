@@ -12,7 +12,7 @@ import {
   createAttempt, consumeCallback, validateSession, publicJson, selectExactModel,
   syntheticRequest, consumeProbeStream, runSyntheticProbe, inferenceFailureDiagnostic, digest,
 } from './siwc-local-runtime.mjs';
-import { loadRegistration, saveRegistration } from './siwc-local-pilot.mjs';
+import { loadRegistration, saveRegistration, startLocalPilot } from './siwc-local-pilot.mjs';
 
 // All HTTP responses, tokens and identities below are synthetic. The global
 // network guard catches accidental requests outside an explicitly injected mock.
@@ -77,6 +77,61 @@ function eligibleSession() {
   return { accessToken: 'synthetic-access-token', expiresAt: Date.now() + 60_000,
     planScopeGranted: true, accountMatchesExpected: true };
 }
+
+test('normal Info OAuth can run bounded Corely model work without exposing or persisting credentials', async t => {
+  const parent = await mkdtemp(join(tmpdir(), 'new-api-owner-pilot-'));
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const registrationPath = join(parent, 'pilot', 'host.json');
+  let authorize, retainedPort, providerCalls = 0, revoked = false;
+  const pilot = await startLocalPilot({ registrationPath, fetchImpl: async (url, init) => {
+    if (url.endsWith('/openid-configuration')) return jsonResponse({ issuer: ISSUER,
+      jwks_uri: ISSUER + '/.well-known/jwks.json', authorization_endpoint: ISSUER + '/api/accounts/authorize',
+      token_endpoint: ISSUER + '/api/accounts/oauth/token', revocation_endpoint: ISSUER + '/api/accounts/oauth/revoke' });
+    if (url.endsWith('/jwks.json')) return jsonResponse(JWKS);
+    if (url.endsWith('/token')) {
+      const form = new URLSearchParams(init.body);
+      assert.equal(form.get('client_id'), CLIENT);
+      return jsonResponse(tokenFixture({ claims: { email: 'info@moztech.cc', nonce: authorize.searchParams.get('nonce'),
+        iat: Math.floor(Date.now() / 1000) - 1, exp: Math.floor(Date.now() / 1000) + 300 } }));
+    }
+    if (url.endsWith('/revoke')) { revoked = true; return new Response(null, { status: 200 }); }
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-access-token');
+    if (url.endsWith('/models')) return jsonResponse({ models: [{ slug: MODEL, visibility: 'list' }] });
+    assert.equal(url, RESOURCE + '/responses'); providerCalls++;
+    return new Response(eventFrame(completedEvent({ usage: { input_tokens: 17, output_tokens: 11, total_tokens: 28 } })),
+      { headers: { 'Content-Type': 'text/event-stream' } });
+  }, runSyntheticModelJobs: async port => {
+    retainedPort = port;
+    assert.deepEqual(Object.keys(port).sort(), ['authMode', 'capabilities', 'generate']);
+    const content = { version: 1, callId: 'normal-owner-model-job', model: MODEL, workload: 'REPLY_LLM', purpose: 'reply_generation',
+      scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: 'local-owner-job' },
+      system: 'Synthetic customer support facts.', user: PROBE_INPUT, schemaSha256: null };
+    const sort = object => object && typeof object === 'object' ? Object.fromEntries(Object.keys(object).sort().map(key => [key, sort(object[key])])) : object;
+    const result = await port.generate({ ...content, inputSha256: digest(JSON.stringify(sort(content))) }, new AbortController().signal);
+    assert.equal(result.text, PROBE_OUTPUT); assert.equal(result.authMode, 'siwc_plan');
+    return { passed: true, apiKeyUsed: false, modelCalls: 1 };
+  } });
+  t.after(() => pilot.close());
+  const page = await originalFetch(pilot.localUrl); assert.equal(page.status, 200);
+  authorize = new URL((await page.text()).match(/href="([^"]+)"/)[1].replaceAll('&amp;', '&'));
+  assert.equal(authorize.origin, ISSUER);
+  const callback = new URL(authorize.searchParams.get('redirect_uri'));
+  callback.search = new URLSearchParams({ state: authorize.searchParams.get('state'), code: 'synthetic-code', client_id: CLIENT });
+  const response = await originalFetch(callback, { redirect: 'manual' }); assert.equal(response.status, 303);
+  const result = await pilot.completion;
+  assert.deepEqual(result, { phase: 'LOCAL_CORELY_MODEL_JOBS_COMPLETED', remoteRevocationAttempted: true,
+    remoteRevocationConfirmed: true, credentialsPersisted: false });
+  assert.equal(providerCalls, 1); assert.equal(revoked, true);
+  const disk = await readFile(registrationPath, 'utf8'); assert.doesNotMatch(disk, /synthetic-access-token|synthetic-refresh-token|id_token/);
+  await assert.rejects(retainedPort.generate({}, new AbortController().signal), { code: 'SESSION_OPERATION_ABORTED' });
+});
+
+test('owner pilot rejects invalid options before opening a listener or registration', async () => {
+  for (const options of [{ registrationPath: 'relative/path' }, { registrationPath: 123 }, { fetchImpl: true },
+    { runSyntheticModelJobs: true }, { token: 'not-an-input' }]) {
+    await assert.rejects(startLocalPilot(options), { code: 'INVALID_LOCAL_PILOT_OPTIONS' });
+  }
+});
 
 test('authorization attempt binds loopback, PKCE, state, nonce and requested plan scopes', () => {
   const attempt = createAttempt(HOST, CALLBACK, NOW);

@@ -4,9 +4,10 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAttempt, consumeCallback, validateSession, publicJson, runSyntheticProbe, ISSUER, ProbeError } from './siwc-local-runtime.mjs';
+import { createTransientSiwcModelPort } from './siwc-local-model-port.mjs';
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const hostPath = resolve(project, '.local-tests/siwc-personal-pilot/host.json');
@@ -57,15 +58,23 @@ export async function saveRegistration(value, path = hostPath) {
   finally { await handle?.close(); await unlink(temporary).catch(() => {}); }
 }
 
-export async function startLocalPilot() {
-  const profile = await loadRegistration();
-  const lockPath = `${hostPath}.lock`;
+export async function startLocalPilot(options = {}) {
+  if (!options || typeof options !== 'object' || Array.isArray(options) ||
+      Object.keys(options).some(key => !['registrationPath', 'fetchImpl', 'runSyntheticModelJobs'].includes(key)) ||
+      (options.registrationPath !== undefined && (typeof options.registrationPath !== 'string' || !isAbsolute(options.registrationPath))) ||
+      (options.runSyntheticModelJobs !== undefined && typeof options.runSyntheticModelJobs !== 'function') ||
+      (options.fetchImpl !== undefined && typeof options.fetchImpl !== 'function')) throw new ProbeError('INVALID_LOCAL_PILOT_OPTIONS');
+  const registrationPath = options.registrationPath ?? hostPath, fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const profile = await loadRegistration(registrationPath);
+  const lockPath = `${registrationPath}.lock`;
   let lock;
   try { lock = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600); }
   catch { throw new ProbeError('LOCAL_PILOT_ALREADY_ACTIVE_OR_LOCKED'); }
   const abort = new AbortController();
   let attempt, origin, session, cleanupToken, cleanupClientId, deadline;
   let phase = 'WAITING_FOR_OWNER_CONSENT', inFlight = false, stopped = false;
+  let complete;
+  const completion = new Promise(resolve => { complete = resolve; });
   const server = createServer((request, response) => {
     void handleRequest(request, response).catch(() => {
       if (!response.headersSent) response.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -85,7 +94,7 @@ export async function startLocalPilot() {
       for (let retry = 0; retry < 2 && !revoked; retry++) {
         try {
           await publicJson(`${ISSUER}/api/accounts/oauth/revoke`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ token: cleanupToken, token_type_hint: 'refresh_token', client_id: cleanupClientId }) });
+            body: new URLSearchParams({ token: cleanupToken, token_type_hint: 'refresh_token', client_id: cleanupClientId }) }, fetchImpl);
           revoked = true;
         } catch { if (retry === 0) await new Promise(done => setTimeout(done, 500)); }
       }
@@ -99,6 +108,7 @@ export async function startLocalPilot() {
     server.closeAllConnections();
     await lock.close();
     await unlink(lockPath).catch(() => {});
+    complete(Object.freeze({ phase, remoteRevocationAttempted: revocationAttempted, remoteRevocationConfirmed: revoked, credentialsPersisted: false }));
   }
   function interrupt() { phase = 'INTERRUPTED'; process.exitCode = 130; void stop(); }
   async function handleRequest(request, response) {
@@ -115,7 +125,7 @@ export async function startLocalPilot() {
     if (url.pathname === '/' && !url.search) {
       if (phase !== 'WAITING_FOR_OWNER_CONSENT') return finish(409, 'This one-shot attempt has already started.');
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      return response.end(`<!doctype html><meta charset="utf-8"><title>New API 本機個人方案驗證</title><h1>New API 本機個人方案驗證</h1><p>僅登入 info@moztech.cc，驗證 GPT-6.1 Sol 與固定合成題。這不是雲端客服接通。</p><p>不讀真實顧客、不送出、不寫學習、不使用 API key；憑證只留本次程序記憶體，測後嘗試撤銷。</p><p>本機只保留不含憑證的工具註冊對應，以免重複建立註冊。</p><p><a href="${attempt.url.replaceAll('&', '&amp;')}">Continue with ChatGPT</a></p>`);
+      return response.end(`<!doctype html><meta charset="utf-8"><title>New API 本機個人方案驗證</title><h1>New API 本機個人方案驗證</h1><p>僅登入 info@moztech.cc，驗證 GPT-6.1 Sol 與${options.runSyntheticModelJobs ? 'Corely DEV 本機合成模型鏈路' : '固定合成題'}。這不是雲端客服接通。</p><p>不讀真實顧客、不送出、不寫學習、不使用 API key；憑證只留本次程序記憶體，測後嘗試撤銷。</p><p>本機只保留不含憑證的工具註冊對應，以免重複建立註冊。</p><p><a href="${attempt.url.replaceAll('&', '&amp;')}">Continue with ChatGPT</a></p>`);
     }
     if (url.pathname === '/status' && !url.search) return finish(200, JSON.stringify({ phase, noApiKeyFallback: true, noCloud: true }));
     if (url.pathname !== '/auth/callback') return finish(404, 'Not found.');
@@ -133,25 +143,39 @@ export async function startLocalPilot() {
     try {
       // Keep the issued ID even if exchange fails, as required for retrying the same registration.
       profile.clientId = registration.clientId;
-      await saveRegistration(profile);
-      const discovery = await publicJson(`${ISSUER}/.well-known/openid-configuration`, {}, fetch, abort.signal);
+      await saveRegistration(profile, registrationPath);
+      const discovery = await publicJson(`${ISSUER}/.well-known/openid-configuration`, {}, fetchImpl, abort.signal);
       if (discovery.issuer !== ISSUER || discovery.jwks_uri !== `${ISSUER}/.well-known/jwks.json` ||
           discovery.authorization_endpoint !== `${ISSUER}/api/accounts/authorize` ||
           discovery.token_endpoint !== `${ISSUER}/api/accounts/oauth/token` ||
           discovery.revocation_endpoint !== `${ISSUER}/api/accounts/oauth/revoke`) throw new ProbeError('DISCOVERY_NOT_EXPECTED');
-      const token = await publicJson(discovery.token_endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: registration.form }, fetch, abort.signal);
+      const token = await publicJson(discovery.token_endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: registration.form }, fetchImpl, abort.signal);
       // Retain a bounded cleanup handle before validation, including rejected account grants.
       if (typeof token.refresh_token === 'string' && token.refresh_token.length > 0 && token.refresh_token.length <= 65536) {
         cleanupToken = token.refresh_token; cleanupClientId = registration.clientId;
       }
-      const jwks = await publicJson(discovery.jwks_uri, {}, fetch, abort.signal);
+      const jwks = await publicJson(discovery.jwks_uri, {}, fetchImpl, abort.signal);
       session = validateSession(token, jwks, registration.clientId, attempt.nonce, 'info@moztech.cc', Date.now(), profile.subjectHash);
       if (!cleanupToken) throw new ProbeError('RENEWABLE_SESSION_NOT_AVAILABLE');
       if (abort.signal.aborted) throw new ProbeError('ATTEMPT_EXPIRED');
       profile.subjectHash = session.subjectHash;
-      await saveRegistration(profile);
+      await saveRegistration(profile, registrationPath);
+      if (options.runSyntheticModelJobs) {
+        phase = 'RUNNING_CORELY_SYNTHETIC_MODEL_JOBS';
+        const port = createTransientSiwcModelPort({ ...session, alias: 'info' }, fetchImpl, abort.signal);
+        const result = await options.runSyntheticModelJobs(port);
+        if (abort.signal.aborted) throw new ProbeError('ATTEMPT_EXPIRED');
+        if (!result || typeof result !== 'object' || Array.isArray(result) || result.passed !== true || result.apiKeyUsed !== false ||
+            !Number.isSafeInteger(result.modelCalls) || result.modelCalls < 1 || result.modelCalls > 50 ||
+            Object.keys(result).some(key => !['passed', 'apiKeyUsed', 'modelCalls'].includes(key))) throw new ProbeError('CORELY_LOCAL_MODEL_TEST_NOT_VERIFIED');
+        phase = 'LOCAL_CORELY_MODEL_JOBS_COMPLETED';
+        safe({ status: phase, model: 'gpt-6.1-sol', modelCalls: result.modelCalls, planScopeGranted: true, accountMatchesInfo: true,
+          authorizationPath: 'SIWC_PLAN_GRANT', planAuthorizedInferenceVerified: true, hostedCorelyTested: false,
+          exactDebitAmountVerified: false, apiKeyFallbackUsed: false, credentialsPersisted: false, completedAt: new Date().toISOString() });
+        return;
+      }
       phase = 'RUNNING_ONE_SYNTHETIC_PROBE';
-      const result = await runSyntheticProbe(session, fetch, abort.signal);
+      const result = await runSyntheticProbe(session, fetchImpl, abort.signal);
       phase = 'LOCAL_DIRECT_PROBE_COMPLETED';
       safe({ status: phase, ...result, planScopeGranted: true, accountMatchesInfo: true,
         authorizationPath: 'SIWC_PLAN_GRANT', planAuthorizedInferenceVerified: true, planDebitVerified: false,
@@ -179,6 +203,7 @@ export async function startLocalPilot() {
   process.once('SIGTERM', interrupt);
   safe({ status: phase, localUrl: origin, app: 'New API Local Personal Plan Pilot', expectedAccount: 'info@moztech.cc',
     noCloud: true, noCustomerData: true, credentialsPersisted: false, registrationMappingRetained: true, noApiKeyFallback: true });
+  return Object.freeze({ localUrl: origin, completion, close: stop });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

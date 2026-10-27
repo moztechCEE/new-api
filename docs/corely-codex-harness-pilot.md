@@ -1,5 +1,43 @@
 # Local Codex harness pilot
 
+## 2026-10-27: SIWC Corely text-job adapter and bounded transport; not deployed
+
+The new text adapter preserves Corely's complete instructions, current input,
+strict structured schema and per-call digests on the official public SIWC
+Responses route (`store:false`, `stream:true`, exact `gpt-6.1-sol`). It accepts
+only completed, consistent text with provider usage. Refusal/tool/partial output,
+invalid schema, mismatched identity/model/digests, unsafe expiry and uncertain
+transport hold the job. Only the official authenticated plan-limit error may
+advance Info to Eason; API fallback is absent. Image capability remains false.
+Both normal-login ephemeral ports and the protected persistent session manager
+use this same adapter; no native Codex/Luna credential cache is read.
+
+The independent Corely model-job client now supports the separately default-off
+status/enroll/claim/complete resource. Its normal Corely OAuth remains
+`corely:dev-model-jobs`, fixed loopback, owner/admin checked and 15-minute,
+closure-only/revocable. It cannot produce jobs, read cases, approve, send or
+learn. Every lease, selected account, request/schema/result hash and SIWC auth
+mode is validated. There is no new permanent VM Corely grant, public relay,
+daemon, Go upstream channel or customer-service cutover in this milestone.
+
+Corely's cross-repository **offline** fixture exercises actual Nest HTTP/OAuth,
+router/broker, New API app-owned protected session store, worker, SSE parser,
+compact evidence selection and independent semantic-review decoders. All
+provider responses, tokens, facts and identities are synthetic; four bound
+model phases pass. Separately, the normal one-shot Info OAuth pilot can lend
+only a transient in-process port to Corely's fixed local synthetic integration
+test, then revoke the session. It exposes no token getter, cannot replay a call,
+and stops retained ports on logout. This is not a hosted Corely acceptance claim.
+
+Security controls remain grounded in the authentication/session/OAuth cheat
+sheets linked below and stable ASVS5.0.0 V10.1–10.5: issuer/audience/nonce/stable
+subject, PKCE/state, distinct resource/scopes, expiry/revocation and server-side
+authorization. The adapter never logs prompts, output, bearer/renewal tokens or
+actual login values. Full ASVS certification, hosted eligibility, live persistent
+VM enrollment/restart/refresh, actual all-phase Corely inference, original50,
+manual save/unique-send/learned-style adoption remain separate acceptance gates.
+Normal DEV, production, existing data, modes, IAM and cloud services are unchanged.
+
 ## 2026-10-27: persistent owner DEV session implementation; not deployed
 
 The owner explicitly approved fresh New API-owned SIWC credentials on the

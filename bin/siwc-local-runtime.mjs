@@ -231,7 +231,7 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
   return diagnostic;
 }
 
-export async function consumeProbeStream(body) {
+async function consumeTextStream(body, expectedText, signal) {
   if (!body) fail('MISSING_COMPLETED_EVENT');
   const decoder = new TextDecoder('utf8', { fatal: true });
   let buffer = '', total = 0, text = '', completed, responseId;
@@ -270,6 +270,13 @@ export async function consumeProbeStream(body) {
     if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) {
       throw new ProbeError('INFERENCE_NOT_COMPLETED', { errorCode: event.response?.error?.code ?? event.error?.code ?? event.code });
     }
+    // No tools are provided on this text-only port. Never turn a refusal or
+    // an action/tool item into a completed customer-service text receipt.
+    if (event.type.startsWith('response.refusal.') ||
+        (['response.output_item.added', 'response.output_item.done'].includes(event.type) &&
+          !['message', 'reasoning'].includes(event.item?.type)) ||
+        (['response.content_part.added', 'response.content_part.done'].includes(event.type) &&
+          event.part?.type !== 'output_text')) fail('NON_TEXT_OUTPUT_REJECTED');
     if (event.type === 'response.output_text.delta') {
       if (completed || typeof event.delta !== 'string') fail('INVALID_STREAM_EVENT');
       text += event.delta;
@@ -286,18 +293,31 @@ export async function consumeProbeStream(body) {
     }
     if (event.type === 'response.output_item.done' && event.item?.type === 'message') {
       if (completed || event.item.status !== 'completed' || !Array.isArray(event.item.content)) fail('INVALID_STREAM_EVENT');
+      if ((event.item.role !== undefined && event.item.role !== 'assistant') ||
+          event.item.content.some(part => part?.type !== 'output_text')) fail('NON_TEXT_OUTPUT_REJECTED');
       event.item.content.forEach((part, index) => {
         if (part?.type === 'output_text') closePart(event.output_index, index, event.item.id, part.text);
       });
     }
     if (event.type === 'response.completed') {
-      if (completed || event.response?.status !== 'completed' || event.response?.model !== MODEL ||
+      if (completed || event.response?.status !== 'completed' || event.response.error != null || event.response?.model !== MODEL ||
           typeof event.response?.id !== 'string' || !event.response.id) fail('INVALID_COMPLETION');
       completed = event.response;
     }
   }
+  let iterator, finished = false;
+  let interrupted;
+  const interruption = new Promise((_, reject) => { interrupted = () => reject(new ProbeError('SESSION_OPERATION_ABORTED')); });
+  void interruption.catch(() => {});
+  signal?.addEventListener('abort', interrupted, { once: true });
+  if (signal?.aborted) interrupted();
   try {
-    for await (const chunk of body) {
+    iterator = body[Symbol.asyncIterator]();
+    for (;;) {
+      if (signal?.aborted) fail('SESSION_OPERATION_ABORTED');
+      const part = await Promise.race([iterator.next(), interruption]);
+      if (part.done) { finished = true; break; }
+      const chunk = part.value;
       total += chunk.length;
       if (total > 1_048_576) fail('STREAM_TOO_LARGE');
       buffer += decoder.decode(chunk, { stream: true });
@@ -312,9 +332,20 @@ export async function consumeProbeStream(body) {
   } catch (error) {
     if (error instanceof ProbeError) throw error;
     fail('STREAM_INTERRUPTED');
+  } finally {
+    signal?.removeEventListener('abort', interrupted);
+    if (!finished && iterator?.return) void Promise.resolve(iterator.return()).catch(() => {});
   }
   if (!completed) fail('MISSING_COMPLETED_EVENT');
   if (!Array.isArray(completed.output)) fail('INVALID_COMPLETION');
+  for (const [index, item] of completed.output.entries()) {
+    if (!item || !['message', 'reasoning'].includes(item.type)) fail('NON_TEXT_OUTPUT_REJECTED');
+    if (item.type === 'message' && (!Array.isArray(item.content) ||
+        (item.role !== undefined && item.role !== 'assistant') ||
+        (item.status !== undefined && item.status !== 'completed') ||
+        item.content.some(part => part?.type !== 'output_text' || typeof part.text !== 'string'))) fail('NON_TEXT_OUTPUT_REJECTED');
+    if (identities.has(index) && item.id !== undefined && item.id !== identities.get(index)) fail('INVALID_COMPLETION');
+  }
   const snapshotText = completed.output.filter(i => i?.type === 'message')
     .flatMap(i => i.content ?? []).filter(c => c.type === 'output_text').map(c => c.text).join('');
   const ordered = [...parts.values()].sort((a, b) => a.outputIndex - b.outputIndex || a.contentIndex - b.contentIndex);
@@ -322,21 +353,39 @@ export async function consumeProbeStream(body) {
   const itemText = allPartsClosed ? ordered.map(part => part.done).join('') : '';
   const finalText = snapshotText || itemText;
   const streamText = ordered.length ? ordered.map(part => part.delta).join('') : text;
-  if (!finalText || finalText.trim() !== PROBE_OUTPUT || (streamText && streamText !== finalText) ||
+  if (!finalText || (expectedText !== undefined && finalText.trim() !== expectedText) || (streamText && streamText !== finalText) ||
       (snapshotText && itemText && snapshotText !== itemText)) {
-    throw new ProbeError('SYNTHETIC_OUTPUT_MISMATCH', { completedEventVerified: true,
-      finalTextMatchesExpected: finalText.trim() === PROBE_OUTPUT, deltaMatchesFinal: streamText === finalText,
+    throw new ProbeError(expectedText === undefined ? 'COMPLETED_OUTPUT_MISMATCH' : 'SYNTHETIC_OUTPUT_MISMATCH', { completedEventVerified: true,
+      finalTextMatchesExpected: expectedText === undefined || finalText.trim() === expectedText, deltaMatchesFinal: streamText === finalText,
       finalTextLength: finalText.length, deltaTextLength: streamText.length,
       finalTextHash: digest(finalText), deltaTextHash: digest(streamText) });
   }
-  let usage;
+  if (Buffer.byteLength(finalText) > 1_048_576) fail('OUTPUT_TOO_LARGE');
+  let usage, cachedInputTokens;
   if (completed.usage !== undefined && completed.usage !== null) {
     const source = completed.usage;
     if (!['input_tokens', 'output_tokens', 'total_tokens'].every(key => Number.isSafeInteger(source[key]) && source[key] >= 0) ||
         source.input_tokens + source.output_tokens !== source.total_tokens) fail('INVALID_USAGE_RECEIPT');
     usage = { inputTokens: source.input_tokens, outputTokens: source.output_tokens, totalTokens: source.total_tokens };
+    cachedInputTokens = source.input_tokens_details?.cached_tokens ?? 0;
+    if (!Number.isSafeInteger(cachedInputTokens) || cachedInputTokens < 0 || cachedInputTokens > source.input_tokens) fail('INVALID_USAGE_RECEIPT');
   }
-  return { completed: true, model: MODEL, responseIdHash: digest(completed.id), outputHash: digest(finalText), ...(usage ? { usage } : {}) };
+  return { completed: true, model: MODEL, responseIdHash: digest(completed.id), outputHash: digest(finalText),
+    text: finalText, ...(usage ? { usage, cachedInputTokens } : {}) };
+}
+
+/** Fixed local proof retains its historical no-content receipt. */
+export async function consumeProbeStream(body) {
+  const { text: _text, cachedInputTokens: _cached, ...receipt } = await consumeTextStream(body, PROBE_OUTPUT);
+  return receipt;
+}
+
+/** Internal text result for the bounded Corely adapter, never a public proxy.
+ * Usage and terminal completion must both be attested by the provider. */
+export async function consumePlanTextStream(body, signal) {
+  const receipt = await consumeTextStream(body, undefined, signal);
+  if (!receipt.usage) fail('INVALID_USAGE_RECEIPT');
+  return receipt;
 }
 
 export async function runSyntheticProbe(session, fetchImpl = fetch, signal) {

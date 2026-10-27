@@ -6,6 +6,8 @@ import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ISSUER, RESOURCE, SCOPES, ProbeError, digest, publicJson, validateSession, runSyntheticProbe } from './siwc-local-runtime.mjs';
+import { runCorelyPlanRequest } from './siwc-local-model-port.mjs';
+import { snapshotModelRequest } from './corely-model-contract.mjs';
 
 export const VM_NAME = 'new-api-dev-20261022';
 export const SESSION_ACCOUNTS = Object.freeze({ info: 'info@moztech.cc', eason: 'moztecheason@gmail.com' });
@@ -313,6 +315,7 @@ function validatedRefresh(record, token, jwks, now) {
  * until the separate trusted Corely model-job transport is installed. */
 export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fetch, now = Date.now } = {}) {
   if (store.host.runtime !== 'vm' || typeof fetchImpl !== 'function' || typeof now !== 'function') fail('SESSION_MANAGER_INVALID');
+  const modelCalls = new Set();
   const clock = record => {
     const time = now();
     if (!timestamp(time) || (record && time < record.updatedAt)) fail('SESSION_CLOCK_INVALID');
@@ -389,6 +392,19 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       return Object.freeze({ status: 'SESSION_MAINTENANCE_COMPLETED', accounts: results, apiFallbackUsed: false });
     },
     probe,
+    generate(alias, input, signal) {
+      account(alias);
+      if (!(signal instanceof AbortSignal)) return Promise.reject(new ProbeError('MODEL_PORT_INVALID'));
+      checkAbort(signal);
+      let request;
+      try { request = snapshotModelRequest(input); }
+      catch (error) { return Promise.reject(new ProbeError(error.code ?? 'INVALID_REQUEST')); }
+      const call = `${alias}:${request.callId}`;
+      if (modelCalls.has(call) || modelCalls.size >= 1000) return Promise.reject(new ProbeError('MODEL_CALL_REPLAY_OR_CAPACITY'));
+      modelCalls.add(call);
+      return withFreshRecord(alias, record => runCorelyPlanRequest({ alias, accessToken: record.accessToken,
+        expiresAt: record.expiresAt, planScopeGranted: true, accountMatchesExpected: true }, request, fetchImpl, signal), signal);
+    },
     async probeInAccountOrder(signal) {
       try { return { ...await probe('info', signal), fallbackReason: null }; }
       catch (error) {

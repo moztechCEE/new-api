@@ -5,6 +5,7 @@ import { after, before, test } from 'node:test';
 import { CORELY_MODEL_JOB_RESOURCE as RESOURCE, CORELY_MODEL_JOB_ISSUER as ISSUER, CORELY_MODEL_JOB_SCOPE as SCOPE,
   CORELY_MODEL_JOB_CLIENT_ID as CLIENT, CORELY_MODEL_JOB_REDIRECT as REDIRECT, ModelJobClientError,
   validateModelJobCallback, connectCorelyModelJobs } from './codex-harness-model-job-client.mjs';
+import { executeOneCorelyModelJob } from './siwc-local-corely-worker.mjs';
 
 const TOKEN = `models_access_${'t'.repeat(43)}`, CODE = `models_code_${'c'.repeat(43)}`, STATE = 's'.repeat(43);
 const realFetch = globalThis.fetch;
@@ -40,9 +41,14 @@ async function portReusable() {
   finally { if (server.listening) await new Promise(resolve => server.close(resolve)); }
 }
 
-function fakeFetch({ tokenResponse, revokeResponse, tokenThrow, revokeThrow } = {}) {
+function fakeFetch({ tokenResponse, revokeResponse, tokenThrow, revokeThrow, resourceResponse } = {}) {
   const calls = [];
   const fetchImpl = async (url, options) => {
+    if (resourceResponse && ['status', 'enroll', 'claim', 'complete'].some(operation => url === `${RESOURCE}/${operation}`)) {
+      assert.equal(options.headers.authorization, `Bearer ${TOKEN}`); assert.equal(options.redirect, 'error');
+      assert.equal(options.credentials, 'omit'); assert.equal(options.cache, 'no-store');
+      return resourceResponse(url, options);
+    }
     assert.ok([`${ISSUER}/token`, `${ISSUER}/revoke`].includes(url), 'no resource, model, provider or arbitrary request');
     assert.equal(options.method, 'POST'); assert.equal(options.redirect, 'error'); assert.equal(options.credentials, 'omit');
     assert.equal(options.cache, 'no-store'); assert.ok(options.signal instanceof AbortSignal);
@@ -60,6 +66,102 @@ function fakeFetch({ tokenResponse, revokeResponse, tokenThrow, revokeThrow } = 
 }
 
 async function authorize(auth) { assert.equal((await loopback(callbackUrl(auth))).status, 200); }
+
+function syntheticLease() {
+  const canonical = value => value && typeof value === 'object' ? Array.isArray(value) ? value.map(canonical)
+    : Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+  const content = { version: 1, callId: 'synthetic-corely-call', workload: 'REPLY_LLM', purpose: 'reply_generation', model: 'gpt-6.1-sol',
+    scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: 'server-owned-synthetic-job' },
+    system: 'Synthetic facts only.', user: 'Synthetic current question.', schemaSha256: null };
+  const inputSha256 = createHash('sha256').update(JSON.stringify(canonical(content))).digest('hex');
+  return { leaseId: '63388770-cd07-4b5b-a53b-f73ee875a548', accountAlias: 'info', expiresAt: Date.now() + 40_000,
+    request: { ...content, inputSha256 } };
+}
+const resourceStatus = () => ({ status: 'SYNTHETIC_MODEL_TRANSPORT', scope: SCOPE, tenantId: 'moztech', brandId: 'moztech-test',
+  authMode: 'siwc_plan', syntheticOnly: true, enrolled: true, producerConnected: false,
+  apiFallbackEnabled: false, sendingCapability: false, learningCapability: false });
+
+test('normal Corely grant runs one bound SIWC lease, sends no credentials to the model and validates completion hashing', async () => {
+  const lease = syntheticLease(), operations = []; let completed = false, modelCalls = 0;
+  const transport = fakeFetch({ resourceResponse: async (url, options) => {
+    const operation = url.slice(RESOURCE.length + 1); operations.push(operation);
+    if (operation === 'status') { assert.equal(options.method, 'GET'); assert.equal(options.body, undefined); return Response.json(resourceStatus()); }
+    assert.equal(options.method, 'POST'); const body = JSON.parse(options.body);
+    if (operation === 'enroll') {
+      assert.deepEqual(body, {}); return Response.json({ enrolled: true, authMode: 'siwc_plan', expiresAt: Date.now() + 890_000,
+        syntheticOnly: true, apiFallbackEnabled: false, sendingCapability: false, learningCapability: false });
+    }
+    if (operation === 'claim') { assert.deepEqual(body, { accountAlias: 'info' }); return Response.json({ lease, authMode: 'siwc_plan' }); }
+    assert.equal(operation, 'complete'); assert.equal(body.leaseId, lease.leaseId);
+    assert.equal(body.result.authMode, 'siwc_plan'); assert.equal(body.result.inputSha256, lease.request.inputSha256);
+    const receipt = { accepted: true, replayed: completed, callId: lease.request.callId,
+      resultSha256: createHash('sha256').update(JSON.stringify(body.result)).digest('hex') }; completed = true;
+    return Response.json(receipt);
+  } });
+  const client = await connectCorelyModelJobs({ fetchImpl: transport.fetchImpl, onAuthorize: authorize });
+  try {
+    assert.equal((await client.enrollModels()).enrolled, true);
+    const ports = { info: { authMode: 'siwc_plan', capabilities: { text: true, structuredJson: true, images: false },
+      generate: async (request, signal) => {
+        modelCalls++; assert.equal(signal.aborted, false); assert.equal(request.user, lease.request.user);
+        assert.ok(!JSON.stringify(request).includes(TOKEN));
+        return { status: 'success', completionStatus: 'completed', accountAlias: 'info', authMode: 'siwc_plan', accountVerified: true,
+          model: request.model, callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
+          text: 'Synthetic generated answer.', usage: { inputTokens: 10, outputTokens: 4, cachedInputTokens: 1 } };
+      } } };
+    const receipt = await executeOneCorelyModelJob(client, ports, new AbortController().signal);
+    assert.equal(receipt.status, 'CORELY_SYNTHETIC_MODEL_JOB_COMPLETED'); assert.equal(receipt.authMode, 'siwc_plan');
+    assert.equal(receipt.apiFallbackUsed, false); assert.equal(modelCalls, 1);
+    assert.doesNotMatch(JSON.stringify(receipt), /Synthetic|models_access_|Synthetic generated answer/);
+    assert.deepEqual(operations, ['enroll', 'status', 'claim', 'complete']);
+    await assert.rejects(client.claimModel('info'), isCode('RESOURCE_RESPONSE_INVALID'));
+    assert.equal(modelCalls, 1);
+  } finally { await client.revoke(); }
+  await assert.rejects(client.modelStatus(), isCode('GRANT_CLOSED'));
+});
+
+test('resource negotiation rejects permission drift and malformed leases before a model or completion request', async t => {
+  for (const [name, value, invoke] of [
+    ['sending enabled', { ...resourceStatus(), sendingCapability: true }, session => session.modelStatus()],
+    ['wrong account auth mode', { ...resourceStatus(), authMode: 'api_key' }, session => session.modelStatus()],
+    ['unknown status fields', { ...resourceStatus(), bearer: 'synthetic-private-do-not-emit' }, session => session.modelStatus()],
+    ['cross-account lease', { lease: { ...syntheticLease(), accountAlias: 'eason' }, authMode: 'siwc_plan' }, session => session.claimModel('info')],
+    ['expired lease', { lease: { ...syntheticLease(), expiresAt: Date.now() - 1000 }, authMode: 'siwc_plan' }, session => session.claimModel('info')],
+    ['wrong input binding', { lease: { ...syntheticLease(), request: { ...syntheticLease().request, user: 'changed' } }, authMode: 'siwc_plan' }, session => session.claimModel('info')],
+  ]) await t.test(name, async () => {
+    const transport = fakeFetch({ resourceResponse: async () => Response.json(value) });
+    const client = await connectCorelyModelJobs({ fetchImpl: transport.fetchImpl, onAuthorize: authorize });
+    try { await assert.rejects(invoke(client), isCode('RESOURCE_RESPONSE_INVALID')); }
+    finally { await client.revoke(); }
+  });
+});
+
+test('resource errors, redirects, oversized bodies and uncooperative fetches never become fallback or success', async t => {
+  for (const [name, response, expected] of [
+    ['HTTP unauthorized', () => Response.json({ error: 'private-auth-detail' }, { status: 401 }), 'RESOURCE_RESPONSE_INVALID'],
+    ['redirect', () => ({ redirected: true, status: 200 }), 'RESOURCE_RESPONSE_INVALID'],
+    ['oversized', () => new Response(' '.repeat(1024 * 1024 + 1), { headers: { 'Content-Type': 'application/json' } }), 'RESOURCE_RESPONSE_INVALID'],
+    ['network uncertainty', () => { throw new Error('private-provider-detail'); }, 'RESOURCE_REQUEST_UNCERTAIN'],
+    ['hung request', () => new Promise(() => {}), 'RESOURCE_REQUEST_UNCERTAIN'],
+  ]) await t.test(name, async () => {
+    const transport = fakeFetch({ resourceResponse: response });
+    const client = await connectCorelyModelJobs({ fetchImpl: transport.fetchImpl, requestTimeoutMs: 30, onAuthorize: authorize });
+    try { await assert.rejects(client.modelStatus(), isCode(expected)); }
+    finally { await client.revoke(); }
+  });
+});
+
+test('an empty worker queue makes zero model calls; permission drift cannot run a claimed job', async () => {
+  let models = 0, claims = 0;
+  const client = { modelStatus: async () => resourceStatus(), claimModel: async () => { claims++; return null; }, completeModel: async () => { throw new Error('not reached'); } };
+  const ports = { info: { authMode: 'siwc_plan', capabilities: { text: true, structuredJson: true, images: false }, generate: async () => { models++; } } };
+  assert.deepEqual(await executeOneCorelyModelJob(client, ports, new AbortController().signal),
+    { status: 'NO_SYNTHETIC_MODEL_JOB', modelRequestsMade: 0, apiFallbackUsed: false });
+  assert.equal(claims, 2); assert.equal(models, 0);
+  await assert.rejects(executeOneCorelyModelJob({ ...client, modelStatus: async () => ({ ...resourceStatus(), learningCapability: true }) },
+    ports, new AbortController().signal), { code: 'MODEL_WORKER_NOT_ADMITTED' });
+  assert.equal(claims, 2); assert.equal(models, 0);
+});
 
 test('callback requires the separate model-job client, exact loopback, state, issuer and prefixed code', async t => {
   const base = new URL(REDIRECT); base.searchParams.set('state', STATE); base.searchParams.set('iss', ISSUER); base.searchParams.set('code', CODE);
@@ -101,10 +203,10 @@ test('normal OAuth proves only a bounded Corely grant; bearer, code and verifier
     assert.equal(form.get('grant_type'), 'authorization_code'); assert.equal(form.get('redirect_uri'), REDIRECT);
     assert.equal(createHash('sha256').update(form.get('code_verifier')).digest('base64url'), authorization.searchParams.get('code_challenge'));
     assert.notEqual(form.get('code_verifier'), authorization.searchParams.get('state'));
-    assert.deepEqual(Object.keys(session).sort(), ['receipt', 'revoke']); assert.ok(Object.isFrozen(session));
+    assert.deepEqual(Object.keys(session).sort(), ['claimModel', 'completeModel', 'enrollModels', 'modelStatus', 'receipt', 'revoke']); assert.ok(Object.isFrozen(session));
     const receipt = session.receipt(); assert.ok(Object.isFrozen(receipt));
     assert.equal(receipt.status, 'CORELY_MODEL_JOB_GRANT_CONNECTED'); assert.equal(receipt.currentServerAuthority, 'NOT_CHECKED');
-    assert.equal(receipt.syntheticOnly, true); assert.equal(receipt.jobOperations, 'NOT_IMPLEMENTED');
+    assert.equal(receipt.syntheticOnly, true); assert.equal(receipt.jobOperations, 'REQUIRES_RESOURCE_HANDSHAKE');
     for (const field of ['customerDataAccessed', 'modelExecuted', 'apiFallbackUsed', 'sendingPerformed', 'learningPerformed']) assert.equal(receipt[field], false);
     assert.ok(!JSON.stringify(session).includes(TOKEN)); assert.ok(!JSON.stringify(receipt).includes(CODE));
     assert.ok(!JSON.stringify(receipt).includes(form.get('code_verifier')));

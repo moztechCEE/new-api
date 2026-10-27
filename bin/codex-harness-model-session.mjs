@@ -3,13 +3,13 @@
 // Recognizable hosted invocation is rejected; absence of a marker does not
 // attest local-use eligibility or authorize a commercial/hosted service.
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { MODEL, HARNESS_ACCOUNTS, verifyAccount } from './codex-harness-pilot.mjs';
 import { CANARY_PROFILE, canaryExecutableSha256, canaryProfileOverrides, runPermissionsCanary } from './codex-harness-permissions-canary.mjs';
+import { snapshotModelRequest as snapshotCorelyModelRequest, validateModelOutput } from './corely-model-contract.mjs';
 
 export const MODEL_SESSION_VERSION = 'corely-managed-model-session-v1';
 const BOUNDARY = 'This is an owner-operated synthetic Corely model call. Follow the supplied base instructions for this call only. Produce the requested answer without tools, files, network, apps, subagents, execution, approval, sending, learning or persistence. The model has no authority to execute actions or change state. It may accurately describe a server-verified action result explicitly supplied in this call; never invent success, completion or execution evidence.';
@@ -26,14 +26,6 @@ const CODES = new Set(['INVALID_OPTIONS', 'INVALID_REQUEST', 'SCOPE_NOT_ADMITTED
   'RPC_FAILED', 'TIMEOUT', 'OUTPUT_LIMIT', 'TOOL_USE_REJECTED', 'UNSUPPORTED_EVENT', 'THREAD_MISMATCH', 'TURN_MISMATCH',
   'TURN_FAILED', 'INCOMPLETE_TURN', 'INVALID_USAGE', 'INVALID_OUTPUT', 'INVALID_STRUCTURED_OUTPUT', 'CALL_REPLAY',
   'SESSION_CLOSED', 'ABORTED', 'CLEANUP_FAILED']);
-const REQUEST_KEYS = new Set(['version', 'callId', 'workload', 'purpose', 'model', 'scope', 'system', 'user', 'responseFormat',
-  'responseSchema', 'image', 'reasoningEffort', 'verbosity', 'inputSha256', 'schemaSha256']);
-const WORKLOADS = new Set(['DECISION_LLM', 'REPLY_LLM', 'WEB_CHAT_VISION', 'MEDIA_IMAGE_ANALYSIS']);
-const PURPOSES = new Set(['semantic_reply_review', 'semantic_evidence_selection', 'support_decision', 'reply_generation',
-  'reply_repair', 'structured_output', 'text_generation', 'image_analysis']);
-const SCHEMA_KEYS = new Set(['type', 'description', 'title', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
-  'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'uniqueItems']);
-const TYPES = new Set(['null', 'object', 'array', 'string', 'integer', 'number', 'boolean']);
 const CAPABILITIES = Object.freeze({ text: true, structuredJson: true, images: false });
 const MAX_BYTES = 1024 * 1024;
 
@@ -41,7 +33,6 @@ export class ModelSessionError extends Error {
   constructor(code) { super(CODES.has(code) ? code : 'PROTOCOL_ERROR'); this.name = 'ModelSessionError'; this.code = this.message; }
 }
 const held = code => { throw new ModelSessionError(code); };
-const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -49,131 +40,15 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 
-// Rebuild caller JSON synchronously, without invoking getters or retaining
-// references. This canonical order is the Corely router's SHA-256 contract.
-function copyCanonical(value) {
-  let nodes = 0;
-  const seen = new Set();
-  const visit = (node, depth) => {
-    if (++nodes > 20000 || depth > 32) held('INVALID_REQUEST');
-    if (node === null || typeof node === 'string' || typeof node === 'boolean') return node;
-    if (typeof node === 'number' && Number.isFinite(node)) return node;
-    if (!node || typeof node !== 'object' || seen.has(node) || Object.getOwnPropertySymbols(node).length) held('INVALID_REQUEST');
-    if (!Array.isArray(node) && ![Object.prototype, null].includes(Object.getPrototypeOf(node))) held('INVALID_REQUEST');
-    seen.add(node);
-    const descriptors = Object.getOwnPropertyDescriptors(node);
-    let result;
-    if (Array.isArray(node)) {
-      if (Object.keys(descriptors).some(key => key !== 'length' && !/^(0|[1-9][0-9]*)$/.test(key))) held('INVALID_REQUEST');
-      result = [];
-      for (let index = 0; index < node.length; index++) {
-        const entry = descriptors[index];
-        if (!entry || !entry.enumerable || !Object.hasOwn(entry, 'value')) held('INVALID_REQUEST');
-        result.push(visit(entry.value, depth + 1));
-      }
-    } else {
-      result = Object.fromEntries(Object.keys(descriptors).sort().map(key => {
-        const entry = descriptors[key];
-        if (!entry.enumerable || !Object.hasOwn(entry, 'value')) held('INVALID_REQUEST');
-        return [key, visit(entry.value, depth + 1)];
-      }));
-    }
-    seen.delete(node);
-    return Object.freeze(result);
-  };
-  const result = visit(value, 0);
-  if (Buffer.byteLength(JSON.stringify(result)) > 8 * MAX_BYTES) held('INVALID_REQUEST');
-  return result;
-}
-
-function supportsSchema(schema) {
-  let nodes = 0;
-  const visit = (s, depth) => {
-    if (++nodes > 2000 || depth > 24 || !s || typeof s !== 'object' || Array.isArray(s) ||
-        Object.keys(s).some(key => !SCHEMA_KEYS.has(key))) return false;
-    const types = Array.isArray(s.type) ? s.type : [s.type];
-    if (!types.length || types.some(type => !TYPES.has(type))) return false;
-    if (s.enum !== undefined && (!Array.isArray(s.enum) || !s.enum.length)) return false;
-    if (s.uniqueItems !== undefined && typeof s.uniqueItems !== 'boolean') return false;
-    for (const key of ['title', 'description']) if (s[key] !== undefined && typeof s[key] !== 'string') return false;
-    for (const key of ['minItems', 'maxItems', 'minLength', 'maxLength']) {
-      if (s[key] !== undefined && (!Number.isSafeInteger(s[key]) || s[key] < 0)) return false;
-    }
-    for (const key of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum']) {
-      if (s[key] !== undefined && (typeof s[key] !== 'number' || !Number.isFinite(s[key]))) return false;
-    }
-    if (types.includes('object')) {
-      if (s.additionalProperties !== false || !s.properties || typeof s.properties !== 'object' || Array.isArray(s.properties) ||
-          !Array.isArray(s.required) || s.required.some(key => typeof key !== 'string' || !Object.hasOwn(s.properties, key)) ||
-          new Set(s.required).size !== s.required.length || !Object.values(s.properties).every(child => visit(child, depth + 1))) return false;
-    }
-    if (types.includes('array') && !visit(s.items, depth + 1)) return false;
-    return true;
-  };
-  return visit(schema, 0);
+export function snapshotModelRequest(input) {
+  try { return snapshotCorelyModelRequest(input); }
+  catch (error) { throw new ModelSessionError(CODES.has(error?.code) ? error.code : 'INVALID_REQUEST'); }
 }
 
 function validateOutput(text, request) {
-  if (typeof text !== 'string' || !text.trim() || Buffer.byteLength(text) > MAX_BYTES) held('INVALID_OUTPUT');
-  if (!request.responseSchema && request.responseFormat !== 'json') return;
-  let parsed;
-  try { parsed = JSON.parse(text); } catch { held('INVALID_STRUCTURED_OUTPUT'); }
-  if (!request.responseSchema) {
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) held('INVALID_STRUCTURED_OUTPUT');
-    return;
-  }
-  let nodes = 0;
-  const validate = (value, s, depth) => {
-    if (++nodes > 4000 || depth > 24) return false;
-    const types = Array.isArray(s.type) ? s.type : [s.type];
-    const matches = type => type === 'null' ? value === null : type === 'array' ? Array.isArray(value)
-      : type === 'object' ? value !== null && typeof value === 'object' && !Array.isArray(value)
-        : type === 'integer' ? Number.isSafeInteger(value) : type === 'number' ? typeof value === 'number' && Number.isFinite(value)
-          : typeof value === type;
-    if (!types.some(matches)) return false;
-    if (s.enum && !s.enum.some(entry => JSON.stringify(copyCanonical(entry)) === JSON.stringify(copyCanonical(value)))) return false;
-    if (Object.hasOwn(s, 'const') && JSON.stringify(copyCanonical(s.const)) !== JSON.stringify(copyCanonical(value))) return false;
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      return s.required.every(key => Object.hasOwn(value, key)) && Object.keys(value).every(key =>
-        Object.hasOwn(s.properties, key) && validate(value[key], s.properties[key], depth + 1));
-    }
-    if (Array.isArray(value)) return (s.minItems === undefined || value.length >= s.minItems) &&
-      (s.maxItems === undefined || value.length <= s.maxItems) &&
-      (s.uniqueItems !== true || new Set(value.map(entry => JSON.stringify(copyCanonical(entry)))).size === value.length) &&
-      value.every(entry => validate(entry, s.items, depth + 1));
-    if (typeof value === 'string' && ((s.minLength !== undefined && [...value].length < s.minLength) ||
-        (s.maxLength !== undefined && [...value].length > s.maxLength))) return false;
-    return typeof value !== 'number' || !((s.minimum !== undefined && value < s.minimum) || (s.maximum !== undefined && value > s.maximum) ||
-      (s.exclusiveMinimum !== undefined && value <= s.exclusiveMinimum) || (s.exclusiveMaximum !== undefined && value >= s.exclusiveMaximum));
-  };
-  if (!validate(parsed, request.responseSchema, 0)) held('INVALID_STRUCTURED_OUTPUT');
+  try { validateModelOutput(text, request); }
+  catch (error) { throw new ModelSessionError(CODES.has(error?.code) ? error.code : 'INVALID_OUTPUT'); }
 }
-
-function snapshotRequest(input) {
-  const request = copyCanonical(input);
-  if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !REQUEST_KEYS.has(key)) ||
-      request.version !== 1 || request.model !== MODEL || typeof request.callId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(request.callId) ||
-      !WORKLOADS.has(request.workload) || !PURPOSES.has(request.purpose) || typeof request.system !== 'string' || !request.system.trim() ||
-      typeof request.user !== 'string' || !request.user.trim() || (request.responseFormat !== undefined && request.responseFormat !== 'json') ||
-      (request.verbosity !== undefined && request.verbosity !== 'low') ||
-      (request.reasoningEffort !== undefined && (typeof request.reasoningEffort !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/.test(request.reasoningEffort)))) held('INVALID_REQUEST');
-  const s = request.scope;
-  if (!s || typeof s !== 'object' || Array.isArray(s) || Object.keys(s).some(key => !['tenantId', 'brandId', 'synthetic', 'jobId'].includes(key)) ||
-      s.tenantId !== 'moztech' || s.brandId !== 'moztech-test' || s.synthetic !== true || typeof s.jobId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(s.jobId)) held('SCOPE_NOT_ADMITTED');
-  if (Object.hasOwn(request, 'image')) held('UNSUPPORTED_CAPABILITY');
-  if (request.responseSchema !== undefined && !supportsSchema(request.responseSchema)) held('UNSUPPORTED_CAPABILITY');
-  const schemaHash = request.responseSchema === undefined ? null : digest(request.responseSchema);
-  if (request.schemaSha256 !== schemaHash || !/^[a-f0-9]{64}$/.test(request.inputSha256 ?? '')) held('INPUT_MISMATCH');
-  const content = Object.fromEntries(Object.entries(request).filter(([key]) => key !== 'inputSha256'));
-  if (digest(content) !== request.inputSha256) held('INPUT_MISMATCH');
-  return request;
-}
-
-export function snapshotModelRequest(input) {
-  try { return snapshotRequest(input); }
-  catch (error) { throw error instanceof ModelSessionError ? error : new ModelSessionError('INVALID_REQUEST'); }
-}
-
 class OfficialChannel {
   constructor(executable, args, env, cwd, timeoutMs) {
     this.timeoutMs = timeoutMs; this.sequence = 0; this.pending = new Map(); this.waiters = new Map();

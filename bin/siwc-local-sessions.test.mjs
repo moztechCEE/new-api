@@ -9,6 +9,7 @@ import { ISSUER, RESOURCE, MODEL, PROBE_OUTPUT, SCOPES, ProbeError, digest } fro
 import { openSessionStore, persistValidatedAuthorization, retainIssuedRegistration, writeEnrollment, importEnrollment,
   forgetTransferredEnrollment, createPersistentPlanSessions, SESSION_ACCOUNTS } from './siwc-local-sessions.mjs';
 import { startPersistentEnrollment, assertIsolatedSessionEnvironment, parseSessionCommand } from './siwc-local-vm.mjs';
+import { corelyPlanPayload, createSiwcModelTransports, createTransientSiwcModelPort, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 
 // Only fake identities/credentials and injected provider responses are used.
 const nativeFetch = globalThis.fetch;
@@ -58,6 +59,197 @@ function completion() {
     usage: { input_tokens: 17, output_tokens: 11, total_tokens: 28 },
   } })}\n\n`), { headers: { 'Content-Type': 'text/event-stream' } });
 }
+
+function modelRequest({ callId = 'synthetic-model-call', ...changes } = {}) {
+  const sort = value => value && typeof value === 'object' ? Array.isArray(value) ? value.map(sort)
+    : Object.fromEntries(Object.keys(value).sort().map(key => [key, sort(value[key])])) : value;
+  const draft = { version: 1, callId, model: MODEL, workload: 'REPLY_LLM', purpose: 'reply_generation',
+    scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: 'synthetic-model-job' },
+    system: 'Synthetic brand facts only. Preserve quality review.', user: 'Synthetic customer question.', ...changes };
+  const content = { ...draft, schemaSha256: draft.responseSchema ? digest(JSON.stringify(sort(draft.responseSchema))) : null };
+  return { ...content, inputSha256: digest(JSON.stringify(sort(content))) };
+}
+function modelCompletion(text, { usage = { input_tokens: 21, output_tokens: 8, total_tokens: 29,
+  input_tokens_details: { cached_tokens: 5 } }, output, ...changes } = {}) {
+  return new Response(Buffer.from(`data: ${JSON.stringify({ type: 'response.completed', response: {
+    id: 'synthetic-corely-response', status: 'completed', model: MODEL,
+    output: output ?? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }],
+    usage, ...changes,
+  } })}\n\n`), { headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+test('SIWC maps the entire bounded Corely contract to public Responses without paid-API-only fields', async t => {
+  const schema = { type: 'object', properties: { answer: { type: 'string', minLength: 1 } }, required: ['answer'], additionalProperties: false };
+  const input = modelRequest({ responseSchema: schema, responseFormat: 'json', reasoningEffort: 'low', verbosity: 'low' });
+  const { request, payload } = corelyPlanPayload(input);
+  assert.equal(request.inputSha256, input.inputSha256);
+  assert.deepEqual(payload, { model: MODEL, instructions: input.system, input: [{ role: 'user', content: input.user }], store: false, stream: true,
+    reasoning: { effort: 'low' }, text: { format: { type: 'json_schema', name: 'corely_model_output', strict: true, schema }, verbosity: 'low' } });
+  assert.equal(Object.isFrozen(request.responseSchema.properties.answer), true);
+  input.responseSchema.properties.answer.minLength = 999;
+  assert.equal(payload.text.format.schema.properties.answer.minLength, 1);
+  assert.deepEqual(corelyPlanPayload(modelRequest({ responseFormat: 'json' })).payload.text, { format: { type: 'json_object' } });
+  for (const [name, bad, expected] of [
+    ['real customer scope', modelRequest({ scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: false, jobId: 'x' } }), 'SCOPE_NOT_ADMITTED'],
+    ['cross brand', modelRequest({ scope: { tenantId: 'moztech', brandId: 'other', synthetic: true, jobId: 'x' } }), 'SCOPE_NOT_ADMITTED'],
+    ['wrong model', modelRequest({ model: 'gpt-6-astra' }), 'INVALID_REQUEST'],
+    ['image not yet verified', modelRequest({ image: { mime: 'image/png', base64: 'c3ludGhldGlj' } }), 'UNSUPPORTED_CAPABILITY'],
+    ['unbound content', { ...modelRequest(), user: 'changed' }, 'INPUT_MISMATCH'],
+    ['unsupported schema', modelRequest({ responseSchema: { type: 'object', properties: {}, required: [], additionalProperties: true } }), 'UNSUPPORTED_CAPABILITY'],
+    ['API field injection', modelRequest({ temperature: 0 }), 'INVALID_REQUEST'],
+  ]) await t.test(name, () => assert.throws(() => corelyPlanPayload(bad), { code: expected }));
+});
+
+test('persistent SIWC ports generate and independently review separate requests with exact bound plan receipts', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']);
+  const seen = [];
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async (url, init) => {
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-info-access');
+    if (url === `${RESOURCE}/models`) return catalog();
+    assert.equal(url, `${RESOURCE}/responses`); assert.equal(init.credentials, 'omit'); assert.equal(init.redirect, 'error');
+    const payload = JSON.parse(init.body); seen.push(payload);
+    return modelCompletion(payload.instructions.startsWith('Independent') ? '{"approved":true}' : 'Synthetic grounded answer.');
+  } });
+  const ports = createSiwcModelTransports(sessions);
+  assert.equal(ports.info.authMode, 'siwc_plan');
+  assert.equal(ports.info.capabilities.images, false);
+  const generate = modelRequest();
+  const first = ports.info.generate(generate, new AbortController().signal);
+  generate.user = 'Mutated after starting; must not be sent.';
+  const result = await first;
+  assert.deepEqual(result, { accountAlias: 'info', authMode: 'siwc_plan', accountVerified: true, model: MODEL,
+    callId: generate.callId, inputSha256: generate.inputSha256, schemaSha256: null, status: 'success', completionStatus: 'completed',
+    text: 'Synthetic grounded answer.', usage: { inputTokens: 21, outputTokens: 8, cachedInputTokens: 5 } });
+  const review = modelRequest({ callId: 'synthetic-independent-review', purpose: 'semantic_reply_review', system: 'Independent quality review.',
+    user: 'Synthetic customer question. Candidate: Synthetic grounded answer.',
+    responseSchema: { type: 'object', properties: { approved: { type: 'boolean' } }, required: ['approved'], additionalProperties: false } });
+  const reviewed = await ports.info.generate(review, new AbortController().signal);
+  assert.equal(reviewed.text, '{"approved":true}'); assert.equal(reviewed.inputSha256, review.inputSha256);
+  assert.notEqual(reviewed.callId, result.callId); assert.equal(seen.length, 2);
+  assert.equal(seen[0].input[0].content, 'Synthetic customer question.');
+  assert.equal(seen[1].instructions, 'Independent quality review.');
+  assert.equal(seen.every(payload => payload.store === false && payload.stream === true && !payload.tools && !payload.previous_response_id), true);
+  await assert.rejects(ports.info.generate(review, new AbortController().signal), code('MODEL_CALL_REPLAY_OR_CAPACITY'));
+  assert.equal(seen.length, 2);
+});
+
+test('only official authenticated plan exhaustion becomes a Corely SIWC quota receipt', async t => {
+  const { vm } = await transferred(t);
+  for (const [name, status, errorCode, quota] of [
+    ['known exhausted plan', 429, 'subscription_sharing_usage_limit_exceeded', true],
+    ['ordinary throttle', 429, 'rate_limit_exceeded', false],
+    ['unavailable plan', 503, 'subscription_sharing_usage_unavailable', false],
+    ['session revoked', 401, 'chatpass_v2_invalid_authorization_context', false],
+    ['unsupported model capability', 400, 'subscription_sharing_unsupported_capability', false],
+  ]) await t.test(name, async () => {
+    const calls = [];
+    const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async (url, init) => {
+      calls.push(url); assert.equal(init.headers.Authorization, 'Bearer synthetic-info-access');
+      return url.endsWith('/models') ? catalog() : Response.json({ error: { code: errorCode, message: 'private-provider-detail' } }, { status });
+    } });
+    const request = modelRequest();
+    if (quota) {
+      const result = await sessions.generate('info', request, new AbortController().signal);
+      assert.deepEqual(result, { accountAlias: 'info', authMode: 'siwc_plan', accountVerified: true, model: MODEL,
+        callId: request.callId, inputSha256: request.inputSha256, schemaSha256: null,
+        status: 'quota_exhausted', code: 'QUOTA_EXHAUSTED', authenticated: true });
+    } else await assert.rejects(sessions.generate('info', request, new AbortController().signal), error =>
+      error instanceof ProbeError && !JSON.stringify(error).includes('private-provider-detail'));
+    assert.deepEqual(calls, [`${RESOURCE}/models`, `${RESOURCE}/responses`]);
+  });
+});
+
+test('SIWC rejects partial, refused, tool, wrong-model, unmetered and invalid structured completions', async t => {
+  const { vm } = await transferred(t);
+  for (const [name, make, expected] of [
+    ['incomplete', () => modelCompletion('{}', { status: 'incomplete' }), 'INVALID_COMPLETION'],
+    ['wrong model', () => modelCompletion('{}', { model: 'gpt-6-astra' }), 'INVALID_COMPLETION'],
+    ['unmetered', () => modelCompletion('{}', { usage: null }), 'INVALID_USAGE_RECEIPT'],
+    ['cache usage overflow', () => modelCompletion('{}', { usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4, input_tokens_details: { cached_tokens: 3 } } }), 'INVALID_USAGE_RECEIPT'],
+    ['refused', () => modelCompletion('', { output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'synthetic' }] }] }), 'NON_TEXT_OUTPUT_REJECTED'],
+    ['tool call', () => modelCompletion('', { output: [{ type: 'function_call', name: 'send_message', arguments: '{}' }] }), 'NON_TEXT_OUTPUT_REJECTED'],
+    ['invalid schema output', () => modelCompletion('{"approved":"yes"}'), 'INVALID_STRUCTURED_OUTPUT'],
+    ['extra output field', () => modelCompletion('{"approved":true,"extra":1}'), 'INVALID_STRUCTURED_OUTPUT'],
+    ['provider redirect', () => ({ redirected: true, url: 'https://other.invalid' }), 'INFERENCE_RESPONSE_INVALID'],
+  ]) await t.test(name, async () => {
+    const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000,
+      fetchImpl: async url => url.endsWith('/models') ? catalog() : make() });
+    const request = modelRequest({ purpose: 'semantic_reply_review', responseSchema: { type: 'object',
+      properties: { approved: { type: 'boolean' } }, required: ['approved'], additionalProperties: false } });
+    await assert.rejects(sessions.generate('info', request, new AbortController().signal), code(expected));
+    assert.equal((await vm.read('info')).state, 'active');
+  });
+});
+
+test('cancelled and uncertain model work is not repeated or converted into quota fallback', async t => {
+  const { vm } = await transferred(t);
+  const aborted = new AbortController(); aborted.abort(); let count = 0;
+  const early = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async () => { count++; throw new Error('not reached'); } });
+  assert.throws(() => early.generate('info', modelRequest(), aborted.signal), code('SESSION_OPERATION_ABORTED'));
+  assert.equal(count, 0);
+  let reached, finish;
+  const started = new Promise(resolve => { reached = resolve; });
+  const response = new Promise(resolve => { finish = resolve; });
+  const controller = new AbortController();
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async url => {
+    count++; if (url.endsWith('/models')) return catalog(); reached(); return response;
+  } });
+  const request = modelRequest();
+  const operation = sessions.generate('info', request, controller.signal);
+  await started; controller.abort();
+  await assert.rejects(operation, code('SESSION_OPERATION_ABORTED'));
+  await assert.rejects(sessions.generate('info', request, new AbortController().signal), code('MODEL_CALL_REPLAY_OR_CAPACITY'));
+  finish(modelCompletion('Late answer must not be returned.'));
+  assert.equal(count, 2); assert.equal((await vm.read('info')).state, 'active');
+});
+
+test('ephemeral owner-login port retains no token getter and stops on its OAuth lifetime', async () => {
+  const lifetime = new AbortController(), signal = new AbortController();
+  const session = { alias: 'info', planScopeGranted: true, accountMatchesExpected: true,
+    accessToken: 'synthetic-owner-access', expiresAt: Date.now() + 300_000 };
+  let calls = 0;
+  const port = createTransientSiwcModelPort(session, async (url, init) => {
+    calls++; assert.equal(init.headers.Authorization, 'Bearer synthetic-owner-access');
+    return url.endsWith('/models') ? catalog() : modelCompletion('Synthetic answer.');
+  }, lifetime.signal);
+  assert.deepEqual(Object.keys(port).sort(), ['authMode', 'capabilities', 'generate']);
+  session.accessToken = 'changed-owner-token';
+  const request = modelRequest();
+  assert.equal((await port.generate(request, signal.signal)).authMode, 'siwc_plan');
+  await assert.rejects(port.generate(request, signal.signal), code('MODEL_CALL_REPLAY_OR_CAPACITY'));
+  lifetime.abort();
+  await assert.rejects(port.generate(modelRequest({ callId: 'after-owner-logout' }), signal.signal), code('SESSION_OPERATION_ABORTED'));
+  assert.equal(calls, 2);
+});
+
+test('ending normal owner login cancels uncertain in-flight model work without a retry', async () => {
+  const lifetime = new AbortController(), signal = new AbortController();
+  let reached, release, calls = 0;
+  const started = new Promise(resolve => { reached = resolve; });
+  const delayed = new Promise(resolve => { release = resolve; });
+  const port = createTransientSiwcModelPort({ alias: 'info', planScopeGranted: true, accountMatchesExpected: true,
+    accessToken: 'synthetic-owner-access', expiresAt: Date.now() + 300_000 }, async url => {
+    calls++; if (url.endsWith('/models')) return catalog(); reached(); return delayed;
+  }, lifetime.signal);
+  const request = modelRequest(), pending = port.generate(request, signal.signal);
+  await started; lifetime.abort();
+  await assert.rejects(pending, code('SESSION_OPERATION_ABORTED'));
+  release(modelCompletion('Late synthetic answer.'));
+  await assert.rejects(port.generate(modelRequest({ callId: 'after-abort' }), signal.signal), code('SESSION_OPERATION_ABORTED'));
+  assert.equal(calls, 2);
+});
+
+test('model port rejects missing expiry and invalid bearer shape before any provider request', async () => {
+  let calls = 0;
+  const session = { alias: 'info', planScopeGranted: true, accountMatchesExpected: true,
+    accessToken: 'synthetic-access', expiresAt: Date.now() + 300_000 };
+  for (const changes of [{ expiresAt: undefined }, { expiresAt: Number.NaN }, { expiresAt: Date.now() - 1 },
+    { accessToken: 'synthetic\ninvalid' }]) {
+    await assert.rejects(runCorelyPlanRequest({ ...session, ...changes }, modelRequest(), async () => { calls++; },
+      new AbortController().signal), code('SESSION_NOT_ELIGIBLE'));
+  }
+  assert.equal(calls, 0);
+});
 
 test('separate protected runtime hosts survive restart without reading any native auth cache', async t => {
   const { local, vm, parent } = await stores(t);
