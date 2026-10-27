@@ -1,5 +1,110 @@
 # Local Codex harness pilot
 
+## 2026-10-27: resident synthetic consumer and VM-owned key bootstrap (source only)
+
+`bin/corely-vm-model-worker.mjs` joins the existing fixed Corely DPoP client,
+single-lease worker, app-owned persistent SIWC sessions and exact public
+`gpt-6.1-sol` port. This adds no listener, producer, API key, customer input,
+send/approval or learning operation. The Corely server still owns synthetic
+admission and Info -> verified-quota-only Eason job creation. Empty queues,
+authentication/transport errors and missing capabilities are not quota evidence.
+
+The explicit future operator command `init-key --state-dir /state` requires the
+existing private app-owned VM host record. It creates an Ed25519 PKCS8 identity
+only if absent, using Node's cryptographic key generator, and never replaces
+the host identity or silently rotates an existing key. `status` and `run` never
+initialize a missing key. The new `corely-vm-model-identity.json` is0600 inside
+the existing0700 directory. Reads/writes use O_NOFOLLOW, owner/link/size checks,
+an open directory descriptor and dev/inode rechecks. The key stays behind a
+closure; public receipts contain only host/key hashes and capability flags.
+The actual fixed VM-host hash is checked before Corely connection. No native
+Codex/Luna credential path, key/token argument or API/proxy environment is used.
+
+Every `run --state-dir /state` starts a fresh normal five-minute Corely device
+consent and retains the resulting at-most24hour work token only in memory.
+No Corely refresh, persisted work token or automatic consent exists. Restart or
+expiry therefore requires new normal consent, even though the separately
+authorized OpenAI SIWC sessions retain their own existing refresh lifecycle.
+The temporary `corely-vm-model-consent.json` is0600 and contains only the owner
+approval URL/user code, not device/access/refresh tokens. Container logs emit
+only a fixed status/record name. Success or failure removes only the owned
+prompt inode; replacement/uncertain cleanup holds, never deletes another file.
+
+The worker enrolls once and requires the exact V2 status
+`SYNTHETIC_VM_MODEL_TRANSPORT_V2`, `contractVersion:2`, all synthetic/API-off
+boundaries and server-confirmed `producerConnected:true`. V1/false is not
+relabelled connected. Producer readiness has an actual60second deadline and a
+bounded wake budget; the consumer cannot enable the producer. Readiness is
+checked again before each claim. Only one claim/inference/completion runs at a
+time; provider/receipt uncertainty stops without repeating inference/completion.
+SIGINT/SIGTERM, grant expiry and revocation hold. Revocation cannot recall an
+already-started provider inference. Safe completed receipts omit prompt/reply
+text. Idle and job limits bound a run; API fallback remains OFF.
+
+Empty-queue and producer-readiness polling defaults to a bounded1000ms, rather
+than5000ms, so a newly queued model stage does not inherit a five-second idle
+wait. Successful or uncertain model work is never repeated by this change.
+The default maximum is86400 consecutive empty polls, preserving the nominal
+24hour idle ceiling at the new cadence; the fixed server grant expiry and
+revocation remain authoritative and are never extended by poll counts.
+
+The separate compose profiles are `sessions-only` and `model-worker`. **A
+reviewed deployment must explicitly stop the old sessions service before
+starting the model worker**: profiles alone do not enforce mutual exclusion.
+The worker process owns both session maintenance and generation, and an
+exclusive protected lifecycle lock rejects duplicate consumers. A stale lock
+after process/VM failure requires operator inspection, not automatic deletion.
+The worker uses `restart:no`, so a failure cannot silently begin another consent.
+Both profiles preserve uid1000, read-only root, no published ports, dropped
+capabilities, no-new-privileges and256MiB/64pid limits. The image allowlist adds
+only the consumer/client/helper source; key/session files remain outside Git
+and image artifacts. No compose command, real key initialization or deployment
+has been executed for this source change.
+
+Focused offline tests use a public deterministic fixture key, synthetic files,
+mock authority/session ports and the actual single-lease model/receipt guards.
+They cover stable-key restart, no implicit generation, weak permissions,
+symlink/hardlink/duplicate fields, host/inode changes, exclusive lifecycle lock,
+token-free consent/owned cleanup, separate decision/generation/review calls,
+quota-only server routing, V1/not-ready/lost-ready/revoked/expired holds,
+one-shot uncertain completion, abort, bounded idle and the actual default
+one-second queue gap between separate model stages. The first macOS fixture
+run failed because its `/var` temporary path was not canonical; only the
+fixture was corrected to use realpath, without relaxing production checks.
+Node20.20.2 and Node22.19.0 pass the new34 tests plus the V2 client's81 tests:
+**115/115**, zero failures/skips/cancels. The new default-cadence regression first
+failed with three5000ms waits; after the change it observes three1000ms waits
+with exactly one decision, generation and independent review completion each.
+The Node20/22 CI workflow includes the worker path, syntax and offline tests,
+plus a Node22 no-network container import smoke that cannot initialize a key.
+The complete equivalent offline protocol/session/harness/client/worker suite
+passes743/743 on each local Node version, with external-network denial enabled.
+Local Docker is unavailable; actual image build/runtime hardening remains a
+separate CI/deployment gate. No live latency improvement is claimed by these
+deterministic offline tests.
+
+Security guidance read: existing Authentication/Session/OAuth2 references,
+[Key Management](https://cheatsheetseries.owasp.org/cheatsheets/Key_Management_Cheat_Sheet.html),
+[Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html),
+ASVS5.0 V10 (least scope, binding, consent/revoke), V11.1/11.2/11.6 (key lifecycle
+and approved cryptography), and V13.1/13.2/13.3 (backend resources/secrets).
+This owner-operated DEV file store is not a vault/HSM or proof of ASVS13.3.1/
+13.3.3 compliance. Host-root compromise can expose its file/KeyObject; disk and
+backup encryption, operational access/audit, compromise revocation/rotation
+and any stronger vault integration need independent deployment verification.
+It must not be promoted as a production secret-management solution. On suspected
+compromise, stop the worker and revoke its Corely consent before any separately
+reviewed key replacement; `init-key` deliberately cannot overwrite the old key.
+The [official owner-operated OSS VM guide](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
+describes this app-owned session path; it does not attest exact per-call included
+plan debit or authorize an unrelated public hosted-service rollout.
+
+Exact CI, trusted hosted-Corely producer integration, real VM key/normal Corely
+consent/consumer restart and full customer-service acceptance remain separate
+gates. Original50, manual save/single-send/style-learning, images and natural
+quota exhaustion are not proved by these offline fixtures. Normal DEV,
+production, existing data and review modes remain unchanged in this slice.
+
 ## 2026-10-27: bounded dual-clock device polling repair, not deployed
 
 Corely CI40481300648 first held without a stage; diagnostic source d3b9183e

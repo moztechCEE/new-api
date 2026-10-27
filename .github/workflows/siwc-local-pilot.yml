@@ -7,6 +7,7 @@ on:
       - 'bin/siwc-local-*.mjs'
       - 'bin/corely-model-contract.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
+      - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
@@ -16,6 +17,7 @@ on:
       - 'bin/siwc-local-*.mjs'
       - 'bin/corely-model-contract.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
+      - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
@@ -50,6 +52,8 @@ jobs:
           node --check bin/corely-model-contract.mjs
           node --check bin/corely-vm-model-job-client.mjs
           node --check bin/corely-vm-model-job-client.test.mjs
+          node --check bin/corely-vm-model-worker.mjs
+          node --check bin/corely-vm-model-worker.test.mjs
           node --check bin/codex-harness-pilot.mjs
           node --check bin/codex-harness-pilot.test.mjs
           node --check bin/codex-harness-permissions-canary.mjs
@@ -64,10 +68,11 @@ jobs:
       - name: Run synthetic offline protocol regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs
       - name: Run synthetic offline harness regression
-        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/corely-vm-model-job-client.test.mjs
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-model-worker.test.mjs
       - name: Build and smoke-test the private VM runtime without network or credentials
         if: matrix.node == '22'
         run: |
           docker build --network=none -f deploy/gce/siwc.Dockerfile -t new-api-siwc-dev-ci .
           SIWC_IMAGE=new-api-siwc-dev-ci docker compose -f deploy/gce/siwc-compose.yaml config --quiet
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint node new-api-siwc-dev-ci --input-type=module -e "const worker = await import('/opt/new-api-siwc-dev/corely-vm-model-worker.mjs'); if (typeof worker.runCorelyVmModelWorker !== 'function' || typeof worker.openCorelyVmModelIdentity !== 'function') throw new Error('WORKER_IMPORT_CONTRACT');"
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /state:rw,noexec,nosuid,nodev,mode=0700,uid=1000,gid=1000 new-api-siwc-dev-ci status --state-dir /state

@@ -274,6 +274,34 @@ test('resource status must retain fixed host/key, synthetic boundary, API-off an
   }
 });
 
+test('only the explicitly versioned hosted synthetic contract can report producer readiness', async t => {
+  for (const producerConnected of [false, true]) {
+    await t.test(`V2 producer ${producerConnected ? 'ready' : 'not ready'}`, async () => {
+      const f = fixture({ resource: (_op, _init, status) => Response.json({ ...status,
+        status: 'SYNTHETIC_VM_MODEL_TRANSPORT_V2', contractVersion: 2, producerConnected }) });
+      const client = await connectCorelyVmModelJobs(f.options);
+      try {
+        const status = await client.modelStatus();
+        assert.equal(status.contractVersion, 2); assert.equal(status.producerConnected, producerConnected);
+        assert.equal(status.apiFallbackEnabled, false); assert.equal(status.learningCapability, false);
+        assert.equal(status.sendingCapability, false); assert.equal(status.scope, SCOPE);
+      } finally { client.close(); }
+    });
+  }
+  for (const change of [{ contractVersion: 1 }, { contractVersion: 3 }, { contractVersion: '2' },
+    { contractVersion: undefined }, { producerConnected: 'true' }, { status: 'SYNTHETIC_VM_MODEL_TRANSPORT' },
+    { apiFallbackEnabled: true }, { learningCapability: true }, { sendingCapability: true },
+    { syntheticOnly: false }, { scope: 'corely:dev-drafts' }, { extra: true }]) {
+    await t.test(`reject ${Object.keys(change).join(',')}:${String(Object.values(change)[0])}`, async () => {
+      const f = fixture({ resource: (_op, _init, status) => Response.json({ ...status,
+        status: 'SYNTHETIC_VM_MODEL_TRANSPORT_V2', contractVersion: 2, producerConnected: true, ...change }) });
+      const client = await connectCorelyVmModelJobs(f.options);
+      try { await assert.rejects(client.modelStatus(), isCode('RESOURCE_RESPONSE_INVALID')); }
+      finally { client.close(); }
+    });
+  }
+});
+
 test('bounded response bodies and uncertain resource operations cannot be retried into duplicate work', async () => {
   const oversized = fixture({ device: () => new Response('x'.repeat(16_385), { headers: { 'content-type': 'application/json' } }) });
   await assert.rejects(connectCorelyVmModelJobs(oversized.options), isCode('DEVICE_RESPONSE_INVALID'));

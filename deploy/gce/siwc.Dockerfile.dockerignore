@@ -5,5 +5,8 @@
 !bin/siwc-local-vm.mjs
 !bin/siwc-local-model-port.mjs
 !bin/corely-model-contract.mjs
+!bin/siwc-local-corely-worker.mjs
+!bin/corely-vm-model-job-client.mjs
+!bin/corely-vm-model-worker.mjs
 !LICENSE
 !THIRD-PARTY-LICENSES.md

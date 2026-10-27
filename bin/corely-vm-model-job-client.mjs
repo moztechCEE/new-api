@@ -222,9 +222,15 @@ export async function connectCorelyVmModelJobs(options = {}) {
       syntheticOnly: true, apiFallbackEnabled: false, sendingCapability: false, learningCapability: false }); },
     async modelStatus(operationSignal) {
       const value = await resource('status', undefined, operationSignal);
-      if (Object.keys(value).length !== 14 || value.status !== 'SYNTHETIC_VM_MODEL_TRANSPORT' || value.scope !== CORELY_VM_MODEL_JOB_SCOPE ||
+      // V1 explicitly has no producer. The hosted synthetic producer is a
+      // paired V2 contract, not permission to accept a bare boolean flip or
+      // extra fields from an unknown service/version.
+      const legacy = Object.keys(value).length === 14 && value.status === 'SYNTHETIC_VM_MODEL_TRANSPORT' && value.producerConnected === false;
+      const hosted = Object.keys(value).length === 15 && value.status === 'SYNTHETIC_VM_MODEL_TRANSPORT_V2' &&
+        value.contractVersion === 2 && typeof value.producerConnected === 'boolean';
+      if ((!legacy && !hosted) || value.scope !== CORELY_VM_MODEL_JOB_SCOPE ||
           value.tenantId !== 'moztech' || value.brandId !== 'moztech-test' || value.authMode !== 'siwc_plan' || value.syntheticOnly !== true ||
-          typeof value.enrolled !== 'boolean' || value.producerConnected !== false || value.apiFallbackEnabled !== false ||
+          typeof value.enrolled !== 'boolean' || value.apiFallbackEnabled !== false ||
           value.sendingCapability !== false || value.learningCapability !== false || !bindingValid(value) || !Number.isSafeInteger(value.expiresAt) ||
           value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs) throw failure('RESOURCE_RESPONSE_INVALID');
       return Object.freeze({ ...value });
