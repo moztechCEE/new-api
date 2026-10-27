@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ISSUER, RESOURCE, SCOPES, ProbeError, digest, publicJson, validateSession, runSyntheticProbe } from './siwc-local-runtime.mjs';
 
@@ -92,12 +92,17 @@ export async function openSessionStore(path, { runtime = 'vm' } = {}) {
   let root;
   try {
     const parent = await realpath(dirname(selected));
-    root = join(parent, selected.slice(dirname(selected).length + 1));
+    root = join(parent, basename(selected));
     if (root === parent || root === '/') fail('SESSION_STORAGE_PATH_INVALID');
     const parentStat = await lstat(parent);
     if (!parentStat.isDirectory() || ((parentStat.mode & 0o022) && !(parentStat.mode & 0o1000))) fail('SESSION_STORAGE_NOT_PRIVATE');
-    try { await mkdir(root, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    const stat = await lstat(root);
+    let stat;
+    try { stat = await lstat(root); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      try { await mkdir(root, { mode: 0o700 }); } catch (creation) { if (creation.code !== 'EEXIST') throw creation; }
+      stat = await lstat(root);
+    }
     if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 ||
       (process.getuid && stat.uid !== process.getuid())) fail('SESSION_STORAGE_NOT_PRIVATE');
   } catch (error) { throw error instanceof ProbeError ? error : new ProbeError('SESSION_STORAGE_UNAVAILABLE'); }

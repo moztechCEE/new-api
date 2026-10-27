@@ -83,6 +83,17 @@ verified-limit-only fallback. All accounts/tokens/provider bodies are synthetic;
 this is not fresh live OAuth, VM or customer-service acceptance. Exact-version
 CI and the Linux container smoke are still required before deployment approval.
 
+First frozen runtime `9fe44c5ce79f42a38909ae32e0ae6b675c922b69` was **not
+deployable**: [CI40446287898](https://github.com/moztechCEE/new-api/actions/runs/40446287898)
+passed protocol/harness steps but the actual Node22 container smoke held at
+`SESSION_STORAGE_UNAVAILABLE`; the matrix then cancelled Node20. Root cause was
+manual path slicing for a root-level mount (`/state` became `/tate`). Canonical
+parent plus `path.basename` fixes the general path rule without weakening the
+owner-only/no-symlink checks. Regression now also exercises an existing
+root-level directory; fresh full regression and exact-version container CI
+must pass. No cloud service, credential or model request was involved in this
+failure, and its receipt is retained rather than relabelled as success.
+
 Primary provider guidance: [self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms),
 [accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions),
 [registration/storage](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),

@@ -70,6 +70,10 @@ test('separate protected runtime hosts survive restart without reading any nativ
   await assert.rejects(openSessionStore(vm.root, { runtime: 'enrollment' }), code('HOST_RECORD_INVALID'));
   await assert.rejects(vm.read('../enrollment/host'), code('ACCOUNT_NOT_ADMITTED'));
   await assert.rejects(openSessionStore('relative/path'), code('SESSION_STORAGE_PATH_INVALID'));
+  // Root-level mount points must retain their whole basename (/state in the
+  // real container smoke). /tmp already exists and must fail its privacy check,
+  // not be misresolved to /mp and fail while creating an unrelated directory.
+  await assert.rejects(openSessionStore('/tmp'), code('SESSION_STORAGE_NOT_PRIVATE'));
   await symlink(vm.root, join(parent, 'linked'));
   await assert.rejects(openSessionStore(join(parent, 'linked')), code('SESSION_STORAGE_NOT_PRIVATE'));
   await chmod(vm.root, 0o750);
