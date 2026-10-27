@@ -1,6 +1,50 @@
 # Local Codex harness pilot
 
-## Actual 2026-10-27: approved VM-only runtime deployed; fresh grants pending
+## Actual 2026-10-27: both app-owned VM grants and authenticated restart pass
+
+After explicit action-time confirmation, normal `New API DEV Personal Plan`
+sign-in selected each owner's personal workspace and completed the same scoped
+Info/Eason plan consent. Signed identity and client/scope checks passed. Only
+each app-owned protected transfer record went over SSH stdin to the dedicated
+VM; import receipts were checked and `forget-transferred` removed both local
+credential copies without revoking the VM sessions. Public registrations remain.
+Native Codex/Luna caches were not accessed. The runtime remains the exact
+approved **9d13aff1f32866b754dd39cee84951f65c3f2f2d** image, not a new deployment.
+
+Both accounts completed fixed exact `gpt-6.1-sol` probes before and after an
+actual restart of the separate session container. Each completed response used
+17 input / 11 output tokens and matched the expected output hash. After restart,
+Info took5.500s and Eason4.310s; both retained the same protected account files,
+verified identities and VM host hash. API-key fallback is absent. Eason was
+tested explicitly, not by fabricating Info allowance exhaustion.
+
+Both real near-expiry refreshes completed without altering expiry or forcing
+refresh: Info was observed at08:43:03UTC and Eason at08:45:03UTC, both active
+revision2 with extended expiry. After a second actual restart, both updated
+sessions remained active and completed exact-Sol probes (Info4.605s/Eason5.532s,
+same expected hash and17/11usage). This proves one actual refresh per account
+and updated-session restart durability, not indefinite availability.
+The nine protected Corely Cloud Run ready revisions and traffic were rechecked
+unchanged after grants. No normal DEV/production/data/review-mode change.
+
+An owner-local Corely synthetic controller also invoked the VM's same SIWC port
+through SSH stdin, with no public relay or new Corely job grant. Its first run
+completed five model calls but held at a final assertion; the outer diagnostic
+lost the exact failing stage. One unchanged-source diagnostic run passed all
+five phases, including independent review and human-edit revalidation. This
+does **not** resolve the first failure. That diagnostic's provider durations were
+7.089/8.843/5.063/19.358/16.992s; controller durations including SSH were
+10.715/12.471/7.977/22.361/20.267s. No speed-improvement claim is made.
+
+The hosted Corely producer, VM-specific Corely work authorization and persistent
+job consumer are still missing; the existing local 15-minute Corely grant must
+not be copied or silently extended. `corelyRelayConnected:false` is accurate.
+Original50, UI save/unique-send/style-learning, images and natural quota failover
+remain unaccepted. Exact included-plan versus ChatGPT-credit debit is
+NOT_ATTESTED; successful app-owned plan inference is not a per-call balance
+receipt. Further source/deployment authority is separate from this VM consent.
+
+## Historical deployment snapshot 2026-10-27: fresh grants were pending
 
 After the owner's exact confirmation, runtime **9d13aff1f32866b754dd39cee84951f65c3f2f2d**
 was built on the dedicated DEV VM from a clean frozen source archive. Exact
