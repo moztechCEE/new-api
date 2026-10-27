@@ -80,8 +80,17 @@ It covers actual file permissions/restarts, normal mocked-provider OAuth over a
 real loopback listener, account isolation, identity/scope rejection, serialized
 refresh/crash holds, renewal-handle quarantine, revocation, source cleanup and
 verified-limit-only fallback. All accounts/tokens/provider bodies are synthetic;
-this is not fresh live OAuth, VM or customer-service acceptance. Exact-version
-CI and the Linux container smoke are still required before deployment approval.
+this is not fresh live OAuth, VM or customer-service acceptance.
+
+Corrected frozen runtime **6532244c985f54c5369e9d2ee483c433608b6f64** passed
+exact [CI40446770457](https://github.com/moztechCEE/new-api/actions/runs/40446770457),
+matching head SHA, both Node20/22 jobs SUCCESS. Each ran protocol194 + harness388
+with zero fail/skip/cancel; the Node22 actual image build/compose validation and
+networkless non-root/read-only container status smoke also passed. Its two
+accounts were `not_connected`, API fallback false and Corely relay false, as
+expected without credentials. Completed at `2026-10-27T03:54:51Z`.
+This source version is ready for precise VM-only deployment approval, not
+already deployed or authorized for normal customer traffic.
 
 First frozen runtime `9fe44c5ce79f42a38909ae32e0ae6b675c922b69` was **not
 deployable**: [CI40446287898](https://github.com/moztechCEE/new-api/actions/runs/40446287898)
