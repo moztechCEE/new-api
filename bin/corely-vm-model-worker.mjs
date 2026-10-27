@@ -190,9 +190,10 @@ export async function openCorelyVmModelIdentity(stateDir, { initialize = false,
  * ASVS v5.0.0: 4.1.4, 10.1.1, 12.3.2-4, 13.2.2-4, 13.3.2-4.
  */
 export async function openCorelyVmModelGateway(stateDir, sessions, signal, {
-  serverFactory = createHttpsServer, fetchImpl = globalThis.fetch,
+  serverFactory = createHttpsServer, fetchImpl = globalThis.fetch, onDiagnostic = () => {},
 } = {}) {
-  if (!(signal instanceof AbortSignal) || signal.aborted || typeof serverFactory !== 'function' || typeof fetchImpl !== 'function') fail('WORKER_GATEWAY_INVALID');
+  if (!(signal instanceof AbortSignal) || signal.aborted || typeof serverFactory !== 'function' || typeof fetchImpl !== 'function' ||
+      typeof onDiagnostic !== 'function') fail('WORKER_GATEWAY_INVALID');
   const directory = await protectedDirectory(stateDir);
   let server, transport, timer;
   const sockets = new Set();
@@ -229,7 +230,7 @@ export async function openCorelyVmModelGateway(stateDir, sessions, signal, {
     const tls = { key: config.tlsPrivateKeyPem, cert: config.tlsCertificatePem, minVersion: 'TLSv1.2', handshakeTimeout: 10_000 };
     createSecureContext(tls); // Validate before any socket or gateway request.
     transport = createSiwcGatewayModelTransports({ sessions, gatewayUrl: config.gatewayUrl, gatewayToken: config.gatewayToken,
-      bridgeSecret: config.bridgeSecret, signal: active, fetchImpl });
+      bridgeSecret: config.bridgeSecret, signal: active, fetchImpl, onDiagnostic });
     server = serverFactory(tls, transport.handleRequest);
     server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
     server.requestTimeout = 65_000; server.headersTimeout = 10_000; server.keepAliveTimeout = 5_000;
@@ -374,7 +375,9 @@ export async function runVmModelWorkerCommand(argv) {
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
     const store = await openSessionStore(stateDir), sessions = createPersistentPlanSessions(store);
     if (command === 'run-gateway') {
-      gateway = await openCorelyVmModelGateway(stateDir, sessions, controller.signal);
+      gateway = await openCorelyVmModelGateway(stateDir, sessions, controller.signal, {
+        onDiagnostic: value => safe({ status: 'CORELY_DEV_SIWC_GATEWAY_DIAGNOSTIC', ...value }),
+      });
       safe(gateway.receipt());
     }
     const active = gateway?.signal ?? controller.signal;

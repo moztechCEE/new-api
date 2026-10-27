@@ -113,12 +113,21 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
   await chmod(path, 0o644);
   await assert.rejects(openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory }), code('WORKER_STORAGE_NOT_PRIVATE'));
   await chmod(path, 0o600);
-  const gateway = await openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory });
+  const diagnostics = [];
+  await assert.rejects(openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory, onDiagnostic: {} }), code('WORKER_GATEWAY_INVALID'));
+  const gateway = await openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory,
+    onDiagnostic: value => diagnostics.push(value) });
   assert.equal(options.minVersion, 'TLSv1.2'); assert.equal(options.handshakeTimeout, 10_000); assert.equal(typeof handler, 'function');
   assert.deepEqual(listenAddress, { port: 8443, host: '0.0.0.0' });
   assert.deepEqual(Object.keys(gateway.ports), ['info', 'eason']);
   assert.equal(gateway.receipt().apiFallbackEnabled, false);
   assert.doesNotMatch(JSON.stringify(gateway.receipt()), /PRIVATE|test_gateway|test_bridge|gatewayToken|bridgeSecret/);
+  const rejected = { socket: { remoteAddress: '203.0.113.1' }, method: 'POST', url: '/v1/responses' };
+  const response = { writeHead(status) { assert.equal(status, 403); }, end() { this.writableEnded = true; } };
+  await handler(rejected, response);
+  assert.deepEqual(diagnostics, [{ stage: 'BRIDGE_ADMISSION', reason: 'GATEWAY_REQUEST_REJECTED', httpStatus: 403, consumed: false }]);
+  assert.deepEqual(Object.keys(diagnostics[0]).sort(), ['consumed', 'httpStatus', 'reason', 'stage']);
+  assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE|test_gateway|test_bridge|gatewayToken|bridgeSecret|203\.0/);
   const unnegotiated = new EventEmitter(); let destroyed = 0;
   unnegotiated.destroy = () => { assert.equal(closed, 1, 'stop accepting before destroying unnegotiated sockets'); destroyed++; unnegotiated.emit('close'); };
   listenerServer.emit('connection', unnegotiated);

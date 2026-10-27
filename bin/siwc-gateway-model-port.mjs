@@ -20,9 +20,38 @@ const MAX_PENDING = 32;
 const MAX_CALLS = 1000;
 const CALL_TTL = 60_000;
 const BODY_TTL = 10_000;
+const DIAGNOSTIC_REASONS = new Set(['GATEWAY_REQUEST_REJECTED', 'GATEWAY_BODY_INVALID', 'GATEWAY_NONCE_INVALID',
+  'GATEWAY_NONCE_UNBOUND', 'GATEWAY_NONCE_REPLAY', 'GATEWAY_INVOCATION_EXPIRED', 'GATEWAY_PAYLOAD_MISMATCH',
+  'GATEWAY_CALL_ABORTED', 'GATEWAY_RESPONSE_INVALID', 'GATEWAY_RECEIPT_MISMATCH', 'GATEWAY_RECEIPT_INVALID',
+  'EXACT_MODEL_NOT_AVAILABLE', 'UPSTREAM_REQUEST_FAILED', 'INVALID_UPSTREAM_CONTENT_TYPE', 'UPSTREAM_RESPONSE_TOO_LARGE',
+  'INVALID_UPSTREAM_RESPONSE', 'SESSION_NOT_ELIGIBLE', 'SESSION_REAUTH_REQUIRED', 'SESSION_OPERATION_ABORTED',
+  'SESSION_BUSY_OR_LOCKED', 'SESSION_CLOCK_INVALID', 'SESSION_RECORD_INVALID', 'SESSION_RECORD_TOO_LARGE',
+  'SESSION_STORAGE_INVALID', 'SESSION_STORAGE_UNAVAILABLE', 'SESSION_STORAGE_NOT_PRIVATE', 'SESSION_STORAGE_WRITE_FAILED',
+  'SESSION_LOCK_CLEANUP_UNCONFIRMED', 'REFRESH_OUTCOME_UNCERTAIN', 'REFRESH_CLIENT_INVALID', 'REFRESH_IDENTITY_INVALID',
+  'REFRESH_SCOPE_INVALID', 'REFRESH_PERSISTENCE_FAILED', 'REFRESH_REMOTE_REVOCATION_UNCONFIRMED',
+  'MODEL_CALL_REPLAY_OR_CAPACITY', 'MODEL_PORT_INVALID', 'MODEL_PORT_UNAVAILABLE', 'MODEL_PORT_TIMEOUT',
+  'INFERENCE_RESPONSE_INVALID', 'INVALID_STREAM_CONTENT_TYPE', 'INFERENCE_NOT_COMPLETED', 'MISSING_COMPLETED_EVENT',
+  'INVALID_STREAM_EVENT', 'NON_TEXT_OUTPUT_REJECTED', 'OUTPUT_TOO_LARGE', 'STREAM_TOO_LARGE', 'STREAM_INTERRUPTED',
+  'INVALID_COMPLETION', 'COMPLETED_OUTPUT_MISMATCH', 'INVALID_USAGE_RECEIPT', 'INVALID_OUTPUT', 'INVALID_STRUCTURED_OUTPUT',
+  'INVALID_REQUEST', 'SCOPE_NOT_ADMITTED', 'UNSUPPORTED_CAPABILITY', 'INPUT_MISMATCH', 'INVALID_RECEIPT']);
 const credential = value => typeof value === 'string' && /^[A-Za-z0-9._~-]{32,512}$/.test(value);
 const reject = code => { throw new ProbeError(code); };
 const secretHash = value => createHash('sha256').update(value).digest();
+
+// Audit only fixed enums and bounded protocol status. Never inspect messages,
+// causes, provider bodies/headers, identity, input/output values or credentials.
+// Own data descriptors also prevent a foreign error getter being evaluated.
+function failureDiagnostic(error) {
+  try {
+    const code = Object.getOwnPropertyDescriptor(error, 'code')?.value;
+    if (DIAGNOSTIC_REASONS.has(code)) return { reason: code };
+    if (typeof code === 'string') {
+      const match = /^(INFERENCE|UPSTREAM)_HTTP_([1-5][0-9]{2})$/.exec(code);
+      if (match) return { reason: match[1] === 'INFERENCE' ? 'INFERENCE_HTTP_ERROR' : 'UPSTREAM_HTTP_ERROR', httpStatus: Number(match[2]) };
+    }
+  } catch { /* Untrusted error objects never become diagnostic content. */ }
+  return { reason: 'UNKNOWN_ERROR' };
+}
 
 function gatewayEndpoint(value) {
   let url;
@@ -121,12 +150,21 @@ function completedFrame(result, nonce) {
  * account leases. The two secrets here have separate service audiences.
  * No files, credentials, prompts, outputs or real input values are logged. */
 export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gatewayToken, bridgeSecret, signal,
-  fetchImpl = globalThis.fetch } = {}) {
+  fetchImpl = globalThis.fetch, onDiagnostic = () => {} } = {}) {
   const endpoint = gatewayEndpoint(gatewayUrl);
   if (!sessions || typeof sessions.generate !== 'function' || !(signal instanceof AbortSignal) || typeof fetchImpl !== 'function' ||
-      !credential(gatewayToken) || !credential(bridgeSecret) || gatewayToken === bridgeSecret) reject('GATEWAY_OPTIONS_INVALID');
+      typeof onDiagnostic !== 'function' || !credential(gatewayToken) || !credential(bridgeSecret) || gatewayToken === bridgeSecret) reject('GATEWAY_OPTIONS_INVALID');
   let gatewayKey = gatewayToken, serviceSecret = bridgeSecret, closed = false;
   const lifetime = new AbortController(), pending = new Map(), usedCalls = new Set();
+  const diagnose = (stage, error, httpStatus, consumed) => {
+    const failure = failureDiagnostic(error);
+    const status = failure.httpStatus ?? httpStatus;
+    const event = Object.freeze({ stage, reason: failure.reason,
+      httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null, consumed });
+    // Observers cannot affect admission, replay ownership, or failure handling;
+    // neither a throw nor a rejected/slow promise is awaited or retried.
+    try { void Promise.resolve(onDiagnostic(event)).catch(() => {}); } catch { /* Metadata-only observer failure is isolated. */ }
+  };
   const close = () => {
     if (closed) return;
     closed = true;
@@ -152,22 +190,24 @@ export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gateway
     const wire = JSON.stringify({ ...payload, metadata: { [NONCE_KEY]: nonce } });
     if (Buffer.byteLength(wire) > MAX_BODY) reject('GATEWAY_BODY_INVALID');
     const controller = new AbortController(), active = AbortSignal.any([callerSignal, lifetime.signal, controller.signal]);
-    const record = { alias, request, wire, controller, state: 'pending', result: undefined,
+    const record = { alias, request, wire, controller, state: 'pending', consumed: false, result: undefined,
       expiresAt: Date.now() + CALL_TTL, timer: undefined };
     record.timer = setTimeout(() => { record.state = 'held'; record.result = undefined; controller.abort(); }, CALL_TTL);
     record.timer.unref?.();
     pending.set(nonce, record);
-    let response;
+    let response, stage = 'GATEWAY_FETCH';
     try {
       response = await whileActive(Promise.resolve().then(() => {
         active.throwIfAborted();
         return fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store', signal: active,
           headers: { Authorization: `Bearer ${gatewayKey}`, 'Content-Type': 'application/json', Accept: 'text/event-stream' }, body: wire });
       }), active);
+      stage = 'GATEWAY_RESPONSE';
       active.throwIfAborted();
       if (!response || response.redirected || (response.url && response.url !== endpoint)) reject('GATEWAY_RESPONSE_INVALID');
       if (response.status === 429 && record.state === 'quota' && record.result?.status === 'quota_exhausted') return record.result;
       if (response.status !== 200 || !/^text\/event-stream(?:;\s*charset=utf-8)?$/i.test(response.headers?.get('content-type') ?? '')) reject('GATEWAY_RESPONSE_INVALID');
+      stage = 'GATEWAY_RESULT';
       const receipt = await whileActive(consumePlanTextStream(response.body, active), active);
       active.throwIfAborted();
       const original = record.result;
@@ -177,6 +217,7 @@ export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gateway
           receipt.cachedInputTokens !== original.usage.cachedInputTokens) reject('GATEWAY_RECEIPT_MISMATCH');
       return original;
     } catch (error) {
+      diagnose(stage, active.aborted ? new ProbeError('GATEWAY_CALL_ABORTED') : error, response?.status, record.consumed);
       if (active.aborted) reject('GATEWAY_CALL_ABORTED');
       if (error instanceof ProbeError) throw error;
       reject('GATEWAY_CALL_HELD');
@@ -189,27 +230,37 @@ export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gateway
   };
 
   const handleRequest = async (req, res) => {
-    if (closed || !serviceRequest(req, serviceSecret)) { respond(res, 403, 'bridge_request_rejected'); return; }
+    if (closed || !serviceRequest(req, serviceSecret)) {
+      diagnose('BRIDGE_ADMISSION', new ProbeError('GATEWAY_REQUEST_REJECTED'), 403, false);
+      respond(res, 403, 'bridge_request_rejected'); return;
+    }
     const disconnected = new AbortController(), bodyDeadline = AbortSignal.timeout(BODY_TTL);
     const disconnect = () => { if (!res.writableEnded) disconnected.abort(); };
     req.once('aborted', disconnect); res.once('close', disconnect);
-    let record, consumed = false;
+    let record, consumed = false, stage = 'BRIDGE_BODY';
     try {
       const body = await readServiceBody(req, AbortSignal.any([lifetime.signal, disconnected.signal, bodyDeadline]));
       let value;
       try { value = JSON.parse(body); } catch { reject('GATEWAY_BODY_INVALID'); }
+      stage = 'BRIDGE_INVOCATION';
       const nonce = value?.metadata?.[NONCE_KEY];
-      if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)) reject('GATEWAY_INVOCATION_INVALID');
+      if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)) reject('GATEWAY_NONCE_INVALID');
       record = pending.get(nonce);
-      if (!record || record.state !== 'pending' || record.expiresAt <= Date.now() || record.controller.signal.aborted || body !== record.wire) reject('GATEWAY_INVOCATION_INVALID');
+      if (!record) reject('GATEWAY_NONCE_UNBOUND');
+      if (record.state !== 'pending') reject('GATEWAY_NONCE_REPLAY');
+      if (record.expiresAt <= Date.now() || record.controller.signal.aborted) reject('GATEWAY_INVOCATION_EXPIRED');
+      if (body !== record.wire) reject('GATEWAY_PAYLOAD_MISMATCH');
       // Consume synchronously before any session work or await. Replays never
       // execute a second inference, including after a timeout/uncertain result.
-      record.state = 'running'; consumed = true;
+      record.state = 'running'; record.consumed = consumed = true;
       const active = AbortSignal.any([lifetime.signal, disconnected.signal, record.controller.signal]);
-      const result = snapshotModelResult(await whileActive(Promise.resolve().then(() => {
+      stage = 'BRIDGE_SESSION';
+      const generated = await whileActive(Promise.resolve().then(() => {
         active.throwIfAborted();
         return sessions.generate(record.alias, record.request, active);
-      }), active), record.request, record.alias, 'siwc_plan');
+      }), active);
+      stage = 'BRIDGE_RESULT';
+      const result = snapshotModelResult(generated, record.request, record.alias, 'siwc_plan');
       active.throwIfAborted();
       if (closed || record.state !== 'running' || record.expiresAt <= Date.now() || pending.get(nonce) !== record) reject('GATEWAY_CALL_ABORTED');
       if (result.status === 'quota_exhausted') {
@@ -217,11 +268,13 @@ export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gateway
         respond(res, 429, 'subscription_sharing_usage_limit_exceeded');
         return;
       }
+      stage = 'BRIDGE_RESPONSE';
       const frame = completedFrame(result, nonce);
       record.result = result; record.state = 'success';
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
       res.end(frame);
-    } catch {
+    } catch (error) {
+      diagnose(stage, error, 409, consumed);
       if (consumed && record?.state === 'running') { record.state = 'held'; record.result = undefined; record.controller.abort(); }
       respond(res, 409, 'bridge_request_held');
     } finally {

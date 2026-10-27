@@ -4,7 +4,8 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { after, before, test } from 'node:test';
 import { createSiwcGatewayModelTransports } from './siwc-gateway-model-port.mjs';
-import { MODEL } from './siwc-local-runtime.mjs';
+import { runCorelyPlanRequest } from './siwc-local-model-port.mjs';
+import { MODEL, ProbeError } from './siwc-local-runtime.mjs';
 
 // Only injected synthetic Gateway/session fixtures run. No provider, credentials,
 // database, actual VM or customer is read by this suite.
@@ -48,7 +49,7 @@ async function bridgeCall(handleRequest, body, { headers = {}, remoteAddress = '
 }
 
 function harness(t, { generate, gateway, options = {} } = {}) {
-  const lifetime = new AbortController(), calls = [], requests = [];
+  const lifetime = new AbortController(), calls = [], requests = [], diagnostics = [];
   let instance;
   instance = createSiwcGatewayModelTransports({ sessions: { generate: async (alias, request, signal) => {
     calls.push({ alias, request, signal });
@@ -60,9 +61,9 @@ function harness(t, { generate, gateway, options = {} } = {}) {
     assert.equal(init.headers.Authorization, `Bearer ${GATEWAY_KEY}`);
     assert.equal(init.redirect, 'error'); assert.equal(init.credentials, 'omit');
     return gateway ? gateway(instance, init, calls) : (await bridgeCall(instance.handleRequest, init.body)).response;
-  }, ...options });
+  }, onDiagnostic: event => diagnostics.push(event), ...options });
   t.after(() => instance.close());
-  return { instance, calls, requests, lifetime };
+  return { instance, calls, requests, diagnostics, lifetime };
 }
 
 test('Gateway and private bridge retain strict structured facts, identity, usage and single-attempt receipt', async t => {
@@ -154,6 +155,94 @@ test('payload tampering, duplicate JSON keys and unsolicited metadata cannot sta
       init.body.replace('{', '{"model":"different-model",'))).response });
     await assert.rejects(state.instance.ports.info.generate(requestFixture(), new AbortController().signal));
     assert.equal(state.calls.length, 0);
+  });
+});
+
+test('bridge diagnostics distinguish nonce admission from byte-only payload changes without logging actual values', async t => {
+  const variants = [
+    ['GATEWAY_NONCE_INVALID', body => JSON.stringify({ ...JSON.parse(body), metadata: {} })],
+    ['GATEWAY_NONCE_UNBOUND', body => JSON.stringify({ ...JSON.parse(body), metadata: { corely_siwc_nonce: 'x'.repeat(43) } })],
+    ['GATEWAY_PAYLOAD_MISMATCH', body => JSON.stringify(JSON.parse(body), null, 2)],
+  ];
+  for (const [reason, mutate] of variants) await t.test(reason, async t => {
+    const state = harness(t, { gateway: async (instance, init) => {
+      const { res, response } = await bridgeCall(instance.handleRequest, mutate(init.body));
+      assert.equal(res.status, 409);
+      assert.equal(res.body, '{"error":{"type":"corely_siwc_error","code":"bridge_request_held","message":"Corely SIWC request held"}}');
+      return response;
+    } });
+    await assert.rejects(state.instance.ports.info.generate(requestFixture(), new AbortController().signal), { code: 'GATEWAY_RESPONSE_INVALID' });
+    assert.deepEqual(state.diagnostics, [
+      { stage: 'BRIDGE_INVOCATION', reason, httpStatus: 409, consumed: false },
+      { stage: 'GATEWAY_RESPONSE', reason: 'GATEWAY_RESPONSE_INVALID', httpStatus: 409, consumed: false },
+    ]);
+    assert.equal(state.diagnostics.every(Object.isFrozen), true);
+    assert.equal(state.calls.length, 0); assert.equal(state.requests.length, 1);
+    const serialized = JSON.stringify(state.diagnostics);
+    for (const actual of [GATEWAY_KEY, BRIDGE_KEY, 'Synthetic customer question.', 'Synthetic facts only.', 'x'.repeat(43)]) {
+      assert.equal(serialized.includes(actual), false);
+    }
+  });
+});
+
+test('fixed bridge failure enums locate model/catalog, inference and output failures while every uncertain call stays single-attempt', async t => {
+  const schema = { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false };
+  let codeGetterReads = 0;
+  const provider = mode => (alias, request, signal) => runCorelyPlanRequest({ alias, accessToken: 'PRIVATE_SYNTHETIC_PROVIDER_TOKEN',
+    expiresAt: Date.now() + 3_600_000, planScopeGranted: true, accountMatchesExpected: true }, request, async url => {
+    if (url === 'https://api.openai.com/v1/models') return new Response(JSON.stringify({ models: mode === 'missing_model' ? [] : [{ slug: MODEL, visibility: 'list' }] }),
+      { status: mode === 'catalog_http' ? 403 : 200, headers: { 'content-type': 'application/json' } });
+    assert.equal(url, 'https://api.openai.com/v1/responses');
+    if (mode === 'provider_http') return new Response('{"error":{"message":"PRIVATE_PROVIDER_ERROR"}}',
+      { status: 400, headers: { 'content-type': 'application/json' } });
+    const completed = { type: 'response.completed', response: { id: 'synthetic_provider_response', model: MODEL, status: 'completed',
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '{"unexpected":true}' }] }],
+      usage: { input_tokens: 23, output_tokens: 7, total_tokens: 30 } } };
+    return new Response(`event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }, signal);
+  const variants = [
+    ['catalog model absent', provider('missing_model'), 'BRIDGE_SESSION', 'EXACT_MODEL_NOT_AVAILABLE', 409],
+    ['catalog HTTP', provider('catalog_http'), 'BRIDGE_SESSION', 'UPSTREAM_HTTP_ERROR', 403],
+    ['inference HTTP', provider('provider_http'), 'BRIDGE_SESSION', 'INFERENCE_HTTP_ERROR', 400],
+    ['provider output validation', provider('invalid_output'), 'BRIDGE_SESSION', 'INVALID_STRUCTURED_OUTPUT', 409],
+    ['bound receipt output validation', (alias, request) => resultFixture(request, alias, { text: '{"unexpected":true}' }), 'BRIDGE_RESULT', 'INVALID_STRUCTURED_OUTPUT', 409],
+    ['unknown secret-bearing error', () => { throw Object.assign(new Error('PRIVATE_PROVIDER_BODY_AND_TOKEN'),
+      { code: 'PRIVATE_SECRET_CODE', diagnostic: { httpStatus: 401, errorCode: 'PRIVATE_TOKEN' }, cause: 'PRIVATE_INPUT' }); }, 'BRIDGE_SESSION', 'UNKNOWN_ERROR', 409],
+    ['unknown error getter', () => { const error = new Error('PRIVATE_GETTER_MESSAGE');
+      Object.defineProperty(error, 'code', { get() { codeGetterReads++; throw new Error('PRIVATE_GETTER_VALUE'); } }); throw error;
+    }, 'BRIDGE_SESSION', 'UNKNOWN_ERROR', 409],
+  ];
+  for (const [name, generate, stage, reason, httpStatus] of variants) await t.test(name, async t => {
+    const state = harness(t, { generate });
+    const request = requestFixture('diagnostic-failure-call', { responseSchema: schema });
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_CALL_ABORTED' });
+    assert.deepEqual(state.diagnostics, [
+      { stage, reason, httpStatus, consumed: true },
+      { stage: 'GATEWAY_FETCH', reason: 'GATEWAY_CALL_ABORTED', httpStatus: null, consumed: true },
+    ]);
+    assert.equal(codeGetterReads, 0);
+    assert.equal(state.calls.length, 1); assert.equal(state.calls[0].alias, 'info'); assert.equal(state.requests.length, 1);
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+    assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1); assert.equal(state.diagnostics.length, 2);
+    assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE|Synthetic|@|Bearer|nonce|\.cc/);
+  });
+});
+
+test('throwing, rejecting or pending diagnostic observers cannot relax a bridge hold or rerun inference', async t => {
+  for (const mode of ['throw', 'reject', 'pending']) await t.test(mode, async t => {
+    const events = [];
+    const state = harness(t, { generate: () => { throw new ProbeError('EXACT_MODEL_NOT_AVAILABLE'); },
+      options: { onDiagnostic: event => {
+        events.push(event);
+        if (mode === 'throw') throw new Error('PRIVATE_OBSERVER_ERROR');
+        if (mode === 'reject') return Promise.reject(new Error('PRIVATE_OBSERVER_ERROR'));
+        return new Promise(() => {});
+      } } });
+    const request = requestFixture();
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_CALL_ABORTED' });
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+    assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1); assert.equal(events.length, 2);
+    assert.deepEqual(events[0], { stage: 'BRIDGE_SESSION', reason: 'EXACT_MODEL_NOT_AVAILABLE', httpStatus: 409, consumed: true });
   });
 });
 
