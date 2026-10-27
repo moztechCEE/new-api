@@ -1,5 +1,36 @@
 # Local Codex harness pilot
 
+## 2026-10-27: separate 24-hour Corely VM device client implemented, not deployed
+
+The owner approved implementation of a new revocable Corely DEV VM model-work
+grant, not an extension of the old local15-minute grant. The new standalone
+`corely-vm-model-job-client.mjs` uses the fixed VM-only resource/client/scope and
+RFC8628 device authorization, with a pre-pinned Ed25519 key and RFC9449 DPoP
+proofs. It does not create/import an OpenAI grant or read a native login cache.
+Device/token requests and every resource call are key-bound; resource proofs
+also bind the access-token hash. A public host label is not hardware attestation.
+
+The client takes a pre-verified KeyObject; provisioning/protected-store wiring
+is not implemented by this helper. Its token and key remain closure-only, no
+getter or arbitrary URL exists. It exposes only status/enroll/claim/complete,
+with bounded bodies, timeouts, fresh proofs, and one-shot uncertain completion.
+Only device pending/slow-down can poll. There is no refresh or automatic renewed
+Corely consent; the grant is at most24hours from owner approval. `close()` clears
+the local closure and explicitly reports remote revocation NOT_PERFORMED; real
+cleanup must use Corely's authenticated revoke/revoke-all route. Revocation can
+reject future work/results but cannot recall already-started provider inference.
+
+Fresh clean-environment Node22 regression **669/669** passes, no fail/skip/cancel,
+including the new41-case client suite and all628 prior checks. The workflow now
+explicitly includes the new client/tests in syntax, path filters and Node20/22
+offline checks. Exact new CI and cross-repository real loopback integration are
+separate gates. No true VM key/grant, image/container change, hosted producer or
+normal DEV/customer cutover has been performed for this new capability.
+
+Applicable security references: OWASP Authentication/Session/OAuth2 guidance
+and ASVS5.0.0 V10.1.1,10.2.3,10.3.1–10.3.5,10.4.11/14,10.7.1–10.7.3;
+RFC8628/9449/7638. These describe selected controls, not full ASVS certification.
+
 ## Actual 2026-10-27: both app-owned VM grants and authenticated restart pass
 
 After explicit action-time confirmation, normal `New API DEV Personal Plan`
