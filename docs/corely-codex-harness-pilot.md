@@ -1,5 +1,40 @@
 # Local Codex harness pilot
 
+## Actual 2026-10-27: five Corely model phases complete on Info SIWC
+
+New API runtime **9d13aff1f32866b754dd39cee84951f65c3f2f2d** passes fresh628/628
+and exact [CI40457899901](https://github.com/moztechCEE/new-api/actions/runs/40457899901),
+Node20/22 plus actual isolated image build/smoke. Corely runtime
+**72f1b80c217aa858ba342f12d44e718fdb30267f** passes exact
+[CI40458480566](https://github.com/moztechCEE/service-orchestrator/actions/runs/40458480566),
+fresh frozen6896/6896 and forced build/typecheck/lint14/14.
+
+Normal same-tool Info/Pro/plan consent then ran actual Corely evidence selection,
+production decision prompt, composer, independent factual review and human-edit
+revalidation through this app's public SIWC port. All **5/5 real calls** returned
+completed exact `gpt-6.1-sol`, `personal_info`/`siwc_plan` and valid provider usage.
+The clean process had no API key and no fallback. Signed Info identity and plan
+scope passed; remote renewable-session revocation was confirmed at the end,
+with no credential persistence. Completed `2026-10-27T06:14:30.880Z`.
+
+Per-phase latency7.352/9.441/11.560/18.112/18.054 seconds; input26096 and output1156
+tokens. This is a46.465-second first reviewed draft plus18.054-second edited-final
+review, not evidence of a speed improvement. Exact included-plan/credit decrement
+is NOT_ATTESTED. The browser's post-callback status page was blocked, but the
+callback, model calls and revocation completed without weakening browser safety.
+Safe evidence contains output hashes and numeric/enum receipts only, no prompt,
+output text or token. The synthetic test has no DB, sending or learning writer.
+
+**Still open:** persistent fresh SIWC on the dedicated VM, its restart/refresh
+acceptance, trusted hosted Corely producer, fresh Eason SIWC/failover, images,
+original50 and actual UI save/unique-send/learned-style adoption. This is Corely's
+owner-local synthetic model chain, not a hosted customer cutover, Go upstream
+channel or proof of commercial-hosted eligibility. Normal DEV/production, cloud,
+IAM/schema, existing data and review modes were not changed. New exact VM-only
+deployment scope still requires confirmation; historical image approval is not
+reused. The source pin remains9d13aff1; subsequent documentation HEADs are not a
+new tested runtime and future tests must use a clean checkout of that exact pin.
+
 ## 2026-10-27: SIWC Corely text-job adapter and bounded transport; not deployed
 
 The new text adapter preserves Corely's complete instructions, current input,
