@@ -1,5 +1,30 @@
 # Local Codex harness pilot
 
+## Actual 2026-10-27: approved VM-only runtime deployed; fresh grants pending
+
+After the owner's exact confirmation, runtime **9d13aff1f32866b754dd39cee84951f65c3f2f2d**
+was built on the dedicated DEV VM from a clean frozen source archive. Exact
+CI40457899901 was rechecked SUCCESS before deployment. The local immutable image
+ID is `sha256:d8d162ccd8cd1887a795c00320dde792c22384dc3a69087c4a1f545534905f2d`;
+the revision label and all five runtime-file hashes match the frozen source.
+This is not a newly published registry digest.
+
+The separate `new-api-siwc-dev-sessions-1` container is running with uid1000,
+read-only root, no published ports, dropped capabilities, no-new-privileges,
+256MiB/64-pid limits and only its new protected `/state` mount. Networkless
+credential-free image smoke passed; the real VM host record is0600 and its
+directory0700. API fallback, sending and learning capabilities are false.
+The original four gateway containers retain identical IDs/images/start times/
+restart counts, and original compose/runtime-env hashes are unchanged.
+
+Fresh same-app Info personal-account OAuth has reached the official plan-access
+consent page. **No new persistent grant, credential transfer, VM inference,
+renewal or authenticated restart has completed yet.** The action-time confirmation
+for the two same-scope Info/Eason grants is outstanding; no native credential
+cache was used. The maintenance daemon correctly reports no connected accounts.
+Corely relay remains false, normal DEV/production are not cut over, and this
+deployment is not evidence of full customer-service or exact plan-debit acceptance.
+
 ## Actual 2026-10-27: five Corely model phases complete on Info SIWC
 
 New API runtime **9d13aff1f32866b754dd39cee84951f65c3f2f2d** passes fresh628/628
