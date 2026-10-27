@@ -1,0 +1,19 @@
+# A separate project: never compose this into the existing gateway/database stack.
+name: new-api-siwc-dev
+services:
+  sessions:
+    image: ${SIWC_IMAGE:?Set the exact approved SIWC image digest}
+    restart: unless-stopped
+    init: true
+    user: '1000:1000'
+    read_only: true
+    network_mode: bridge
+    # Create this new owner-only directory as uid/gid 1000 before deployment.
+    volumes: ['/opt/new-api-siwc-dev/state:/state:rw']
+    security_opt: ['no-new-privileges:true']
+    cap_drop: ['ALL']
+    pids_limit: 64
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: {max-size: '5m', max-file: '2'}

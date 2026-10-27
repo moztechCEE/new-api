@@ -1,0 +1,7 @@
+**
+!bin/
+!bin/siwc-local-runtime.mjs
+!bin/siwc-local-sessions.mjs
+!bin/siwc-local-vm.mjs
+!LICENSE
+!THIRD-PARTY-LICENSES.md

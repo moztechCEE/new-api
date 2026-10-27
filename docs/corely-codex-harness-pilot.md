@@ -1,5 +1,95 @@
 # Local Codex harness pilot
 
+## 2026-10-27: persistent owner DEV session implementation; not deployed
+
+The owner explicitly approved fresh New API-owned SIWC credentials on the
+dedicated `new-api-dev-20261022` VM, for `moztech-test` synthetic cases only.
+Info remains primary and Eason backup; Platform API fallback is disabled.
+This is not permission to reuse native Codex/Luna caches, read real customers,
+change normal Corely/production/data/review modes, or offer hosted access to
+other users. Exact new deployment SHA/scope must still be confirmed after CI.
+
+`bin/siwc-local-sessions.mjs` and `bin/siwc-local-vm.mjs` implement app-owned
+normal loopback OAuth, separate protected account registrations, a distinct
+stable VM host ID, SSH-stdin import, restart-safe expiry and serialized rotating
+refreshes. Directories are 0700 and records 0600; unsafe permissions, symlinks,
+hardlinks, identity/client mixing, scope expansion and replayed handoffs fail.
+A durable pending marker prevents old refresh-token reuse after ambiguity or
+crash. A newly returned renewal token is quarantined for revocation before
+identity verification/final replacement, not activated on a failed validation.
+Definitively invalid refresh tokens are removed; uncertain outcomes require
+reauthorization. A stale lease is never automatically stolen.
+
+Enrollment uses the app name `New API DEV Personal Plan`. Its local runtime
+cannot refresh or run models. Transfer writes this app's selected protected
+record only, not any native cache. The VM retains its own host ID. After its
+import receipt is checked, `forget-transferred` removes the source credentials
+and transfer file without revoking the VM session; public registration identity
+is retained. Sign-out instead attempts remote refresh-session revocation,
+clears local tokens, and reports unconfirmed revocation explicitly.
+
+The CLI rejects API-key/proxy/native-home injection and arbitrary model/customer
+arguments. Its only inference remains the fixed synthetic exact-Sol proof.
+Only a verified provider plan-exhaustion code can advance Info to Eason; an
+ordinary 429, missing login, timeout or unsupported capability cannot. No API
+fallback exists. Normal Corely routing and its quality/manual-send/learning
+code are unchanged: **the New API upstream channel and Corely job transport are
+not connected by this session-maintenance milestone**.
+
+The independent container has no listener/ports, no DB credentials/volumes,
+non-root uid1000, read-only root, dropped capabilities and bounded resources.
+`deploy/gce/siwc-compose.yaml` uses a separate compose project and a new state
+directory, not the existing gateway compose/runtime.env. The official Node22
+linux/amd64 base is pinned by digest; Node20/22 protocol CI plus a networkless,
+credential-free container status smoke are required. Local Docker is unavailable,
+so local container execution is not claimed. The live VM was read-only checked
+as RUNNING, existing compose path `/opt/new-api-dev`; no runtime/service/session
+or cloud resource was changed.
+
+The app's documented VM credential path is
+`/opt/new-api-siwc-dev/state/{host,info,eason}.json`, mounted as `/state`.
+Enrollment lives in a separate protected local application directory. Neither
+directory belongs in the Git checkout or image. The Docker-specific build
+context allows only the three runtime scripts and unchanged license files;
+the ordinary gateway context now also excludes `.local-tests`.
+
+Operator commands are explicit: `init-vm`, `authorize --account info|eason
+--target-host-id <VM_HOST_ID>`, `import --account info|eason` (SSH stdin only),
+`forget-transferred --account <alias> --imported-sha256 <receipt hash>`,
+`status`, `maintain`, `probe`, and `disconnect --account <alias>`.
+Each requires `--state-dir <absolute app-owned directory>` and an isolated
+`env -i` environment. `probe` accepts no prompt/model/account override and
+follows Info then verified-limit-only Eason. It does not run Corely or 50 cases.
+
+Security references read before auth implementation: [ASVS5.0.0](https://asvs.owasp.org/),
+[Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html),
+[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html),
+and [OAuth2](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html).
+Selected ASVS controls: V10.1.1/10.1.2 (backend token isolation and transaction
+binding), V10.2.1/10.2.3 (PKCE/state and minimum scope), V10.5.1–10.5.4
+(nonce, stable subject, exact issuer and audience). The provider controls
+refresh rotation/revocation; this client serializes and preserves its lifecycle.
+This is not full ASVS certification. VM placement, actual storage/deployment
+permissions, encrypted-at-rest operational protection, fresh persistent OAuth,
+actual VM restart/refresh/model proof and relay/Corely end-to-end acceptance
+remain unverified. Host metadata is not itself a VM identity attestation.
+
+Fresh local regression after the session implementation: **582/582**, zero
+fail/skip/cancel, Node20 clean environment with a loopback-only network guard.
+It covers actual file permissions/restarts, normal mocked-provider OAuth over a
+real loopback listener, account isolation, identity/scope rejection, serialized
+refresh/crash holds, renewal-handle quarantine, revocation, source cleanup and
+verified-limit-only fallback. All accounts/tokens/provider bodies are synthetic;
+this is not fresh live OAuth, VM or customer-service acceptance. Exact-version
+CI and the Linux container smoke are still required before deployment approval.
+
+Primary provider guidance: [self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms),
+[accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions),
+[registration/storage](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),
+and [refresh recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery).
+The prior local direct SIWC success below is preserved, not relabelled as a
+VM, New API gateway, all-Corely or exact debit result.
+
 ## Latest actual result — Info direct SIWC inference passes (2026-10-27)
 
 Runtime **d5b8f6d2b153b88c6517b0a56275a87ce061ac65** passed fresh548/548
@@ -18,9 +108,9 @@ Neither required removing quality checks or changing FAQ/stage data.
 This verifies an actual personal-plan-authorized inference, not the precise
 subscription/credit debit amount, a New API gateway call, hosted Corely,
 account failover or manual-edit/send/learning acceptance. No cloud change.
-The next boundary is an explicitly approved persistent, owner-only SIWC session
-on the dedicated New API DEV VM for synthetic Corely integration; no Codex/Luna
-cache import. This question is pending, not an issued persistent authorization.
+The owner has now approved persistence/background use on the dedicated DEV VM
+for synthetic Corely integration; no Codex/Luna cache import. Implementation and
+precise deployment approval are tracked above; no persistent grant is issued yet.
 
 ## 2026-10-27 SIWC VM clarification and bounded inference diagnosis
 

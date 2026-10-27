@@ -174,6 +174,9 @@ test('returning authorization reuses the issued registration and binds callback 
   for (const clientId of ['', 'dynamic_agent_client', 'invalid client', 'x'.repeat(257)]) {
     assert.throws(() => createAttempt(HOST, CALLBACK, NOW, { clientId }), { code: 'INVALID_REGISTRATION' });
   }
+  for (const agentName of ['', 'bad\nname', '<b>name</b>', 'x'.repeat(81)]) {
+    assert.throws(() => createAttempt(HOST, CALLBACK, NOW, { agentName }), { code: 'INVALID_REGISTRATION' });
+  }
 });
 
 test('real RS256 ID token establishes only the expected scoped synthetic session', () => {

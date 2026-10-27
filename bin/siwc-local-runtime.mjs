@@ -55,13 +55,15 @@ export function createAttempt(hostId, redirectUri, now = Date.now(), registratio
   const url = new URL('/api/accounts/authorize', ISSUER);
   const clientId = registration.clientId;
   if (clientId !== undefined && (!/^[A-Za-z0-9_-]{1,256}$/.test(clientId) || clientId === 'dynamic_agent_client')) fail('INVALID_REGISTRATION');
+  const agentName = registration.agentName ?? 'New API Local Personal Plan Pilot';
+  if (typeof agentName !== 'string' || agentName.length < 1 || agentName.length > 80 || /[\u0000-\u001f\u007f<>]/.test(agentName)) fail('INVALID_REGISTRATION');
   for (const [key, value] of Object.entries({
     client_id: clientId ?? 'dynamic_agent_client',
     ext_agent_host_id: hostId, response_type: 'code', redirect_uri: redirectUri,
     scope: SCOPES, resource: RESOURCE, state, nonce, code_challenge_method: 'S256',
     code_challenge: createHash('sha256').update(verifier).digest('base64url'),
   })) url.searchParams.set(key, value);
-  if (!clientId) url.searchParams.set('agent_name_hint', 'New API Local Personal Plan Pilot');
+  if (!clientId) url.searchParams.set('agent_name_hint', agentName);
   return { state, nonce, verifier, redirectUri, clientId, expiresAt: now + 600_000, used: false, url: url.href };
 }
 
