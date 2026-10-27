@@ -11,6 +11,7 @@ export const CORELY_VM_MODEL_JOB_CLIENT_ID = 'corely-vm-model-jobs-dev';
 export const CORELY_VM_HOST_ID_HASH = '89d0316d433fbf80da04c4b8ad5a2cc12daa28d8720886916ba2f6b9558519e0';
 export const CORELY_VM_VERIFICATION_URI = 'https://agent-dev.corely.cc/ops/work-candidates/vm-model-jobs/connect';
 const MAX_GRANT_MS = 86_400_000;
+const MAX_POLL_WAKEUPS = 32;
 const CODES = new Set(['INVALID_OPTIONS', 'INVALID_KEY', 'ABORTED', 'AUTHORIZATION_FAILED', 'AUTHORIZATION_TIMEOUT',
   'AUTHORIZATION_DENIED', 'DEVICE_RESPONSE_INVALID', 'TOKEN_RESPONSE_INVALID', 'TOKEN_EXCHANGE_UNCERTAIN',
   'GRANT_EXPIRED', 'GRANT_CLOSED', 'RESOURCE_REQUEST_UNCERTAIN', 'RESOURCE_RESPONSE_INVALID', 'MODEL_JOB_NOT_CURRENT']);
@@ -95,10 +96,10 @@ async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, 
  * native logins, OpenAI credentials, customers, or arbitrary URLs/operations. */
 export async function connectCorelyVmModelJobs(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(key =>
-    !['privateKey', 'expectedKeyThumbprint', 'onAuthorize', 'fetchImpl', 'signal', 'now', 'sleep', 'requestTimeoutMs'].includes(key))) throw failure('INVALID_OPTIONS');
+    !['privateKey', 'expectedKeyThumbprint', 'onAuthorize', 'fetchImpl', 'signal', 'now', 'monotonicNow', 'sleep', 'requestTimeoutMs'].includes(key))) throw failure('INVALID_OPTIONS');
   const { privateKey, expectedKeyThumbprint, onAuthorize, fetchImpl = globalThis.fetch, signal, now = Date.now,
-    sleep = waitInterval, requestTimeoutMs = 15_000 } = options;
-  if (typeof onAuthorize !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' || typeof sleep !== 'function' ||
+    monotonicNow = () => performance.now(), sleep = waitInterval, requestTimeoutMs = 15_000 } = options;
+  if (typeof onAuthorize !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' || typeof monotonicNow !== 'function' || typeof sleep !== 'function' ||
       !Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 10 || requestTimeoutMs > 30_000 ||
       (signal !== undefined && !(signal instanceof AbortSignal))) throw failure('INVALID_OPTIONS');
   if (signal?.aborted) throw failure('ABORTED');
@@ -117,6 +118,12 @@ export async function connectCorelyVmModelJobs(options = {}) {
     if (!Number.isSafeInteger(value) || value < 0 || value < lastClock) throw failure('INVALID_OPTIONS');
     lastClock = value; return value;
   };
+  let lastMonotonic = -1;
+  const readMonotonic = () => {
+    let value; try { value = monotonicNow(); } catch { throw failure('INVALID_OPTIONS'); }
+    if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER - MAX_GRANT_MS || value < lastMonotonic) throw failure('INVALID_OPTIONS');
+    lastMonotonic = value; return value;
+  };
   const proof = (endpoint, method, accessToken) => {
     const header = Buffer.from(JSON.stringify({ typ: 'dpop+jwt', alg: 'EdDSA', jwk })).toString('base64url');
     const payload = Buffer.from(JSON.stringify({ htu: endpoint, htm: method, iat: Math.floor(readClock() / 1000), jti: randomUUID(),
@@ -125,7 +132,7 @@ export async function connectCorelyVmModelJobs(options = {}) {
     try { return `${message}.${sign(null, Buffer.from(message), privateKey).toString('base64url')}`; }
     catch { throw failure('INVALID_KEY'); }
   };
-  const authorizationStarted = readClock(), authorizationMonotonic = performance.now();
+  const authorizationStarted = readClock(), authorizationMonotonic = readMonotonic();
   const transaction = new AbortController(), abort = () => transaction.abort(failure('ABORTED'));
   signal?.addEventListener('abort', abort, { once: true });
   const timer = setTimeout(() => transaction.abort(failure('AUTHORIZATION_TIMEOUT')), 300_000);
@@ -146,12 +153,25 @@ export async function connectCorelyVmModelJobs(options = {}) {
       scope: CORELY_VM_MODEL_JOB_SCOPE, vmHostIdHash: CORELY_VM_HOST_ID_HASH, keyThumbprint }))), transaction.signal);
     let interval = 5000;
     for (;;) {
-      const before = readClock();
-      if (before >= authorizationStarted + 300_000 || performance.now() - authorizationMonotonic >= 300_000) throw failure('AUTHORIZATION_TIMEOUT');
-      await untilAborted(sleep(interval, transaction.signal), transaction.signal);
-      if (readClock() < before + interval) throw failure('INVALID_OPTIONS');
-      if (readClock() >= authorizationStarted + 300_000 || performance.now() - authorizationMonotonic >= 300_000) throw failure('AUTHORIZATION_TIMEOUT');
-      const endpoint = `${CORELY_VM_MODEL_JOB_ISSUER}/token`, started = readClock(), startedMonotonic = performance.now();
+      let wall = readClock(), monotonic = readMonotonic();
+      const wallDeadline = wall + interval, monotonicDeadline = monotonic + interval;
+      let wakeups = 0;
+      // Timers may wake early. Keep both deadlines fixed for this poll and
+      // supplement only the remaining wait; never shorten the server interval
+      // or restart the five-minute authorization lifetime.
+      for (;;) {
+        const authorizationRemaining = Math.min(authorizationStarted + 300_000 - wall,
+          authorizationMonotonic + 300_000 - monotonic);
+        if (authorizationRemaining <= 0) throw failure('AUTHORIZATION_TIMEOUT');
+        const remaining = Math.max(wallDeadline - wall, monotonicDeadline - monotonic);
+        if (remaining <= 0) break;
+        if (++wakeups > MAX_POLL_WAKEUPS) throw failure('INVALID_OPTIONS');
+        await untilAborted(sleep(Math.ceil(Math.min(remaining, authorizationRemaining)), transaction.signal), transaction.signal);
+        const previousWall = wall, previousMonotonic = monotonic;
+        wall = readClock(); monotonic = readMonotonic();
+        if (wall === previousWall && monotonic === previousMonotonic) throw failure('INVALID_OPTIONS');
+      }
+      const endpoint = `${CORELY_VM_MODEL_JOB_ISSUER}/token`, started = readClock(), startedMonotonic = readMonotonic();
       const value = await requestJson(endpoint, { fetchImpl, requestTimeoutMs, signal: transaction.signal, kind: 'token', proof: proof(endpoint, 'POST'),
         body: { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', client_id: CORELY_VM_MODEL_JOB_CLIENT_ID,
           resource: CORELY_VM_MODEL_JOB_RESOURCE, device_code: device.device_code } });
@@ -164,7 +184,7 @@ export async function connectCorelyVmModelJobs(options = {}) {
           value.expires_in < 1 || value.expires_in * 1000 > MAX_GRANT_MS) throw failure('TOKEN_RESPONSE_INVALID');
       grantLifetime = value.expires_in * 1000; expiresAt = started + grantLifetime; tokenStarted = startedMonotonic;
       token = value.access_token;
-      if (readClock() >= expiresAt || performance.now() - tokenStarted >= grantLifetime) throw failure('GRANT_EXPIRED');
+      if (readClock() >= expiresAt || readMonotonic() - tokenStarted >= grantLifetime) throw failure('GRANT_EXPIRED');
       break;
     }
   } catch (error) {
@@ -181,7 +201,7 @@ export async function connectCorelyVmModelJobs(options = {}) {
     if (signal?.aborted) { close(); throw failure('ABORTED'); }
     if (closed || !token) throw failure('GRANT_CLOSED');
     if (held) throw failure('RESOURCE_REQUEST_UNCERTAIN');
-    if (readClock() >= expiresAt || performance.now() - tokenStarted >= grantLifetime) { close(); throw failure('GRANT_EXPIRED'); }
+    if (readClock() >= expiresAt || readMonotonic() - tokenStarted >= grantLifetime) { close(); throw failure('GRANT_EXPIRED'); }
   };
   const resource = async (operation, body, operationSignal) => {
     live();

@@ -1,5 +1,32 @@
 # Local Codex harness pilot
 
+## 2026-10-27: bounded dual-clock device polling repair, not deployed
+
+Corely CI40481300648 first held without a stage; diagnostic source d3b9183e
+and exactCI40484859365 identified SECOND_CONNECT / INVALID_OPTIONS after four
+mocked model jobs completed (43 authority reads, two consent reads). Neither
+failure is erased. The old1f4 client deterministically rejects a4999ms early
+wake before token POST; completing a timer does not guarantee exact elapsed
+wall time. See [Node timers](https://raw.githubusercontent.com/nodejs/node/v20.20.2/doc/api/timers.md)
+and [RFC8628 section3.5](https://www.rfc-editor.org/rfc/rfc8628.html#section-3.5).
+
+The client now fixes wall and monotonic deadlines per poll and ceil-waits the
+remaining duration. Token POST requires both deadlines; pending/slow_down do not
+reset the original300second authorization lifetime. No-progress/rollback/invalid
+or overflowing clocks hold, at most32early wakeups are allowed, and cancellation
+still interrupts supplementary waits. Grant expiry stays at most24hours and the
+original uncertain token-exchange/no-retry rule is unchanged. The trusted test
+seam defaults to `() => performance.now()`; it is not an input/proxy/credential
+endpoint and does not alter resource, DPoP, scope or permissions.
+
+New client suite **66/66** passes on official Node20.20.2 and Node22.19.0,
+including4999+1/fractional waits, actual POST-time checks, independent frozen/
+backward/NaN/overflow clocks, cancellation, original300second timeout and
+monotonic24hour expiry. Fresh Node20 full offline regression **694/694** passes,
+no fail/skip/cancel. Exact new CI and pinned Corely Linux integration remain
+separate gates. No live inference, VM image/private key/grant, normal DEV,
+production, real customer, sending or learning change occurred.
+
 ## 2026-10-27: separate 24-hour Corely VM device client implemented, not deployed
 
 The owner approved implementation of a new revocable Corely DEV VM model-work

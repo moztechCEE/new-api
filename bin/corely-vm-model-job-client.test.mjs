@@ -20,7 +20,7 @@ function fixture(change = {}) {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const jwk = publicKey.export({ format: 'jwk' });
   const thumbprint = hash(JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: jwk.x }));
-  let clock = 1_800_000_000_000, consented = false, completeCount = 0;
+  let clock = 1_800_000_000_000, monotonic = 1000, consented = false, completeCount = 0;
   const grantExpiry = clock + 86_400_000, calls = [], waits = [], proofs = new Set();
   const content = { version: 1, callId: 'synthetic-vm-model-call', workload: 'REPLY_LLM', purpose: 'reply_generation', model: 'gpt-6.1-sol',
     scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: 'server-synthetic-job' },
@@ -44,8 +44,9 @@ function fixture(change = {}) {
     assert.equal(proofs.has(payload.jti), false); proofs.add(payload.jti);
     if (accessToken) assert.equal(payload.ath, hash(accessToken));
   };
-  const options = { privateKey, expectedKeyThumbprint: thumbprint, now: () => clock,
-    sleep: async ms => { waits.push(ms); clock += ms; },
+  const advance = ms => { clock += ms; monotonic += ms; };
+  const options = { privateKey, expectedKeyThumbprint: thumbprint, now: () => clock, monotonicNow: () => monotonic,
+    sleep: async ms => { waits.push(ms); advance(ms); },
     onAuthorize: async value => {
       assert.deepEqual(Object.keys(value).sort(), ['verificationUri', 'verificationUriComplete', 'userCode', 'expiresIn', 'interval', 'scope', 'vmHostIdHash', 'keyThumbprint'].sort());
       assert.equal(value.verificationUriComplete, `${VERIFICATION}?requestId=${REQUEST}`);
@@ -53,7 +54,7 @@ function fixture(change = {}) {
       await change.onAuthorize?.(value);
     },
     fetchImpl: async (url, init) => {
-      calls.push({ url, method: init.method });
+      calls.push({ url, method: init.method, wall: clock, monotonic });
       assert.equal(init.redirect, 'error'); assert.equal(init.credentials, 'omit'); assert.equal(init.cache, 'no-store');
       assert.ok(init.signal instanceof AbortSignal); assert.equal(init.headers.Accept, 'application/json');
       if (url === `${ISSUER}/device_authorization`) {
@@ -87,7 +88,8 @@ function fixture(change = {}) {
         resultSha256: createHash('sha256').update(JSON.stringify(body.result)).digest('hex') });
     } };
   return { options, calls, waits, lease, result, thumbprint, publicKey, status, assertProof,
-    advance: ms => { clock += ms; }, completed: () => completeCount };
+    advance, advanceWall: ms => { clock += ms; }, advanceMonotonic: ms => { monotonic += ms; },
+    completed: () => completeCount };
 }
 
 test('offline device + sender-constrained grant completes only one bound synthetic lease without exposing credentials', async () => {
@@ -109,6 +111,95 @@ test('authorization_pending and slow_down are the only pollable token outcomes a
     ? Response.json({ error: polls === 1 ? 'authorization_pending' : 'slow_down' }, { status: 400 }) : Response.json(value) });
   const client = await connectCorelyVmModelJobs(f.options); assert.deepEqual(f.waits, [5000, 5000, 10000]);
   assert.equal(polls, 3); client.close();
+});
+
+test('an early 4999ms timer wake waits the last millisecond before exchanging a token', async () => {
+  const f = fixture();
+  const client = await connectCorelyVmModelJobs({ ...f.options, sleep: async ms => {
+    f.waits.push(ms); f.advance(f.waits.length === 1 ? ms - 1 : ms);
+  } });
+  assert.deepEqual(f.waits, [5000, 1]);
+  assert.equal(f.calls.filter(call => call.url.endsWith('/token')).length, 1); client.close();
+});
+
+test('fractional and independent clock early wakes ceil the remaining wait and never poll early', async t => {
+  for (const [name, wallElapsed, monotonicElapsed] of [['wall', 4999, 5000], ['monotonic', 5000, 4999], ['fractional', 5000, 4999.25]]) {
+    await t.test(name, async () => {
+      const f = fixture(), wallStart = f.options.now(), monotonicStart = f.options.monotonicNow();
+      const client = await connectCorelyVmModelJobs({ ...f.options, sleep: async ms => {
+        assert.equal(Number.isSafeInteger(ms), true); assert.ok(ms >= 1); f.waits.push(ms);
+        if (f.waits.length === 1) { f.advanceWall(wallElapsed); f.advanceMonotonic(monotonicElapsed); }
+        else f.advance(ms);
+      } });
+      assert.deepEqual(f.waits, [5000, 1]);
+      const polls = f.calls.filter(call => call.url.endsWith('/token'));
+      assert.equal(polls.length, 1); assert.ok(polls[0].wall - wallStart >= 5000);
+      assert.ok(polls[0].monotonic - monotonicStart >= 5000); client.close();
+    });
+  }
+});
+
+test('no-progress, one static clock, backwards and non-finite clocks reject before token POST', async t => {
+  for (const [name, move] of [['no progress', () => {}], ['static wall', (f, ms) => f.advanceMonotonic(ms)],
+    ['static monotonic', (f, ms) => f.advanceWall(ms)], ['wall rollback', f => f.advanceWall(-1)],
+    ['monotonic rollback', f => f.advanceMonotonic(-1)]]) {
+    await t.test(name, async () => {
+      const f = fixture();
+      await assert.rejects(connectCorelyVmModelJobs({ ...f.options, sleep: async ms => { f.waits.push(ms); move(f, ms); } }), isCode('INVALID_OPTIONS'));
+      assert.equal(f.calls.length, 1); assert.ok(f.waits.length <= 32);
+      if (name === 'no progress') assert.equal(f.waits.length, 1);
+      if (name.startsWith('static ')) assert.equal(f.waits.length, 32);
+    });
+  }
+  for (const [name, value] of [['NaN', NaN], ['Infinity', Infinity], ['overflow', 1e30], ['negative', -1], ['string', '1000'], ['not callable', 1000]]) {
+    await t.test(name, async () => {
+      const f = fixture();
+      await assert.rejects(connectCorelyVmModelJobs({ ...f.options, monotonicNow: name === 'not callable' ? value : () => value }), isCode('INVALID_OPTIONS'));
+      assert.equal(f.calls.length, 0);
+    });
+  }
+  await t.test('non-finite after wake', async () => {
+    const f = fixture(); let invalid = false;
+    await assert.rejects(connectCorelyVmModelJobs({ ...f.options, monotonicNow: () => invalid ? NaN : f.options.monotonicNow(),
+      sleep: async ms => { f.advance(ms); invalid = true; } }), isCode('INVALID_OPTIONS'));
+    assert.equal(f.calls.length, 1);
+  });
+});
+
+test('cancellation during an early-wake supplementary wait prevents token exchange', async () => {
+  const controller = new AbortController(), f = fixture();
+  await assert.rejects(connectCorelyVmModelJobs({ ...f.options, signal: controller.signal, sleep: async ms => {
+    f.waits.push(ms);
+    if (f.waits.length === 1) f.advance(ms - 1); else controller.abort();
+  } }), isCode('ABORTED'));
+  assert.deepEqual(f.waits, [5000, 1]); assert.equal(f.calls.length, 1);
+});
+
+test('early wakes and slow_down do not extend the original 300-second authorization deadline', async t => {
+  for (const clock of ['both', 'wall', 'monotonic']) {
+    await t.test(clock, async () => {
+      const f = fixture({ onAuthorize: () => {
+        if (clock !== 'monotonic') f.advanceWall(299_999);
+        if (clock !== 'wall') f.advanceMonotonic(299_999);
+      } });
+      await assert.rejects(connectCorelyVmModelJobs(f.options), isCode('AUTHORIZATION_TIMEOUT'));
+      assert.deepEqual(f.waits, [1]); assert.equal(f.calls.length, 1);
+    });
+  }
+  await t.test('slow_down reaches, never passes, the deadline', async () => {
+    const f = fixture({ token: () => Response.json({ error: 'slow_down' }, { status: 400 }) });
+    const started = f.options.now();
+    await assert.rejects(connectCorelyVmModelJobs(f.options), isCode('AUTHORIZATION_TIMEOUT'));
+    assert.equal(f.options.now() - started, 300_000);
+    assert.deepEqual(f.waits, [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000, 45000, 50000, 25000]);
+    assert.equal(f.calls.filter(call => call.url.endsWith('/token')).length, 10);
+  });
+});
+
+test('the monotonic grant deadline expires even if the wall clock stays static after connect', async () => {
+  const f = fixture(), client = await connectCorelyVmModelJobs(f.options);
+  f.advanceMonotonic(86_400_000);
+  await assert.rejects(client.modelStatus(), isCode('GRANT_EXPIRED')); assert.equal(f.calls.length, 2);
 });
 
 test('fixed issuer, URL, scope and pre-verified Ed25519 key cannot be changed by callers', async t => {
