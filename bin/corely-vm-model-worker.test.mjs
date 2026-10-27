@@ -5,8 +5,9 @@ import { chmod, link, lstat, mkdtemp, readFile, readdir, realpath, rename, rm, s
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { after, before, test } from 'node:test';
-import { openCorelyVmModelIdentity, openCorelyVmModelWorkerLifecycle, runCorelyVmModelWorker,
+import { openCorelyVmModelIdentity, openCorelyVmModelWorkerLifecycle, openCorelyVmModelGateway, runCorelyVmModelWorker,
   parseVmModelWorkerCommand, VmModelWorkerError } from './corely-vm-model-worker.mjs';
 import { CORELY_VM_MODEL_JOB_SCOPE as SCOPE, CORELY_VM_MODEL_JOB_RESOURCE as RESOURCE,
   CORELY_VM_HOST_ID_HASH as HOST, CORELY_VM_VERIFICATION_URI as VERIFICATION } from './corely-vm-model-job-client.mjs';
@@ -74,6 +75,54 @@ test('weak permissions, links, malformed records, and a changed host fail before
         ['WORKER_STORAGE_INVALID', 'WORKER_STORAGE_NOT_PRIVATE', 'WORKER_IDENTITY_INVALID'].includes(error.code) && !JSON.stringify(error).includes('PRIVATE_TEST_MARKER'));
     });
   }
+});
+
+test('explicit gateway bootstrap requires private expiring DEV-only credentials and matching TLS identity', async t => {
+  const f = await storage(t), controller = new AbortController();
+  t.after(() => controller.abort());
+  const keyPath = join(f.root, 'fixture-key.pem'), certPath = join(f.root, 'fixture-cert.pem');
+  // Ephemeral local test material, never a production or VM credential.
+  const certificate = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:3072', '-nodes', '-days', '2',
+    '-keyout', keyPath, '-out', certPath, '-subj', '/CN=corely-siwc-bridge', '-addext', 'subjectAltName=DNS:corely-siwc-bridge'],
+  { encoding: 'utf8', stdio: 'pipe' });
+  assert.equal(certificate.status, 0, 'test-only TLS fixture creation must succeed');
+  const config = { kind: 'CORELY_DEV_SIWC_GATEWAY', version: 1, gatewayUrl: 'https://newapi-dev.corely.cc/v1/responses',
+    gatewayToken: 'test_gateway_only_'.repeat(3), bridgeSecret: 'test_bridge_only_'.repeat(4), expiresAt: Date.now() + 30 * 60_000,
+    tlsCertificatePem: await readFile(certPath, 'utf8'), tlsPrivateKeyPem: await readFile(keyPath, 'utf8') };
+  const path = join(f.root, 'corely-vm-model-gateway.json');
+  let listeners = 0, options, handler, listenAddress, closed = 0, listenerServer;
+  const serverFactory = (tls, requestHandler) => {
+    listeners++; options = tls; handler = requestHandler;
+    const server = new EventEmitter();
+    server.listen = (port, host, ready) => { listenAddress = { port, host }; ready(); };
+    server.close = done => { closed++; queueMicrotask(done); };
+    server.closeAllConnections = () => {};
+    listenerServer = server; return server;
+  };
+  const sessions = { generate() { throw new Error('NO_INFERENCE_DURING_BOOTSTRAP'); } };
+  for (const changed of [
+    { gatewayUrl: 'https://newapi.corely.cc/v1/responses' }, { gatewayUrl: 'http://newapi-dev.corely.cc/v1/responses' },
+    { gatewayToken: config.bridgeSecret }, { expiresAt: Date.now() - 1 }, { expiresAt: Date.now() + 86460_000 },
+    { tlsPrivateKeyPem: 'PRIVATE_TEST_MARKER' }, { apiFallbackEnabled: true },
+  ]) {
+    await writeFile(path, JSON.stringify({ ...config, ...changed }), { mode: 0o600 });
+    await assert.rejects(openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory }), code('WORKER_GATEWAY_INVALID'));
+  }
+  assert.equal(listeners, 0);
+  await writeFile(path, JSON.stringify(config), { mode: 0o600 });
+  await chmod(path, 0o644);
+  await assert.rejects(openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory }), code('WORKER_STORAGE_NOT_PRIVATE'));
+  await chmod(path, 0o600);
+  const gateway = await openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory });
+  assert.equal(options.minVersion, 'TLSv1.2'); assert.equal(options.handshakeTimeout, 10_000); assert.equal(typeof handler, 'function');
+  assert.deepEqual(listenAddress, { port: 8443, host: '0.0.0.0' });
+  assert.deepEqual(Object.keys(gateway.ports), ['info', 'eason']);
+  assert.equal(gateway.receipt().apiFallbackEnabled, false);
+  assert.doesNotMatch(JSON.stringify(gateway.receipt()), /PRIVATE|test_gateway|test_bridge|gatewayToken|bridgeSecret/);
+  const unnegotiated = new EventEmitter(); let destroyed = 0;
+  unnegotiated.destroy = () => { assert.equal(closed, 1, 'stop accepting before destroying unnegotiated sockets'); destroyed++; unnegotiated.emit('close'); };
+  listenerServer.emit('connection', unnegotiated);
+  await gateway.close(); await gateway.close(); assert.equal(closed, 1); assert.equal(gateway.signal.aborted, true); assert.equal(destroyed, 1);
 });
 
 test('lifecycle lock is exclusive and consent reference is protected, token-free and removed after use', async t => {
@@ -265,6 +314,7 @@ test('idle bounds stop without spending model allowance, and CLI accepts no cred
   assert.equal((await runCorelyVmModelWorker(f.options)).reason, 'IDLE_LIMIT');
   assert.equal(f.generated.length, 0); assert.equal(f.closed(), 1); assert.deepEqual(f.sleeps, [1000]);
   assert.deepEqual(parseVmModelWorkerCommand(['run', '--state-dir', '/state']), { command: 'run', stateDir: '/state' });
+  assert.deepEqual(parseVmModelWorkerCommand(['run-gateway', '--state-dir', '/state']), { command: 'run-gateway', stateDir: '/state' });
   for (const args of [['run', '--api-key', 'PRIVATE_ARG'], ['init-key', '--state-dir', '/state', '--model', MODEL], ['run', '--state-dir', '../state']]) {
     assert.throws(() => parseVmModelWorkerCommand(args), code('WORKER_OPTIONS_INVALID'));
   }

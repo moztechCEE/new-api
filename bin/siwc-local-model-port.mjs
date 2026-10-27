@@ -1,21 +1,40 @@
 // Private, owner-operated synthetic Corely model port. No listener, API key,
 // native credential cache, tool execution, sending or learning capability.
 import { randomUUID } from 'node:crypto';
-import { MODEL, RESOURCE, ProbeError, publicJson, selectExactModel, consumePlanTextStream,
+import { MODEL, RESOURCE, ProbeError, digest, publicJson, selectExactModel, consumePlanTextStream,
   inferenceFailureDiagnostic } from './siwc-local-runtime.mjs';
 import { snapshotModelRequest, validateModelOutput } from './corely-model-contract.mjs';
 
 /** Preserve the complete prompt and strict output contract. SIWC uses the
  * public Responses endpoint, not Chat Completions or a ChatGPT backend proxy.
  * Unsupported API parameters are not forwarded or silently substituted. */
-export function corelyPlanPayload(input) {
+export function corelyPlanPayload(input, accountAlias) {
   const request = snapshotModelRequest(input);
+  if (accountAlias !== undefined && !['info', 'eason'].includes(accountAlias)) throw new ProbeError('MODEL_PORT_INVALID');
   const text = {};
   if (request.responseSchema) text.format = { type: 'json_schema', name: 'corely_model_output', strict: true, schema: request.responseSchema };
   else if (request.responseFormat === 'json') text.format = { type: 'json_object' };
   if (request.verbosity) text.verbosity = request.verbosity;
-  return Object.freeze({ request, payload: Object.freeze({ model: MODEL, instructions: request.system,
-    input: [{ role: 'user', content: request.user }], store: false, stream: true,
+  const cache = request.promptCache;
+  if (cache && accountAlias === undefined) throw new ProbeError('MODEL_PORT_INVALID');
+  // Cache accounting is isolated by verified account, tenant, brand and the
+  // exact reusable wire prefix/schema/settings. It never caches a reply or
+  // permits skipping an independent review. Full prompt bytes remain ordered.
+  const cacheKey = cache ? `corely-plan-${digest(JSON.stringify([accountAlias, request.scope.tenantId,
+    request.scope.brandId, request.purpose, MODEL, cache.key, request.system,
+    cache.userPrefixChars === undefined ? '' : request.user.slice(0, cache.userPrefixChars),
+    request.schemaSha256, request.reasoningEffort ?? null, request.verbosity ?? null]))}` : undefined;
+  const userContent = cache?.userPrefixChars === undefined ? request.user : [
+    { type: 'input_text', text: request.user.slice(0, cache.userPrefixChars), prompt_cache_breakpoint: { mode: 'explicit' } },
+    { type: 'input_text', text: request.user.slice(cache.userPrefixChars) },
+  ];
+  return Object.freeze({ request, payload: Object.freeze({ model: MODEL,
+    ...(cache ? { input: [
+      { role: 'developer', content: [{ type: 'input_text', text: request.system, prompt_cache_breakpoint: { mode: 'explicit' } }] },
+      { role: 'user', content: userContent },
+    ], prompt_cache_key: cacheKey, prompt_cache_options: { mode: 'implicit' } }
+      : { instructions: request.system, input: [{ role: 'user', content: request.user }] }),
+    store: false, stream: true,
     ...(Object.keys(text).length ? { text } : {}),
     ...(request.reasoningEffort ? { reasoning: { effort: request.reasoningEffort } } : {}) }) });
 }
@@ -35,7 +54,7 @@ function whileActive(work, signal) {
  * authority to read a customer: the future Corely producer must separately
  * enforce server-owned synthetic provenance before creating any such job. */
 export async function runCorelyPlanRequest(session, input, fetchImpl = globalThis.fetch, signal) {
-  const { request, payload } = corelyPlanPayload(input);
+  const { request, payload } = corelyPlanPayload(input, session?.alias);
   if (!(signal instanceof AbortSignal) || typeof fetchImpl !== 'function') throw new ProbeError('MODEL_PORT_INVALID');
   signal.throwIfAborted();
   if (!['info', 'eason'].includes(session?.alias) || session?.planScopeGranted !== true || session?.accountMatchesExpected !== true ||

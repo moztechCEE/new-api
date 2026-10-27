@@ -4,6 +4,7 @@
 !bin/siwc-local-sessions.mjs
 !bin/siwc-local-vm.mjs
 !bin/siwc-local-model-port.mjs
+!bin/siwc-gateway-model-port.mjs
 !bin/corely-model-contract.mjs
 !bin/siwc-local-corely-worker.mjs
 !bin/corely-vm-model-job-client.mjs

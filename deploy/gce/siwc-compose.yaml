@@ -39,3 +39,31 @@ services:
     logging:
       driver: json-file
       options: {max-size: '5m', max-file: '2'}
+  # Explicit replacement profile, never start beside model-worker/sessions.
+  # No published ports. The existing Go Gateway joins this private network
+  # and trusts the bridge's pinned TLS certificate/CA. Channel/token/strict
+  # affinity setup and their <=24h credentials need a separate approved release.
+  model-worker-gateway:
+    profiles: ['model-worker-gateway']
+    image: ${SIWC_IMAGE:?Set the exact approved SIWC image digest}
+    restart: 'no'
+    init: true
+    entrypoint: ['node', '/opt/new-api-siwc-dev/corely-vm-model-worker.mjs']
+    command: ['run-gateway', '--state-dir', '/state']
+    user: '1000:1000'
+    read_only: true
+    networks:
+      gateway-private:
+        aliases: ['corely-siwc-bridge']
+    volumes: ['/opt/new-api-siwc-dev/state:/state:rw']
+    security_opt: ['no-new-privileges:true']
+    cap_drop: ['ALL']
+    pids_limit: 64
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: {max-size: '5m', max-file: '2'}
+networks:
+  gateway-private:
+    external: true
+    name: new-api-siwc-gateway

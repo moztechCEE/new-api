@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// Dedicated owner-operated DEV consumer. No listener, producer, API fallback,
+// Dedicated owner-operated DEV consumer. No public listener, producer, API fallback,
 // native credential cache, customer operations, or automatic Corely re-consent.
-import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, X509Certificate } from 'node:crypto';
+import { createServer as createHttpsServer } from 'node:https';
+import { createSecureContext } from 'node:tls';
 import { constants } from 'node:fs';
 import { lstat, open, realpath, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -11,6 +13,7 @@ import { connectCorelyVmModelJobs, CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_S
   CORELY_VM_MODEL_JOB_RESOURCE, CORELY_VM_VERIFICATION_URI } from './corely-vm-model-job-client.mjs';
 import { executeOneCorelyModelJob } from './siwc-local-corely-worker.mjs';
 import { createSiwcModelTransports } from './siwc-local-model-port.mjs';
+import { createSiwcGatewayModelTransports } from './siwc-gateway-model-port.mjs';
 import { openSessionStore, createPersistentPlanSessions, VM_NAME } from './siwc-local-sessions.mjs';
 import { assertIsolatedSessionEnvironment } from './siwc-local-vm.mjs';
 import { MODEL, digest } from './siwc-local-runtime.mjs';
@@ -18,11 +21,13 @@ import { MODEL, digest } from './siwc-local-runtime.mjs';
 const KEY_FILE = 'corely-vm-model-identity.json';
 const PROMPT_FILE = 'corely-vm-model-consent.json';
 const LOCK_FILE = 'corely-vm-model-worker.lock';
+const GATEWAY_FILE = 'corely-vm-model-gateway.json';
 const MAX_RECORD = 16_384;
 const CODES = new Set(['WORKER_OPTIONS_INVALID', 'WORKER_STORAGE_INVALID', 'WORKER_STORAGE_NOT_PRIVATE',
   'WORKER_IDENTITY_NOT_INITIALIZED', 'WORKER_IDENTITY_INVALID', 'WORKER_HOST_MISMATCH', 'WORKER_ALREADY_RUNNING',
   'WORKER_CLEANUP_UNCONFIRMED', 'WORKER_AUTHORITY_HELD', 'WORKER_PRODUCER_NOT_READY', 'WORKER_EVENT_UNCONFIRMED',
-  'WORKER_SESSION_HELD', 'WORKER_EXECUTION_HELD', 'WORKER_OPERATION_TIMEOUT', 'WORKER_ABORTED', 'WORKER_FAILED']);
+  'WORKER_SESSION_HELD', 'WORKER_EXECUTION_HELD', 'WORKER_GATEWAY_INVALID', 'WORKER_GATEWAY_UNAVAILABLE',
+  'WORKER_OPERATION_TIMEOUT', 'WORKER_ABORTED', 'WORKER_FAILED']);
 export class VmModelWorkerError extends Error {
   constructor(code) { super(CODES.has(code) ? code : 'WORKER_FAILED'); this.name = 'VmModelWorkerError'; this.code = this.message; }
 }
@@ -177,6 +182,78 @@ export async function openCorelyVmModelIdentity(stateDir, { initialize = false,
   }
 }
 
+/** Explicit gateway mode only. The normal direct command never reads these
+ * credentials. They are dedicated, expiring local service credentials, not
+ * OpenAI credentials; the provider tokens remain in the SIWC session manager.
+ * The private bridge has TLS and no published Docker port. The Go channel must
+ * trust only its pinned CA/certificate and use strict single-attempt affinity.
+ * ASVS v5.0.0: 4.1.4, 10.1.1, 12.3.2-4, 13.2.2-4, 13.3.2-4.
+ */
+export async function openCorelyVmModelGateway(stateDir, sessions, signal, {
+  serverFactory = createHttpsServer, fetchImpl = globalThis.fetch,
+} = {}) {
+  if (!(signal instanceof AbortSignal) || signal.aborted || typeof serverFactory !== 'function' || typeof fetchImpl !== 'function') fail('WORKER_GATEWAY_INVALID');
+  const directory = await protectedDirectory(stateDir);
+  let server, transport, timer;
+  const sockets = new Set();
+  const controller = new AbortController(), active = AbortSignal.any([signal, controller.signal]);
+  const close = async () => {
+    controller.abort(); clearTimeout(timer); transport?.close();
+    if (server) {
+      const drained = new Promise(resolve => server.close(() => resolve()));
+      server.closeAllConnections?.();
+      // HTTP closeAllConnections does not guarantee interruption of a raw
+      // TCP peer that has not finished its TLS handshake yet.
+      for (const socket of sockets) socket.destroy();
+      sockets.clear(); await drained;
+      server = undefined;
+    }
+    await directory.close();
+  };
+  try {
+    const config = await directory.read(GATEWAY_FILE);
+    if (!exact(config, ['kind', 'version', 'gatewayUrl', 'gatewayToken', 'bridgeSecret', 'expiresAt', 'tlsCertificatePem', 'tlsPrivateKeyPem']) ||
+        config.kind !== 'CORELY_DEV_SIWC_GATEWAY' || config.version !== 1 ||
+        config.gatewayUrl !== 'https://newapi-dev.corely.cc/v1/responses' ||
+        !/^[A-Za-z0-9_-]{32,256}$/.test(config.gatewayToken ?? '') || !/^[A-Za-z0-9_-]{43,256}$/.test(config.bridgeSecret ?? '') ||
+        config.gatewayToken === config.bridgeSecret || !Number.isSafeInteger(config.expiresAt) || config.expiresAt <= Date.now() ||
+        config.expiresAt > Date.now() + 86400_000 || typeof config.tlsCertificatePem !== 'string' ||
+        typeof config.tlsPrivateKeyPem !== 'string') fail('WORKER_GATEWAY_INVALID');
+    const certificate = new X509Certificate(config.tlsCertificatePem), privateKey = createPrivateKey(config.tlsPrivateKeyPem);
+    if (!certificate.checkPrivateKey(privateKey) || certificate.checkHost('corely-siwc-bridge', { wildcards: false }) !== 'corely-siwc-bridge' ||
+        Date.parse(certificate.validFrom) > Date.now() || Date.parse(certificate.validTo) < config.expiresAt) fail('WORKER_GATEWAY_INVALID');
+    const strongKey = privateKey.asymmetricKeyType === 'ed25519' ||
+      privateKey.asymmetricKeyType === 'rsa' && privateKey.asymmetricKeyDetails?.modulusLength >= 3072 ||
+      privateKey.asymmetricKeyType === 'ec' && ['prime256v1', 'secp384r1', 'secp521r1'].includes(privateKey.asymmetricKeyDetails?.namedCurve);
+    if (!strongKey) fail('WORKER_GATEWAY_INVALID');
+    const tls = { key: config.tlsPrivateKeyPem, cert: config.tlsCertificatePem, minVersion: 'TLSv1.2', handshakeTimeout: 10_000 };
+    createSecureContext(tls); // Validate before any socket or gateway request.
+    transport = createSiwcGatewayModelTransports({ sessions, gatewayUrl: config.gatewayUrl, gatewayToken: config.gatewayToken,
+      bridgeSecret: config.bridgeSecret, signal: active, fetchImpl });
+    server = serverFactory(tls, transport.handleRequest);
+    server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
+    server.requestTimeout = 65_000; server.headersTimeout = 10_000; server.keepAliveTimeout = 5_000;
+    server.maxConnections = 8; server.maxHeadersCount = 24;
+    await new Promise((resolve, reject) => {
+      const failed = () => reject(new VmModelWorkerError('WORKER_GATEWAY_UNAVAILABLE'));
+      server.once('error', failed);
+      server.listen(8443, '0.0.0.0', () => { server.removeListener('error', failed); resolve(); });
+    });
+    server.on('error', () => controller.abort());
+    timer = setTimeout(() => controller.abort(), Math.max(1, config.expiresAt - Date.now())); timer.unref();
+    active.throwIfAborted();
+    let closed = false;
+    return Object.freeze({ ports: transport.ports, signal: active,
+      receipt: () => Object.freeze({ status: 'CORELY_DEV_SIWC_GATEWAY_READY', syntheticOnly: true, gatewayHost: 'newapi-dev.corely.cc',
+        bridgeTls: true, apiFallbackEnabled: false, sendingCapability: false, learningCapability: false }),
+      async close() { if (!closed) { closed = true; await close(); } },
+    });
+  } catch (error) {
+    await close();
+    throw error instanceof VmModelWorkerError ? error : new VmModelWorkerError('WORKER_GATEWAY_INVALID');
+  }
+}
+
 /** The owner approval reference is not a model credential. Keep even this
  * short-lived reference out of container logs, and reject stale/replaced files. */
 export async function openCorelyVmModelWorkerLifecycle(stateDir, keyThumbprint) {
@@ -279,7 +356,7 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
 }
 
 export function parseVmModelWorkerCommand(argv) {
-  if (!Array.isArray(argv) || argv.length !== 3 || !['init-key', 'status', 'run'].includes(argv[0]) || argv[1] !== '--state-dir' ||
+  if (!Array.isArray(argv) || argv.length !== 3 || !['init-key', 'status', 'run', 'run-gateway'].includes(argv[0]) || argv[1] !== '--state-dir' ||
       typeof argv[2] !== 'string' || !isAbsolute(argv[2]) || resolve(argv[2]) !== argv[2]) fail('WORKER_OPTIONS_INVALID');
   return Object.freeze({ command: argv[0], stateDir: argv[2] });
 }
@@ -289,25 +366,32 @@ export async function runVmModelWorkerCommand(argv) {
   assertIsolatedSessionEnvironment();
   const safe = value => process.stdout.write(`${JSON.stringify(value)}\n`);
   const identity = await openCorelyVmModelIdentity(stateDir, { initialize: command === 'init-key' });
-  let lifecycle;
+  let lifecycle, gateway;
   const controller = new AbortController(), stop = () => controller.abort();
   try {
-    if (command !== 'run') return safe(identity.receipt());
+    if (!['run', 'run-gateway'].includes(command)) return safe(identity.receipt());
     lifecycle = await openCorelyVmModelWorkerLifecycle(stateDir, identity.receipt().keyThumbprint);
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
     const store = await openSessionStore(stateDir), sessions = createPersistentPlanSessions(store);
-    const client = await identity.connect({ signal: controller.signal, onAuthorize: async value => {
+    if (command === 'run-gateway') {
+      gateway = await openCorelyVmModelGateway(stateDir, sessions, controller.signal);
+      safe(gateway.receipt());
+    }
+    const active = gateway?.signal ?? controller.signal;
+    const client = await identity.connect({ signal: active, onAuthorize: async value => {
       safe(await lifecycle.presentConsent(value));
     } });
     await lifecycle.clearConsent();
-    safe(await runCorelyVmModelWorker({ client, ports: createSiwcModelTransports(sessions), signal: controller.signal,
-      onReceipt: safe, maintainSessions: async active => {
+    safe(await runCorelyVmModelWorker({ client, ports: gateway?.ports ?? createSiwcModelTransports(sessions), signal: active,
+      onReceipt: value => safe(gateway && value.status === 'CORELY_SYNTHETIC_MODEL_JOB_COMPLETED'
+        ? { ...value, modelTransport: 'new_api_gateway_siwc' } : value), maintainSessions: async active => {
         const maintenance = await sessions.maintain(active);
         if (maintenance.accounts.some(account => account.state === 'held')) fail('WORKER_SESSION_HELD');
       } }));
   } finally {
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); controller.abort();
     let cleanupFailed = false;
+    try { await gateway?.close(); } catch { cleanupFailed = true; }
     try { await lifecycle?.close(); } catch { cleanupFailed = true; }
     await identity.close();
     if (cleanupFailed) fail('WORKER_CLEANUP_UNCONFIRMED');

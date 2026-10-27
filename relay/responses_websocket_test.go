@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -613,6 +614,88 @@ func TestResponsesWSPassthroughPreservesRawPricingParameters(t *testing.T) {
 	storage, err := common.GetBodyStorage(c)
 	require.NoError(t, err)
 	require.NoError(t, storage.Close())
+}
+
+// The SIWC pilot uses the existing HTTP Responses relay, not a new provider or
+// Codex reverse proxy. Exercise the real Go body/header/SSE path with a local
+// synthetic bridge and prove the dedicated token's first attempt cannot retry.
+func TestSIWCGatewayResponsesPassthroughAndSingleAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
+	service.InitHttpClient()
+	setting := operation_setting.GetChannelAffinitySetting()
+	original := *setting
+	t.Cleanup(func() { *setting = original })
+	setting.Enabled = true
+	setting.Rules = []operation_setting.ChannelAffinityRule{{
+		Name: "corely-dev-siwc-test", ModelRegex: []string{"^gpt-6\\.1-sol$"}, PathRegex: []string{"^/v1/responses$"},
+		KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "context_int", Key: "token_id"}},
+		ValueRegex: "^424242$", TTLSeconds: 60, SessionMode: "strict", IncludeUsingGroup: true, IncludeRuleName: true,
+	}}
+	payload := `{"model":"gpt-6.1-sol","store":false,"stream":true,"reasoning":{"effort":"low"},"prompt_cache_options":{"mode":"implicit"},"input":[{"role":"developer","content":[{"type":"input_text","text":"Synthetic immutable policy","prompt_cache_breakpoint":{"mode":"explicit"}}]},{"role":"user","content":"Synthetic current question"}],"text":{"format":{"type":"json_schema","name":"corely_model_output","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}},"metadata":{"corely_siwc_nonce":"synthetic-one-shot-ticket"}}`
+	completed := `{"type":"response.completed","response":{"id":"synthetic-response","status":"completed","model":"gpt-6.1-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"answer\":\"Synthetic grounded answer\"}"}]}],"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28,"input_tokens_details":{"cached_tokens":12}}}}`
+	var upstreamCalls atomic.Int32
+	bridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		assert.Equal(t, "/v1/responses", r.URL.Path)
+		assert.Equal(t, "Bearer synthetic-bridge-only", r.Header.Get("Authorization"))
+		assert.NotContains(t, r.Header.Get("Authorization"), "synthetic-gateway-only")
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		assert.Equal(t, payload, string(body), "strict schema, false values and cache breakpoints must survive byte-for-byte")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err = fmt.Fprintf(w, "event: response.completed\ndata: %s\n\n", completed)
+		require.NoError(t, err)
+	}))
+	t.Cleanup(bridge.Close)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer synthetic-gateway-only")
+	common.SetContextKey(c, constant.ContextKeyTokenId, 424242)
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-6.1-sol")
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, bridge.URL)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "synthetic-bridge-only")
+	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: true})
+	_, found := service.GetPreferredChannelByAffinity(c, "gpt-6.1-sol", "corely-dev-siwc-test")
+	assert.False(t, found, "a cold affinity cache must already enforce strict session semantics")
+	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusGatewayTimeout} {
+		decision := service.DecideRelayRetry(c, types.NewErrorWithStatusCode(errors.New("synthetic failure"), types.ErrorCodeDoRequestFailed, status), 3)
+		assert.Equal(t, "stop", decision.Action)
+		assert.Equal(t, "strict_session", decision.Reason)
+	}
+	var request dto.OpenAIResponsesRequest
+	require.NoError(t, common.Unmarshal([]byte(payload), &request))
+	info := relaycommon.GenRelayInfoResponses(c, &request)
+	adaptor, body, closer, apiErr := PrepareResponsesRequest(c, info, &request)
+	require.Nil(t, apiErr)
+	t.Cleanup(func() { require.NoError(t, closer.Close()) })
+	response, err := adaptor.DoRequest(c, info, body)
+	require.NoError(t, err)
+	upstream, ok := response.(*http.Response)
+	require.True(t, ok)
+	usage, apiErr := adaptor.DoResponse(c, upstream, info)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	actualUsage, ok := usage.(*dto.Usage)
+	require.True(t, ok)
+	assert.Equal(t, 20, actualUsage.PromptTokens)
+	assert.Equal(t, 8, actualUsage.CompletionTokens)
+	assert.Equal(t, 12, actualUsage.PromptTokensDetails.CachedTokens)
+	assert.Contains(t, w.Body.String(), completed)
+	assert.EqualValues(t, 1, upstreamCalls.Load())
+	other, _ := gin.CreateTestContext(httptest.NewRecorder())
+	other.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	common.SetContextKey(other, constant.ContextKeyTokenId, 424243)
+	service.GetPreferredChannelByAffinity(other, "gpt-6.1-sol", "corely-dev-siwc-test")
+	assert.False(t, service.ShouldSkipRetryAfterChannelAffinityFailure(other), "the pilot rule must not change another token's policy")
+	if storage, err := common.GetBodyStorage(c); err == nil {
+		t.Cleanup(func() { require.NoError(t, storage.Close()) })
+	}
 }
 
 func TestResponsesWSStreamIdentity(t *testing.T) {

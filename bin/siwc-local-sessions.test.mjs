@@ -60,7 +60,7 @@ function completion() {
   } })}\n\n`), { headers: { 'Content-Type': 'text/event-stream' } });
 }
 
-function modelRequest({ callId = 'synthetic-model-call', ...changes } = {}) {
+function modelRequest({ callId = 'synthetic-model-call', inputSha256: _inputHash, schemaSha256: _schemaHash, ...changes } = {}) {
   const sort = value => value && typeof value === 'object' ? Array.isArray(value) ? value.map(sort)
     : Object.fromEntries(Object.keys(value).sort().map(key => [key, sort(value[key])])) : value;
   const draft = { version: 1, callId, model: MODEL, workload: 'REPLY_LLM', purpose: 'reply_generation',
@@ -98,6 +98,65 @@ test('SIWC maps the entire bounded Corely contract to public Responses without p
     ['unsupported schema', modelRequest({ responseSchema: { type: 'object', properties: {}, required: [], additionalProperties: true } }), 'UNSUPPORTED_CAPABILITY'],
     ['API field injection', modelRequest({ temperature: 0 }), 'INVALID_REQUEST'],
   ]) await t.test(name, () => assert.throws(() => corelyPlanPayload(bad), { code: expected }));
+});
+
+test('SIWC prefix breakpoints preserve every prompt byte and isolate cache accounting by verified account and exact prefix', async () => {
+  const prefix = '品牌事實\r\n完整產品目錄🙂\n', system = '完整系統規則\r\n獨立覆核不可省略。';
+  const original = modelRequest({ system, user: prefix + '本輪顧客問題一。', promptCache: {
+    key: `support-${'a'.repeat(64)}`, userPrefixChars: prefix.length }, reasoningEffort: 'low', verbosity: 'low' });
+  const { request, payload } = corelyPlanPayload(original, 'info');
+  assert.equal(payload.instructions, undefined);
+  assert.deepEqual(payload.input[0], { role: 'developer', content: [{ type: 'input_text', text: system,
+    prompt_cache_breakpoint: { mode: 'explicit' } }] });
+  assert.deepEqual(Buffer.from(payload.input[0].content[0].text), Buffer.from(system));
+  assert.deepEqual(Buffer.from(payload.input[1].content.map(part => part.text).join('')), Buffer.from(original.user));
+  assert.equal(payload.input[1].content[0].text, prefix);
+  assert.deepEqual(payload.input[1].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
+  assert.equal(payload.input[1].content[1].prompt_cache_breakpoint, undefined);
+  assert.deepEqual(payload.prompt_cache_options, { mode: 'implicit' });
+  assert.match(payload.prompt_cache_key, /^corely-plan-[a-f0-9]{64}$/);
+  assert.equal(payload.store, false); assert.equal(payload.stream, true);
+  assert.deepEqual(payload.reasoning, { effort: 'low' }); assert.equal(payload.text.verbosity, 'low');
+  for (const name of ['metadata', 'prompt_cache_retention', 'cache_control', 'previous_response_id', 'background']) assert.equal(payload[name], undefined);
+  assert.notEqual(corelyPlanPayload(original, 'eason').payload.prompt_cache_key, payload.prompt_cache_key);
+  const changedQuestion = modelRequest({ ...original, user: prefix + '本輪顧客問題二。' });
+  assert.equal(corelyPlanPayload(changedQuestion, 'info').payload.prompt_cache_key, payload.prompt_cache_key);
+  for (const changes of [{ system: system + '新增規則' }, { user: '不同事實🙂\n' + original.user },
+    { purpose: 'semantic_reply_review' }, { responseSchema: { type: 'object', properties: {}, required: [], additionalProperties: false } }]) {
+    assert.notEqual(corelyPlanPayload(modelRequest({ ...original, ...changes }), 'info').payload.prompt_cache_key, payload.prompt_cache_key);
+  }
+  assert.equal(Object.isFrozen(request.promptCache), true);
+  assert.throws(() => corelyPlanPayload(changedQuestion), code('MODEL_PORT_INVALID'));
+  original.promptCache.key = `support-${'b'.repeat(64)}`;
+  assert.equal(request.promptCache.key, `support-${'a'.repeat(64)}`);
+});
+
+test('SIWC rejects invalid, falsy, Unicode-split and unbound prefix hints without dropping metadata', async t => {
+  for (const promptCache of [false, null, [], {}, { key: 'customer-id' }, { key: `support-${'a'.repeat(64)}`, extra: true },
+    ...[0, false, -1, 1.5, '1', 2, 4].map(userPrefixChars => ({ key: `support-${'a'.repeat(64)}`, userPrefixChars }))]) {
+    await t.test(JSON.stringify(promptCache), () => assert.throws(() => corelyPlanPayload(modelRequest({ user: 'a🙂b', promptCache }), 'info'), { code: 'INVALID_REQUEST' }));
+  }
+  const request = modelRequest({ promptCache: { key: `support-${'a'.repeat(64)}` } });
+  assert.throws(() => corelyPlanPayload({ ...request, promptCache: false }, 'info'), { code: 'INVALID_REQUEST' });
+  assert.throws(() => corelyPlanPayload({ ...request, promptCache: { key: `support-${'b'.repeat(64)}` } }, 'info'), { code: 'INPUT_MISMATCH' });
+});
+
+test('personal Responses forwards cache hints only as documented fields and never retries unsupported hints', async () => {
+  const session = { alias: 'info', planScopeGranted: true, accountMatchesExpected: true,
+    accessToken: 'synthetic-access', expiresAt: Date.now() + 300_000 };
+  const input = modelRequest({ promptCache: { key: `support-${'a'.repeat(64)}`, userPrefixChars: 9 } });
+  let catalogCalls = 0, modelCalls = 0;
+  await assert.rejects(runCorelyPlanRequest(session, input, async (url, init) => {
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-access');
+    if (url.endsWith('/models')) { catalogCalls++; return catalog(); }
+    modelCalls++;
+    const payload = JSON.parse(init.body);
+    assert.equal(payload.input[1].content.map(part => part.text).join(''), input.user);
+    assert.equal(payload.input[0].content[0].text, input.system);
+    assert.match(payload.prompt_cache_key, /^corely-plan-[a-f0-9]{64}$/);
+    return Response.json({ error: { code: 'subscription_sharing_unsupported_capability', param: 'prompt_cache_options' } }, { status: 400 });
+  }, new AbortController().signal), code('INFERENCE_HTTP_400'));
+  assert.equal(catalogCalls, 1); assert.equal(modelCalls, 1);
 });
 
 test('persistent SIWC ports generate and independently review separate requests with exact bound plan receipts', async t => {

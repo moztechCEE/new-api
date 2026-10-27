@@ -5,22 +5,26 @@ on:
     branches: ['codex/**']
     paths:
       - 'bin/siwc-local-*.mjs'
+      - 'bin/siwc-gateway-*.mjs'
       - 'bin/corely-model-contract.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
+      - 'relay/responses_websocket_test.go'
       - '.dockerignore'
   pull_request:
     paths:
       - 'bin/siwc-local-*.mjs'
+      - 'bin/siwc-gateway-*.mjs'
       - 'bin/corely-model-contract.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
+      - 'relay/responses_websocket_test.go'
       - '.dockerignore'
   workflow_dispatch:
 
@@ -28,6 +32,22 @@ permissions:
   contents: read
 
 jobs:
+  gateway-relay-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            relaykit/go.sum
+            tokenkit/go.sum
+      - name: Real Go Responses passthrough, SSE and first-attempt retry contract
+        run: go test ./relay -run '^TestSIWCGatewayResponsesPassthroughAndSingleAttempt$' -count=1
   local-protocol:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -48,6 +68,7 @@ jobs:
           node --check bin/siwc-local-vm.mjs
           node --check bin/siwc-local-sessions.test.mjs
           node --check bin/siwc-local-model-port.mjs
+          node --check bin/siwc-gateway-model-port.mjs
           node --check bin/siwc-local-corely-worker.mjs
           node --check bin/corely-model-contract.mjs
           node --check bin/corely-vm-model-job-client.mjs
@@ -66,7 +87,7 @@ jobs:
           node --check bin/codex-harness-model-job-client.mjs
           node --check bin/codex-harness-model-job-client.test.mjs
       - name: Run synthetic offline protocol regression
-        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs bin/siwc-gateway-model-port.test.mjs
       - name: Run synthetic offline harness regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-model-worker.test.mjs
       - name: Build and smoke-test the private VM runtime without network or credentials

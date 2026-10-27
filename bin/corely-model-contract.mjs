@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 const MODEL = 'gpt-6.1-sol';
 const MAX_BYTES = 1024 * 1024;
 const REQUEST_KEYS = new Set(['version', 'callId', 'workload', 'purpose', 'model', 'scope', 'system', 'user', 'responseFormat',
-  'responseSchema', 'image', 'reasoningEffort', 'verbosity', 'inputSha256', 'schemaSha256']);
+  'responseSchema', 'image', 'reasoningEffort', 'verbosity', 'promptCache', 'inputSha256', 'schemaSha256']);
 const WORKLOADS = new Set(['DECISION_LLM', 'REPLY_LLM', 'WEB_CHAT_VISION', 'MEDIA_IMAGE_ANALYSIS']);
 const PURPOSES = new Set(['semantic_reply_review', 'semantic_evidence_selection', 'support_decision', 'reply_generation',
   'reply_repair', 'structured_output', 'text_generation', 'image_analysis']);
@@ -130,6 +130,14 @@ function snapshotRequest(input) {
   if (!s || typeof s !== 'object' || Array.isArray(s) || Object.keys(s).some(key => !['tenantId', 'brandId', 'synthetic', 'jobId'].includes(key)) ||
       s.tenantId !== 'moztech' || s.brandId !== 'moztech-test' || s.synthetic !== true || typeof s.jobId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(s.jobId)) held('SCOPE_NOT_ADMITTED');
   if (Object.hasOwn(request, 'image')) held('UNSUPPORTED_CAPABILITY');
+  if (Object.hasOwn(request, 'promptCache')) {
+    const cache = request.promptCache, boundary = cache?.userPrefixChars;
+    if (!cache || typeof cache !== 'object' || Array.isArray(cache) ||
+        Object.keys(cache).some(key => !['key', 'userPrefixChars'].includes(key)) ||
+        typeof cache.key !== 'string' || !/^support-[a-f0-9]{64}$/.test(cache.key) ||
+        (Object.hasOwn(cache, 'userPrefixChars') && (!Number.isSafeInteger(boundary) || boundary <= 0 || boundary >= request.user.length ||
+          (/[\uD800-\uDBFF]/u.test(request.user[boundary - 1]) && /[\uDC00-\uDFFF]/u.test(request.user[boundary]))))) held('INVALID_REQUEST');
+  }
   if (request.responseSchema !== undefined && !supportsSchema(request.responseSchema)) held('UNSUPPORTED_CAPABILITY');
   const schemaHash = request.responseSchema === undefined ? null : digest(request.responseSchema);
   if (request.schemaSha256 !== schemaHash || !/^[a-f0-9]{64}$/.test(request.inputSha256 ?? '')) held('INPUT_MISMATCH');
