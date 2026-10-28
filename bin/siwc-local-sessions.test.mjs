@@ -113,7 +113,7 @@ test('SIWC prefix breakpoints preserve every prompt byte and isolate cache accou
   assert.equal(payload.input[1].content[0].text, prefix);
   assert.deepEqual(payload.input[1].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
   assert.equal(payload.input[1].content[1].prompt_cache_breakpoint, undefined);
-  assert.deepEqual(payload.prompt_cache_options, { mode: 'implicit' });
+  assert.equal(Object.hasOwn(payload, 'prompt_cache_options'), false);
   assert.match(payload.prompt_cache_key, /^corely-plan-[a-f0-9]{64}$/);
   assert.equal(payload.store, false); assert.equal(payload.stream, true);
   assert.deepEqual(payload.reasoning, { effort: 'low' }); assert.equal(payload.text.verbosity, 'low');
@@ -141,7 +141,7 @@ test('SIWC rejects invalid, falsy, Unicode-split and unbound prefix hints withou
   assert.throws(() => corelyPlanPayload({ ...request, promptCache: { key: `support-${'b'.repeat(64)}` } }, 'info'), { code: 'INPUT_MISMATCH' });
 });
 
-test('personal Responses forwards cache hints only as documented fields and never retries unsupported hints', async () => {
+test('personal Responses omits request-level cache options and never retries unsupported prefix hints', async () => {
   const session = { alias: 'info', planScopeGranted: true, accountMatchesExpected: true,
     accessToken: 'synthetic-access', expiresAt: Date.now() + 300_000 };
   const input = modelRequest({ promptCache: { key: `support-${'a'.repeat(64)}`, userPrefixChars: 9 } });
@@ -154,7 +154,9 @@ test('personal Responses forwards cache hints only as documented fields and neve
     assert.equal(payload.input[1].content.map(part => part.text).join(''), input.user);
     assert.equal(payload.input[0].content[0].text, input.system);
     assert.match(payload.prompt_cache_key, /^corely-plan-[a-f0-9]{64}$/);
-    return Response.json({ error: { code: 'subscription_sharing_unsupported_capability', param: 'prompt_cache_options' } }, { status: 400 });
+    assert.equal(Object.hasOwn(payload, 'prompt_cache_options'), false);
+    return Response.json({ error: { code: 'subscription_sharing_unsupported_capability',
+      param: 'input[0].content[0].prompt_cache_breakpoint' } }, { status: 400 });
   }, new AbortController().signal), code('INFERENCE_HTTP_400'));
   assert.equal(catalogCalls, 1); assert.equal(modelCalls, 1);
 });

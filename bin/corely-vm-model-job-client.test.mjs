@@ -71,7 +71,7 @@ function fixture(change = {}) {
         const value = { access_token: TOKEN, token_type: 'DPoP', expires_in: Math.floor((grantExpiry - clock) / 1000), scope: SCOPE };
         return change.token?.(value, init) ?? Response.json(value);
       }
-      assert.ok(['status', 'enroll', 'claim', 'complete'].some(operation => url === `${RESOURCE}/${operation}`), 'no arbitrary URL, customer, provider, API, or producer call');
+      assert.ok(['status', 'enroll', 'claim', 'complete', 'fail'].some(operation => url === `${RESOURCE}/${operation}`), 'no arbitrary URL, customer, provider, API, or producer call');
       const op = url.slice(RESOURCE.length + 1);
       assert.equal(init.headers.Authorization, `DPoP ${TOKEN}`); assertProof(init.headers.DPoP, url, init.method, TOKEN);
       if (change.resource) return change.resource(op, init, status());
@@ -83,6 +83,10 @@ function fixture(change = {}) {
           vmHostIdHash: HOST, keyThumbprint: thumbprint });
       }
       if (op === 'claim') { assert.deepEqual(body, { accountAlias: 'info' }); return Response.json({ lease, authMode: 'siwc_plan' }); }
+      if (op === 'fail') {
+        assert.deepEqual(body, { leaseId: lease.leaseId });
+        return change.fail?.(init) ?? Response.json({ held: true, reason: 'EXECUTION_UNAVAILABLE' });
+      }
       assert.equal(op, 'complete'); assert.equal(body.leaseId, lease.leaseId); assert.equal(body.result.text, result.text); completeCount++;
       return Response.json({ accepted: true, replayed: false, callId: request.callId,
         resultSha256: createHash('sha256').update(JSON.stringify(body.result)).digest('hex') });
@@ -94,7 +98,7 @@ function fixture(change = {}) {
 
 test('offline device + sender-constrained grant completes only one bound synthetic lease without exposing credentials', async () => {
   const f = fixture(), client = await connectCorelyVmModelJobs(f.options);
-  assert.deepEqual(Object.keys(client).sort(), ['receipt', 'modelStatus', 'enrollModels', 'claimModel', 'completeModel', 'close'].sort());
+  assert.deepEqual(Object.keys(client).sort(), ['receipt', 'modelStatus', 'enrollModels', 'claimModel', 'completeModel', 'failModel', 'close'].sort());
   const receipt = client.receipt(); assert.equal(receipt.apiFallbackEnabled, false); assert.equal(receipt.keyThumbprint, f.thumbprint);
   assert.doesNotMatch(JSON.stringify(receipt), /vm_models_access_|vm_models_device_|Synthetic generated|PRIVATE KEY/);
   assert.equal((await client.modelStatus()).producerConnected, false); assert.equal((await client.enrollModels()).enrolled, true);
@@ -103,6 +107,83 @@ test('offline device + sender-constrained grant completes only one bound synthet
   await assert.rejects(client.completeModel(lease.leaseId, f.result), isCode('MODEL_JOB_NOT_CURRENT')); assert.equal(f.completed(), 1);
   assert.deepEqual(f.waits, [5000]); assert.equal(f.calls.filter(call => call.url.endsWith('/token')).length, 1);
   assert.equal(client.close().remoteRevocation, 'NOT_PERFORMED'); await assert.rejects(client.modelStatus(), isCode('GRANT_CLOSED'));
+});
+
+test('terminal failure uses one sender-bound owned lease, fixed metadata only, then closes local authority', async () => {
+  const f = fixture(), client = await connectCorelyVmModelJobs(f.options);
+  const lease = await client.claimModel('info');
+  assert.deepEqual(await client.failModel(lease.leaseId), { held: true, reason: 'EXECUTION_UNAVAILABLE' });
+  await assert.rejects(client.failModel(lease.leaseId), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.completeModel(lease.leaseId, f.result), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.modelStatus(), isCode('GRANT_CLOSED'));
+  assert.equal(f.calls.filter(call => call.url.endsWith('/fail')).length, 1);
+  assert.equal(f.completed(), 0);
+});
+
+test('a terminal notification in flight blocks every subsequent operation before network', async () => {
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const f = fixture({ fail: () => { entered(); return new Promise(resolve => { release = resolve; }); } });
+  const client = await connectCorelyVmModelJobs(f.options), lease = await client.claimModel('info');
+  const stopping = client.failModel(lease.leaseId); await started;
+  const before = f.calls.length;
+  assert.throws(() => client.receipt(), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.modelStatus(), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.enrollModels(), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.claimModel('info'), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.completeModel(lease.leaseId, f.result), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.failModel(lease.leaseId), isCode('GRANT_CLOSED'));
+  assert.equal(f.calls.length, before);
+  release(Response.json({ held: true, reason: 'EXECUTION_UNAVAILABLE' }));
+  assert.deepEqual(await stopping, { held: true, reason: 'EXECUTION_UNAVAILABLE' });
+});
+
+test('unknown, expired, completed, explicitly closed or process-aborted leases cannot notify failure', async t => {
+  for (const state of ['unknown', 'expired lease', 'expired grant', 'completed', 'closed', 'aborted']) await t.test(state, async () => {
+    const controller = new AbortController(), f = fixture();
+    const client = await connectCorelyVmModelJobs({ ...f.options, signal: controller.signal });
+    const lease = await client.claimModel('info');
+    let leaseId = lease.leaseId, expected = 'MODEL_JOB_NOT_CURRENT';
+    if (state === 'unknown') leaseId = '11111111-1111-4111-8111-111111111111';
+    if (state === 'expired lease') f.advance(60_000);
+    if (state === 'expired grant') { f.advance(86_400_000); expected = 'GRANT_EXPIRED'; }
+    if (state === 'completed') await client.completeModel(leaseId, f.result);
+    if (state === 'closed') { client.close(); expected = 'GRANT_CLOSED'; }
+    if (state === 'aborted') { controller.abort(); expected = 'ABORTED'; }
+    await assert.rejects(client.failModel(leaseId), isCode(expected));
+    assert.equal(f.calls.filter(call => call.url.endsWith('/fail')).length, 0); client.close();
+  });
+});
+
+test('lost, rejected, duplicate, escaped, oversized or malformed failure receipts never retry or claim success', async t => {
+  for (const [name, response, expected] of [
+    ['lost', () => new Promise(() => {}), 'RESOURCE_REQUEST_UNCERTAIN'],
+    ['rejected', () => Response.json({ held: true, reason: 'EXECUTION_UNAVAILABLE' }, { status: 403 }), 'RESOURCE_RESPONSE_INVALID'],
+    ['wrong reason', () => Response.json({ held: true, reason: 'PRIVATE_PROVIDER_MESSAGE' }), 'RESOURCE_RESPONSE_INVALID'],
+    ['extra', () => Response.json({ held: true, reason: 'EXECUTION_UNAVAILABLE', result: 'PRIVATE_RESULT' }), 'RESOURCE_RESPONSE_INVALID'],
+    ['duplicate', () => new Response('{"held":false,"held":true,"reason":"EXECUTION_UNAVAILABLE"}', { headers: { 'content-type': 'application/json' } }), 'RESOURCE_RESPONSE_INVALID'],
+    ['escaped', () => new Response('{"h\\u0065ld":true,"reason":"EXECUTION_UNAVAILABLE"}', { headers: { 'content-type': 'application/json' } }), 'RESOURCE_RESPONSE_INVALID'],
+    ['oversized', () => new Response(' '.repeat(4097), { headers: { 'content-type': 'application/json' } }), 'RESOURCE_RESPONSE_INVALID'],
+  ]) await t.test(name, async () => {
+    const f = fixture({ fail: response }), client = await connectCorelyVmModelJobs({ ...f.options, requestTimeoutMs: 10 });
+    const lease = await client.claimModel('info');
+    await assert.rejects(client.failModel(lease.leaseId), isCode(expected));
+    await assert.rejects(client.failModel(lease.leaseId), isCode('GRANT_CLOSED'));
+    assert.equal(f.calls.filter(call => call.url.endsWith('/fail')).length, 1);
+    assert.equal(f.completed(), 0);
+  });
+});
+
+test('uncertain completion has consumed its lease and cannot be resubmitted as a failure', async () => {
+  const f = fixture({ resource: (op, _init) => {
+    if (op === 'claim') return Response.json({ lease: f.lease, authMode: 'siwc_plan' });
+    throw new Error('PRIVATE_LOST_COMPLETION');
+  } });
+  const client = await connectCorelyVmModelJobs(f.options), lease = await client.claimModel('info');
+  await assert.rejects(client.completeModel(lease.leaseId, f.result), isCode('RESOURCE_REQUEST_UNCERTAIN'));
+  await assert.rejects(client.failModel(lease.leaseId), isCode('RESOURCE_REQUEST_UNCERTAIN'));
+  assert.equal(f.calls.filter(call => call.url.endsWith('/complete')).length, 1);
+  assert.equal(f.calls.filter(call => call.url.endsWith('/fail')).length, 0); client.close();
 });
 
 test('authorization_pending and slow_down are the only pollable token outcomes and produce fresh DPoP proofs', async () => {

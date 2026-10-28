@@ -20,6 +20,8 @@ export function corelyPlanPayload(input, accountAlias) {
   // Cache accounting is isolated by verified account, tenant, brand and the
   // exact reusable wire prefix/schema/settings. It never caches a reply or
   // permits skipping an independent review. Full prompt bytes remain ordered.
+  // Implicit caching is the provider default; do not force request-level
+  // cache options that the plan route rejects. Keep the existing prefix hints.
   const cacheKey = cache ? `corely-plan-${digest(JSON.stringify([accountAlias, request.scope.tenantId,
     request.scope.brandId, request.purpose, MODEL, cache.key, request.system,
     cache.userPrefixChars === undefined ? '' : request.user.slice(0, cache.userPrefixChars),
@@ -32,7 +34,7 @@ export function corelyPlanPayload(input, accountAlias) {
     ...(cache ? { input: [
       { role: 'developer', content: [{ type: 'input_text', text: request.system, prompt_cache_breakpoint: { mode: 'explicit' } }] },
       { role: 'user', content: userContent },
-    ], prompt_cache_key: cacheKey, prompt_cache_options: { mode: 'implicit' } }
+    ], prompt_cache_key: cacheKey }
       : { instructions: request.system, input: [{ role: 'user', content: request.user }] }),
     store: false, stream: true,
     ...(Object.keys(text).length ? { text } : {}),

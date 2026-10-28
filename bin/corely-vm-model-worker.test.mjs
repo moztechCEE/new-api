@@ -155,9 +155,9 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
       }
       providerCalls++; assert.equal(url, 'https://api.openai.com/v1/responses');
       const payload = JSON.parse(init.body);
-      assert.equal(payload.input[0].role, 'developer'); assert.deepEqual(payload.prompt_cache_options, { mode: 'implicit' });
+      assert.equal(payload.input[0].role, 'developer'); assert.equal(Object.hasOwn(payload, 'prompt_cache_options'), false);
       assert.equal(Object.hasOwn(payload, 'metadata'), false);
-      return Response.json({ error: { type: 'invalid_request_error', param: 'prompt_cache_options',
+      return Response.json({ error: { type: 'invalid_request_error', param: 'input[0].content[0].prompt_cache_breakpoint',
         code: 'PRIVATE_PROVIDER_CODE', message: 'PRIVATE_PROVIDER_INPUT_AND_CREDENTIAL' } }, { status: 400 });
     }, signal);
   };
@@ -176,9 +176,10 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
   assert.deepEqual(aliases, ['info']); assert.deepEqual(worker.claims, ['info']);
   assert.equal(catalogCalls, 1); assert.equal(providerCalls, 1); assert.equal(gatewayCalls, 1);
   assert.equal(worker.completions.length, 0); assert.equal(worker.closed(), 1);
+  assert.equal(worker.failures.length, 1);
   assert.deepEqual(diagnostics.slice(1), [
     { stage: 'BRIDGE_SESSION', reason: 'INFERENCE_HTTP_ERROR', httpStatus: 400, consumed: true,
-      providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'CACHE_OPTIONS' },
+      providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'INPUT_BREAKPOINT' },
     { stage: 'GATEWAY_FETCH', reason: 'GATEWAY_CALL_ABORTED', httpStatus: null, consumed: true },
   ]);
   const emitted = JSON.stringify(diagnostics.map(value => ({ status: 'CORELY_DEV_SIWC_GATEWAY_DIAGNOSTIC', ...value })));
@@ -233,8 +234,8 @@ function request(purpose, index) {
   return { ...content, inputSha256: digest(JSON.stringify(canonical(content))) };
 }
 function workerFixture({ purposes = ['support_decision', 'reply_generation', 'semantic_reply_review'], quota = false,
-  statusChange, generateChange, completeChange, maintainChange } = {}) {
-  const controller = new AbortController(), events = [], claims = [], generated = [], completions = [], sleeps = [];
+  statusChange, generateChange, completeChange, maintainChange, failureChange } = {}) {
+  const controller = new AbortController(), events = [], claims = [], generated = [], completions = [], failures = [], sleeps = [];
   let index = 0, closed = 0, statusReads = 0, infoQuota = false;
   const state = { status: 'SYNTHETIC_VM_MODEL_TRANSPORT_V2', contractVersion: 2, producerConnected: true, authMode: 'siwc_plan',
     enrolled: true, syntheticOnly: true, tenantId: 'moztech', brandId: 'moztech-test', scope: SCOPE,
@@ -268,12 +269,18 @@ function workerFixture({ purposes = ['support_decision', 'reply_generation', 'se
       index++;
       return { accepted: true, replayed: false, callId: result.callId, resultSha256: digest(JSON.stringify(result)) };
     },
+    failModel: async (leaseId, signal) => {
+      controller.signal.throwIfAborted();
+      failures.push(leaseId);
+      assert.ok(signal instanceof AbortSignal); assert.equal(signal.aborted, false);
+      return failureChange ? failureChange(leaseId, signal) : { held: true, reason: 'EXECUTION_UNAVAILABLE' };
+    },
     close: () => { closed++; },
   };
   const options = { client, ports: createSiwcModelTransports(sessions), signal: controller.signal, onReceipt: async receipt => { events.push(receipt); },
     sleep: async ms => { sleeps.push(ms); }, pollIntervalMs: 1000, maxJobs: purposes.length || 1, maxIdlePolls: 2,
     producerWaitMs: 2000, maintainSessions: maintainChange ?? (async () => {}) };
-  return { options, controller, events, claims, generated, completions, sleeps, closed: () => closed };
+  return { options, controller, events, claims, generated, completions, failures, sleeps, closed: () => closed };
 }
 
 test('resident loop serially completes decision, generation and independent review through real bound model helpers', async () => {
@@ -328,6 +335,7 @@ test('only a server-enqueued Eason job after bound Info quota is consumed; ordin
     await assert.rejects(runCorelyVmModelWorker(held.options), code('WORKER_EXECUTION_HELD'));
     assert.deepEqual(held.generated.map(call => call.alias), ['info']); assert.deepEqual(held.claims, ['info']);
     assert.equal(held.completions.length, 0); assert.equal(held.closed(), 1);
+    assert.equal(held.failures.length, 1); assert.equal(held.events.at(-1).status, 'CORELY_VM_MODEL_WORKER_REMOTE_HELD');
   });
 });
 
@@ -342,6 +350,7 @@ test('legacy, missing producer, lost authority and maintenance failure hold befo
     await assert.rejects(runCorelyVmModelWorker(f.options), code(kind === 'legacy' ? 'WORKER_AUTHORITY_HELD'
       : kind === 'producer missing' ? 'WORKER_PRODUCER_NOT_READY' : 'WORKER_EXECUTION_HELD'));
     assert.equal(f.generated.length, 0); assert.equal(f.claims.length, 0); assert.equal(f.closed(), 1);
+    assert.equal(f.failures.length, 0);
     if (kind === 'producer missing') assert.deepEqual(f.sleeps, [1000, 1000]);
   });
 });
@@ -363,6 +372,49 @@ test('uncertain or revoked completion is one-shot and never regenerated', async 
   await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_EXECUTION_HELD'));
   assert.equal(f.generated.length, 1); assert.equal(f.completions.length, 1); assert.equal(f.closed(), 1);
   assert.equal(f.events.length, 1);
+  assert.equal(f.failures.length, 0);
+});
+
+test('each failed model phase stops once without retry, rotation, next phase or raw error receipt', async t => {
+  for (const purpose of ['support_decision', 'reply_generation', 'semantic_reply_review']) await t.test(purpose, async () => {
+    const f = workerFixture({ purposes: [purpose, 'reply_generation'], generateChange: async () => { throw new Error('PRIVATE_PROVIDER_INPUT'); } });
+    await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_EXECUTION_HELD'));
+    assert.equal(f.generated.length, 1); assert.equal(f.failures.length, 1); assert.deepEqual(f.claims, ['info']);
+    assert.equal(f.completions.length, 0); assert.equal(f.closed(), 1);
+    assert.deepEqual(f.events.at(-1), { status: 'CORELY_VM_MODEL_WORKER_REMOTE_HELD', reason: 'EXECUTION_UNAVAILABLE',
+      apiFallbackUsed: false, sendingPerformed: false, learningPerformed: false });
+    assert.doesNotMatch(JSON.stringify(f.events), /PRIVATE_PROVIDER|SYNTHETIC_PRIVATE|leaseId/);
+  });
+});
+
+test('gateway cancellation can notify once using separate live authority without reopening inference', async () => {
+  const inference = new AbortController();
+  const f = workerFixture({ generateChange: async () => { inference.abort(); return new Promise(() => {}); } });
+  f.options.signal = inference.signal;
+  await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_ABORTED'));
+  assert.equal(f.failures.length, 1); assert.equal(f.generated.length, 1); assert.deepEqual(f.claims, ['info']);
+  assert.equal(f.events.at(-1).status, 'CORELY_VM_MODEL_WORKER_REMOTE_HELD'); assert.equal(f.closed(), 1);
+});
+
+test('unconfirmed or malformed terminal hold is not retried or reported as confirmed', async t => {
+  for (const kind of ['lost', 'malformed']) await t.test(kind, async () => {
+    const f = workerFixture({ generateChange: async () => { throw new Error('PRIVATE_PROVIDER_INPUT'); }, failureChange: async () => {
+      if (kind === 'lost') throw new Error('PRIVATE_LOST_STOP');
+      return { held: true, reason: 'EXECUTION_UNAVAILABLE', extra: true };
+    } });
+    await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_EXECUTION_HELD'));
+    assert.equal(f.failures.length, 1); assert.equal(f.events.at(-1).status, 'CORELY_VM_MODEL_WORKER_STOP_UNCONFIRMED');
+    assert.equal(f.closed(), 1); assert.equal(f.generated.length, 1);
+  });
+});
+
+test('terminal notification is bounded even when its transport ignores cancellation', async () => {
+  const f = workerFixture({ generateChange: async () => { throw new Error('PRIVATE_PROVIDER_INPUT'); }, failureChange: () => new Promise(() => {}) });
+  const keepAlive = setInterval(() => {}, 1000);
+  try { await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_EXECUTION_HELD')); }
+  finally { clearInterval(keepAlive); }
+  assert.equal(f.failures.length, 1); assert.equal(f.closed(), 1); assert.equal(f.generated.length, 1);
+  assert.equal(f.events.some(event => event.status === 'CORELY_VM_MODEL_WORKER_REMOTE_HELD'), false);
 });
 
 test('abort interrupts an uncooperative inference without completing or polling another lease', async () => {
@@ -371,6 +423,7 @@ test('abort interrupts an uncooperative inference without completing or polling 
   const running = runCorelyVmModelWorker(f.options); await started; f.controller.abort();
   await assert.rejects(running, code('WORKER_ABORTED'));
   assert.equal(f.generated.length, 1); assert.equal(f.completions.length, 0); assert.equal(f.closed(), 1); assert.deepEqual(f.claims, ['info']);
+  assert.equal(f.failures.length, 0);
 });
 
 test('idle bounds stop without spending model allowance, and CLI accepts no credential/model/endpoint overrides', async () => {

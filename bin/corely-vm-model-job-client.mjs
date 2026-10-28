@@ -41,7 +41,7 @@ function waitInterval(ms, signal) {
 
 /** Only called with this module's fixed TLS endpoints. No redirects, cookies,
  * retries, logging, unbounded bodies, or raw provider errors escape here. */
-async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, token, signal, requestTimeoutMs, limit = 16_384, kind }) {
+async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, token, signal, requestTimeoutMs, limit = 16_384, kind, flatResponse = false }) {
   const controller = new AbortController(), abort = () => controller.abort(failure('ABORTED'));
   const uncertain = kind === 'token' ? 'TOKEN_EXCHANGE_UNCERTAIN' : kind === 'resource' ? 'RESOURCE_REQUEST_UNCERTAIN' : 'AUTHORIZATION_FAILED';
   const invalid = kind === 'token' ? 'TOKEN_RESPONSE_INVALID' : kind === 'resource' ? 'RESOURCE_RESPONSE_INVALID' : 'DEVICE_RESPONSE_INVALID';
@@ -72,7 +72,7 @@ async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, 
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw failure(invalid);
     // Both OAuth responses are flat, fixed-field JSON. Reject escaped or
     // duplicate member names instead of accepting ambiguous credentials.
-    if (kind !== 'resource') {
+    if (kind !== 'resource' || flatResponse) {
       const names = [...text.matchAll(/"([a-z_]+)"\s*:/g)].map(match => match[1]);
       if (text.includes('\\') || names.length !== Object.keys(value).length || new Set(names).size !== names.length) throw failure(invalid);
     }
@@ -193,25 +193,26 @@ export async function connectCorelyVmModelJobs(options = {}) {
     if (transaction.signal.aborted && transaction.signal.reason instanceof VmModelJobClientError) throw transaction.signal.reason;
     throw failure('AUTHORIZATION_FAILED');
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
-  let closed = false, held = false;
+  let closed = false, held = false, stopping = false;
   const leases = new Map();
   const close = () => { closed = true; token = ''; leases.clear(); signal?.removeEventListener('abort', close); };
   signal?.addEventListener('abort', close, { once: true });
-  const live = () => {
+  const live = (terminal = false) => {
     if (signal?.aborted) { close(); throw failure('ABORTED'); }
     if (closed || !token) throw failure('GRANT_CLOSED');
+    if (stopping && !terminal) throw failure('GRANT_CLOSED');
     if (held) throw failure('RESOURCE_REQUEST_UNCERTAIN');
     if (readClock() >= expiresAt || readMonotonic() - tokenStarted >= grantLifetime) { close(); throw failure('GRANT_EXPIRED'); }
   };
-  const resource = async (operation, body, operationSignal) => {
-    live();
+  const resource = async (operation, body, operationSignal, { limit = 1024 * 1024, flatResponse = false, timeoutMs = requestTimeoutMs, terminal = false } = {}) => {
+    live(terminal);
     if (operationSignal !== undefined && !(operationSignal instanceof AbortSignal)) throw failure('INVALID_OPTIONS');
     const active = signal && operationSignal ? AbortSignal.any([signal, operationSignal]) : signal ?? operationSignal;
     const endpoint = `${CORELY_VM_MODEL_JOB_RESOURCE}/${operation}`, method = operation === 'status' ? 'GET' : 'POST';
     try {
-      const value = await requestJson(endpoint, { fetchImpl, requestTimeoutMs, signal: active, kind: 'resource', method, body,
-        token, proof: proof(endpoint, method, token), limit: 1024 * 1024 });
-      live(); return value;
+      const value = await requestJson(endpoint, { fetchImpl, requestTimeoutMs: timeoutMs, signal: active, kind: 'resource', method, body,
+        token, proof: proof(endpoint, method, token), limit, flatResponse });
+      live(terminal); return value;
     } catch (error) { held = true; throw error; }
   };
   const bindingValid = value => value.vmHostIdHash === CORELY_VM_HOST_ID_HASH && value.keyThumbprint === keyThumbprint;
@@ -271,6 +272,22 @@ export async function connectCorelyVmModelJobs(options = {}) {
       if (lease.expiresAt <= readClock() || Object.keys(value).length !== 4 || value.accepted !== true || typeof value.replayed !== 'boolean' ||
           value.callId !== lease.request.callId || value.resultSha256 !== expected) throw failure('RESOURCE_RESPONSE_INVALID');
       return Object.freeze({ ...value });
+    },
+    async failModel(leaseId, operationSignal) {
+      live(); const lease = leases.get(leaseId);
+      if (!lease || lease.expiresAt <= readClock()) throw failure('MODEL_JOB_NOT_CURRENT');
+      // Only an owned, still-leased call can stop this grant. A failed or lost
+      // completion has already consumed its local lease and cannot be retried
+      // here. No prompt, result, provider error or credential enters this body.
+      leases.delete(leaseId);
+      stopping = true;
+      try {
+        const value = await resource('fail', { leaseId }, operationSignal,
+          { limit: 4096, flatResponse: true, timeoutMs: Math.min(requestTimeoutMs, 5000), terminal: true });
+        if (lease.expiresAt <= readClock() || Object.keys(value).length !== 2 || value.held !== true ||
+            value.reason !== 'EXECUTION_UNAVAILABLE') throw failure('RESOURCE_RESPONSE_INVALID');
+        return Object.freeze({ held: true, reason: 'EXECUTION_UNAVAILABLE' });
+      } finally { close(); }
     },
     close() { close(); return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'NOT_PERFORMED' }); },
   });

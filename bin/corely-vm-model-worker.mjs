@@ -298,12 +298,12 @@ const readyStatus = status => status?.status === 'SYNTHETIC_VM_MODEL_TRANSPORT_V
  * this loop cannot create work, approve a draft, send, learn, or retry ambiguity. */
 export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt = async () => {}, sleep = (ms, signal) => delay(ms, undefined, { signal }),
   pollIntervalMs = 1000, maxJobs = 1000, maxIdlePolls = 86400, producerWaitMs = 60000, maintainSessions = async () => {} } = {}) {
-  if (!client || !['receipt', 'enrollModels', 'modelStatus', 'claimModel', 'completeModel', 'close'].every(key => typeof client[key] === 'function') ||
+  if (!client || !['receipt', 'enrollModels', 'modelStatus', 'claimModel', 'completeModel', 'failModel', 'close'].every(key => typeof client[key] === 'function') ||
       !(signal instanceof AbortSignal) || typeof onReceipt !== 'function' || typeof sleep !== 'function' || typeof maintainSessions !== 'function' ||
       !Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1000 || pollIntervalMs > 30000 ||
       !Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 1000 || !Number.isSafeInteger(maxIdlePolls) || maxIdlePolls < 1 || maxIdlePolls > 86400 ||
       !Number.isSafeInteger(producerWaitMs) || producerWaitMs < 1000 || producerWaitMs > 60000) fail('WORKER_OPTIONS_INVALID');
-  let completed = 0, idle = 0;
+  let completed = 0, idle = 0, currentLease = null;
   const emit = value => bounded(Promise.resolve().then(() => onReceipt(value)), signal, 5000, 'WORKER_EVENT_UNCONFIRMED');
   const guarded = Object.freeze({
     async modelStatus(active) {
@@ -311,7 +311,19 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
       if (!readyStatus(status)) fail('WORKER_AUTHORITY_HELD');
       return status;
     },
-    claimModel: (...args) => client.claimModel(...args), completeModel: (...args) => client.completeModel(...args),
+    async claimModel(...args) {
+      if (currentLease !== null) fail('WORKER_AUTHORITY_HELD');
+      const lease = await client.claimModel(...args);
+      if (lease !== null) currentLease = lease;
+      return lease;
+    },
+    async completeModel(...args) {
+      if (currentLease?.leaseId !== args[0]) fail('WORKER_AUTHORITY_HELD');
+      // Completion is one-shot. Its uncertain receipt must never become a
+      // second authenticated submission through the terminal-failure path.
+      currentLease = null;
+      return client.completeModel(...args);
+    },
   });
   try {
     signal.throwIfAborted(); const receipt = client.receipt();
@@ -350,6 +362,24 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
         apiFallbackUsed: false, sendingPerformed: false, learningPerformed: false });
     }
   } catch (error) {
+    if (currentLease !== null) {
+      const leaseId = currentLease.leaseId; currentLease = null;
+      // Inference cancellation and authority cancellation are distinct. This
+      // bounded, single attempt still requires the client's live grant and
+      // owned unexpired lease; explicit user/process stop closes that grant.
+      const stopSignal = AbortSignal.timeout(5000);
+      let confirmed = false;
+      try {
+        const receipt = await bounded(Promise.resolve().then(() => client.failModel(leaseId, stopSignal)), stopSignal, 5000);
+        confirmed = exact(receipt, ['held', 'reason']) && receipt.held === true && receipt.reason === 'EXECUTION_UNAVAILABLE';
+      } catch { /* A missing stop receipt is not a successful remote hold. */ }
+      if (!stopSignal.aborted) try {
+        await bounded(Promise.resolve().then(() => onReceipt(Object.freeze({
+          status: confirmed ? 'CORELY_VM_MODEL_WORKER_REMOTE_HELD' : 'CORELY_VM_MODEL_WORKER_STOP_UNCONFIRMED',
+          reason: 'EXECUTION_UNAVAILABLE', apiFallbackUsed: false, sendingPerformed: false, learningPerformed: false,
+        }))), stopSignal, 5000, 'WORKER_EVENT_UNCONFIRMED');
+      } catch { /* Preserve the original execution failure. */ }
+    }
     if (signal.aborted) fail('WORKER_ABORTED');
     if (error instanceof VmModelWorkerError) throw error;
     fail('WORKER_EXECUTION_HELD');
@@ -381,7 +411,9 @@ export async function runVmModelWorkerCommand(argv) {
       safe(gateway.receipt());
     }
     const active = gateway?.signal ?? controller.signal;
-    const client = await identity.connect({ signal: active, onAuthorize: async value => {
+    // Gateway failure stops inference, but leaves at most one bounded terminal
+    // notification possible. SIGINT/SIGTERM still closes authority immediately.
+    const client = await identity.connect({ signal: controller.signal, onAuthorize: async value => {
       safe(await lifecycle.presentConsent(value));
     } });
     await lifecycle.clearConsent();
