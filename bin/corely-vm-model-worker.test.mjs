@@ -155,9 +155,10 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
       }
       providerCalls++; assert.equal(url, 'https://api.openai.com/v1/responses');
       const payload = JSON.parse(init.body);
-      assert.equal(payload.input[0].role, 'developer'); assert.equal(Object.hasOwn(payload, 'prompt_cache_options'), false);
+      assert.equal(payload.instructions, input.system); assert.deepEqual(payload.input, [{ role: 'user', content: input.user }]);
+      assert.doesNotMatch(JSON.stringify(payload), /prompt_cache_|cache_control/);
       assert.equal(Object.hasOwn(payload, 'metadata'), false);
-      return Response.json({ error: { type: 'invalid_request_error', param: 'input[0].content[0].prompt_cache_breakpoint',
+      return Response.json({ error: { type: 'invalid_request_error', param: 'synthetic_parameter',
         code: 'PRIVATE_PROVIDER_CODE', message: 'PRIVATE_PROVIDER_INPUT_AND_CREDENTIAL' } }, { status: 400 });
     }, signal);
   };
@@ -179,7 +180,7 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
   assert.equal(worker.failures.length, 1);
   assert.deepEqual(diagnostics.slice(1), [
     { stage: 'BRIDGE_SESSION', reason: 'INFERENCE_HTTP_ERROR', httpStatus: 400, consumed: true,
-      providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'INPUT_BREAKPOINT' },
+      providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'OTHER' },
     { stage: 'GATEWAY_FETCH', reason: 'GATEWAY_CALL_ABORTED', httpStatus: null, consumed: true },
   ]);
   const emitted = JSON.stringify(diagnostics.map(value => ({ status: 'CORELY_DEV_SIWC_GATEWAY_DIAGNOSTIC', ...value })));
@@ -228,7 +229,7 @@ test('replaced consent inode is never deleted and malformed authorization cannot
 });
 
 function request(purpose, index) {
-  const content = { version: 1, callId: `synthetic-call-${index}`, workload: purpose === 'support_decision' ? 'DECISION_LLM' : 'REPLY_LLM',
+  const content = { version: 1, callId: `synthetic-call-${index}`, workload: ['semantic_evidence_selection', 'support_decision'].includes(purpose) ? 'DECISION_LLM' : 'REPLY_LLM',
     purpose, model: MODEL, scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: 'server-synthetic-job' },
     system: 'SYNTHETIC_PRIVATE_PROMPT', user: 'SYNTHETIC_PRIVATE_QUESTION', schemaSha256: null };
   return { ...content, inputSha256: digest(JSON.stringify(canonical(content))) };
@@ -283,13 +284,14 @@ function workerFixture({ purposes = ['support_decision', 'reply_generation', 'se
   return { options, controller, events, claims, generated, completions, failures, sleeps, closed: () => closed };
 }
 
-test('resident loop serially completes decision, generation and independent review through real bound model helpers', async () => {
-  const f = workerFixture(), result = await runCorelyVmModelWorker(f.options);
-  assert.equal(result.reason, 'JOB_LIMIT'); assert.equal(result.completed, 3); assert.equal(f.closed(), 1);
-  assert.deepEqual(f.generated.map(call => call.purpose), ['support_decision', 'reply_generation', 'semantic_reply_review']);
-  assert.equal(new Set(f.generated.map(call => call.callId)).size, 3);
-  assert.ok(f.generated.every(call => call.alias === 'info')); assert.deepEqual(f.claims, ['info', 'info', 'info']);
-  assert.equal(f.completions.length, 3); assert.equal(f.events.length, 4);
+test('resident loop serially completes evidence selection, decision, generation and independent review through real bound model helpers', async () => {
+  const purposes = ['semantic_evidence_selection', 'support_decision', 'reply_generation', 'semantic_reply_review'];
+  const f = workerFixture({ purposes }), result = await runCorelyVmModelWorker(f.options);
+  assert.equal(result.reason, 'JOB_LIMIT'); assert.equal(result.completed, 4); assert.equal(f.closed(), 1);
+  assert.deepEqual(f.generated.map(call => call.purpose), purposes);
+  assert.equal(new Set(f.generated.map(call => call.callId)).size, 4);
+  assert.ok(f.generated.every(call => call.alias === 'info')); assert.deepEqual(f.claims, ['info', 'info', 'info', 'info']);
+  assert.equal(f.completions.length, 4); assert.equal(f.events.length, 5);
   assert.doesNotMatch(JSON.stringify(f.events), /SYNTHETIC_PRIVATE|access_token|refresh_token|PRIVATE KEY/);
   assert.ok(f.events.every(event => event.apiFallbackUsed === false && event.sendingPerformed === false && event.learningPerformed === false));
 });

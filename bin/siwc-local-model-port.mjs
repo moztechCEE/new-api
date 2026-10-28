@@ -1,7 +1,7 @@
 // Private, owner-operated synthetic Corely model port. No listener, API key,
 // native credential cache, tool execution, sending or learning capability.
 import { randomUUID } from 'node:crypto';
-import { MODEL, RESOURCE, ProbeError, digest, publicJson, selectExactModel, consumePlanTextStream,
+import { MODEL, RESOURCE, ProbeError, publicJson, selectExactModel, consumePlanTextStream,
   inferenceFailureDiagnostic } from './siwc-local-runtime.mjs';
 import { snapshotModelRequest, validateModelOutput } from './corely-model-contract.mjs';
 
@@ -15,27 +15,13 @@ export function corelyPlanPayload(input, accountAlias) {
   if (request.responseSchema) text.format = { type: 'json_schema', name: 'corely_model_output', strict: true, schema: request.responseSchema };
   else if (request.responseFormat === 'json') text.format = { type: 'json_object' };
   if (request.verbosity) text.verbosity = request.verbosity;
-  const cache = request.promptCache;
-  if (cache && accountAlias === undefined) throw new ProbeError('MODEL_PORT_INVALID');
-  // Cache accounting is isolated by verified account, tenant, brand and the
-  // exact reusable wire prefix/schema/settings. It never caches a reply or
-  // permits skipping an independent review. Full prompt bytes remain ordered.
-  // Implicit caching is the provider default; do not force request-level
-  // cache options that the plan route rejects. Keep the existing prefix hints.
-  const cacheKey = cache ? `corely-plan-${digest(JSON.stringify([accountAlias, request.scope.tenantId,
-    request.scope.brandId, request.purpose, MODEL, cache.key, request.system,
-    cache.userPrefixChars === undefined ? '' : request.user.slice(0, cache.userPrefixChars),
-    request.schemaSha256, request.reasoningEffort ?? null, request.verbosity ?? null]))}` : undefined;
-  const userContent = cache?.userPrefixChars === undefined ? request.user : [
-    { type: 'input_text', text: request.user.slice(0, cache.userPrefixChars), prompt_cache_breakpoint: { mode: 'explicit' } },
-    { type: 'input_text', text: request.user.slice(cache.userPrefixChars) },
-  ];
-  return Object.freeze({ request, payload: Object.freeze({ model: MODEL,
-    ...(cache ? { input: [
-      { role: 'developer', content: [{ type: 'input_text', text: request.system, prompt_cache_breakpoint: { mode: 'explicit' } }] },
-      { role: 'user', content: userContent },
-    ], prompt_cache_key: cacheKey }
-      : { instructions: request.system, input: [{ role: 'user', content: request.user }] }),
+  if (request.promptCache && accountAlias === undefined) throw new ProbeError('MODEL_PORT_INVALID');
+  // SIWC uses one conservative wire profile for every account and purpose.
+  // Validated optimization hints remain bound to the original request/hash,
+  // but optional API cache fields are not forwarded on this plan route. Keep
+  // every prompt byte and the independent output/review contracts unchanged.
+  return Object.freeze({ request, payload: Object.freeze({ model: MODEL, instructions: request.system,
+    input: [{ role: 'user', content: request.user }],
     store: false, stream: true,
     ...(Object.keys(text).length ? { text } : {}),
     ...(request.reasoningEffort ? { reasoning: { effort: request.reasoningEffort } } : {}) }) });

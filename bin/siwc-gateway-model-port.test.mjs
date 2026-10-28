@@ -86,23 +86,39 @@ test('Gateway and private bridge retain strict structured facts, identity, usage
   await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
 });
 
-test('prefix hints cross the Gateway without losing bytes or leaking its nonce to SIWC; accounts keep separate cache keys', async t => {
-  const state = harness(t), user = 'Stable synthetic facts.\nCurrent synthetic request.';
-  const options = { user, promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 'Stable synthetic facts.'.length } };
+test('bound hints cross the Gateway while both accounts send the complete conservative SIWC profile without its nonce', async t => {
+  const providerCalls = [], prefix = '固定合成事實🙂\r\n', user = prefix + '本輪合成問題。\r\n補充內容。';
+  const system = '完整合成規範\r\n不可省略獨立覆核🙂';
+  const state = harness(t, { generate: (alias, original, signal) => runCorelyPlanRequest({ alias,
+    planScopeGranted: true, accountMatchesExpected: true, accessToken: `synthetic-${alias}-access`, expiresAt: Date.now() + 300_000 },
+  original, async (url, init) => {
+    assert.equal(init.headers.Authorization, `Bearer synthetic-${alias}-access`);
+    if (url.endsWith('/models')) return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+    assert.equal(url, 'https://api.openai.com/v1/responses');
+    const payload = JSON.parse(init.body); providerCalls.push({ alias, payload });
+    assert.equal(payload.instructions, system); assert.deepEqual(payload.input, [{ role: 'user', content: user }]);
+    assert.equal(Object.hasOwn(payload, 'metadata'), false); assert.doesNotMatch(JSON.stringify(payload), /prompt_cache_|cache_control|corely_siwc_nonce/);
+    return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: {
+      id: `synthetic-${alias}-response`, status: 'completed', model: MODEL,
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '合成客服答案🙂' }] }],
+      usage: { input_tokens: 23, output_tokens: 7, total_tokens: 30, input_tokens_details: { cached_tokens: 3 } },
+    } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+  }, signal) });
+  const options = { system, user, promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: prefix.length } };
   for (const alias of ['info', 'eason']) {
     const request = requestFixture(`prefix-${alias}`, options);
     const result = await state.instance.ports[alias].generate(request, new AbortController().signal);
-    assert.equal(result.status, 'success'); assert.equal(result.accountAlias, alias);
+    assert.equal(result.status, 'success'); assert.equal(result.accountAlias, alias); assert.equal(result.inputSha256, request.inputSha256);
     assert.deepEqual(state.calls.at(-1).request.promptCache, options.promptCache);
     assert.equal(state.calls.at(-1).request.user, user); assert.equal(Object.hasOwn(state.calls.at(-1).request, 'metadata'), false);
     const wire = JSON.parse(state.requests.at(-1).init.body);
-    assert.equal(wire.input[0].role, 'developer');
-    assert.equal(wire.input[1].content.map(block => block.text).join(''), user);
-    assert.deepEqual(wire.input[1].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
-    assert.equal(Object.hasOwn(wire, 'prompt_cache_retention'), false);
+    assert.match(wire.metadata.corely_siwc_nonce, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(wire.instructions, system); assert.deepEqual(wire.input, [{ role: 'user', content: user }]);
+    assert.doesNotMatch(JSON.stringify(wire), /prompt_cache_|cache_control/);
   }
-  assert.notEqual(JSON.parse(state.requests[0].init.body).prompt_cache_key, JSON.parse(state.requests[1].init.body).prompt_cache_key);
-  assert.equal(state.calls.length, 2);
+  assert.equal(state.calls.length, 2); assert.equal(providerCalls.length, 2);
+  assert.deepEqual(providerCalls.map(call => call.alias), ['info', 'eason']);
+  assert.deepEqual(providerCalls[0].payload, providerCalls[1].payload);
 });
 
 test('only bound authenticated quota receipt returns quota; generic/fabricated Gateway429 never does', async t => {

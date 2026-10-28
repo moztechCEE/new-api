@@ -100,31 +100,30 @@ test('SIWC maps the entire bounded Corely contract to public Responses without p
   ]) await t.test(name, () => assert.throws(() => corelyPlanPayload(bad), { code: expected }));
 });
 
-test('SIWC prefix breakpoints preserve every prompt byte and isolate cache accounting by verified account and exact prefix', async () => {
+test('SIWC preserves complete prompt variants and bound hints without optional API cache fields', async () => {
   const prefix = '品牌事實\r\n完整產品目錄🙂\n', system = '完整系統規則\r\n獨立覆核不可省略。';
   const original = modelRequest({ system, user: prefix + '本輪顧客問題一。', promptCache: {
     key: `support-${'a'.repeat(64)}`, userPrefixChars: prefix.length }, reasoningEffort: 'low', verbosity: 'low' });
   const { request, payload } = corelyPlanPayload(original, 'info');
-  assert.equal(payload.instructions, undefined);
-  assert.deepEqual(payload.input[0], { role: 'developer', content: [{ type: 'input_text', text: system,
-    prompt_cache_breakpoint: { mode: 'explicit' } }] });
-  assert.deepEqual(Buffer.from(payload.input[0].content[0].text), Buffer.from(system));
-  assert.deepEqual(Buffer.from(payload.input[1].content.map(part => part.text).join('')), Buffer.from(original.user));
-  assert.equal(payload.input[1].content[0].text, prefix);
-  assert.deepEqual(payload.input[1].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
-  assert.equal(payload.input[1].content[1].prompt_cache_breakpoint, undefined);
-  assert.equal(Object.hasOwn(payload, 'prompt_cache_options'), false);
-  assert.match(payload.prompt_cache_key, /^corely-plan-[a-f0-9]{64}$/);
+  assert.deepEqual(Buffer.from(payload.instructions), Buffer.from(system));
+  assert.deepEqual(payload.input, [{ role: 'user', content: original.user }]);
+  assert.deepEqual(Buffer.from(payload.input[0].content), Buffer.from(original.user));
+  assert.equal(request.inputSha256, original.inputSha256);
   assert.equal(payload.store, false); assert.equal(payload.stream, true);
   assert.deepEqual(payload.reasoning, { effort: 'low' }); assert.equal(payload.text.verbosity, 'low');
-  for (const name of ['metadata', 'prompt_cache_retention', 'cache_control', 'previous_response_id', 'background']) assert.equal(payload[name], undefined);
-  assert.notEqual(corelyPlanPayload(original, 'eason').payload.prompt_cache_key, payload.prompt_cache_key);
+  for (const name of ['metadata', 'prompt_cache_options', 'prompt_cache_key', 'prompt_cache_retention', 'cache_control', 'previous_response_id', 'background']) assert.equal(Object.hasOwn(payload, name), false);
+  assert.doesNotMatch(JSON.stringify(payload), /prompt_cache_breakpoint/);
+  assert.deepEqual(corelyPlanPayload(original, 'eason').payload, payload);
   const changedQuestion = modelRequest({ ...original, user: prefix + '本輪顧客問題二。' });
-  assert.equal(corelyPlanPayload(changedQuestion, 'info').payload.prompt_cache_key, payload.prompt_cache_key);
-  for (const changes of [{ system: system + '新增規則' }, { user: '不同事實🙂\n' + original.user },
+  for (const changes of [{ user: changedQuestion.user }, { system: system + '新增規則' }, { user: '不同事實🙂\n' + original.user },
     { purpose: 'semantic_reply_review' }, { responseSchema: { type: 'object', properties: {}, required: [], additionalProperties: false } }]) {
-    assert.notEqual(corelyPlanPayload(modelRequest({ ...original, ...changes }), 'info').payload.prompt_cache_key, payload.prompt_cache_key);
+    const variant = modelRequest({ ...original, ...changes }), projected = corelyPlanPayload(variant, 'info');
+    assert.notEqual(projected.request.inputSha256, request.inputSha256);
+    assert.equal(projected.payload.instructions, variant.system); assert.equal(projected.payload.input[0].content, variant.user);
+    if (variant.responseSchema) assert.deepEqual(projected.payload.text.format.schema, variant.responseSchema);
   }
+  const noBoundary = corelyPlanPayload(modelRequest({ ...original, promptCache: { key: original.promptCache.key } }), 'info');
+  assert.deepEqual(noBoundary.payload, payload); assert.notEqual(noBoundary.request.inputSha256, request.inputSha256);
   assert.equal(Object.isFrozen(request.promptCache), true);
   assert.throws(() => corelyPlanPayload(changedQuestion), code('MODEL_PORT_INVALID'));
   original.promptCache.key = `support-${'b'.repeat(64)}`;
@@ -141,7 +140,7 @@ test('SIWC rejects invalid, falsy, Unicode-split and unbound prefix hints withou
   assert.throws(() => corelyPlanPayload({ ...request, promptCache: { key: `support-${'b'.repeat(64)}` } }, 'info'), { code: 'INPUT_MISMATCH' });
 });
 
-test('personal Responses omits request-level cache options and never retries unsupported prefix hints', async () => {
+test('personal Responses keeps the conservative profile and never retries a synthetic invalid request', async () => {
   const session = { alias: 'info', planScopeGranted: true, accountMatchesExpected: true,
     accessToken: 'synthetic-access', expiresAt: Date.now() + 300_000 };
   const input = modelRequest({ promptCache: { key: `support-${'a'.repeat(64)}`, userPrefixChars: 9 } });
@@ -151,47 +150,57 @@ test('personal Responses omits request-level cache options and never retries uns
     if (url.endsWith('/models')) { catalogCalls++; return catalog(); }
     modelCalls++;
     const payload = JSON.parse(init.body);
-    assert.equal(payload.input[1].content.map(part => part.text).join(''), input.user);
-    assert.equal(payload.input[0].content[0].text, input.system);
-    assert.match(payload.prompt_cache_key, /^corely-plan-[a-f0-9]{64}$/);
-    assert.equal(Object.hasOwn(payload, 'prompt_cache_options'), false);
-    return Response.json({ error: { code: 'subscription_sharing_unsupported_capability',
-      param: 'input[0].content[0].prompt_cache_breakpoint' } }, { status: 400 });
+    assert.deepEqual(payload.input, [{ role: 'user', content: input.user }]); assert.equal(payload.instructions, input.system);
+    assert.doesNotMatch(JSON.stringify(payload), /prompt_cache_|cache_control/);
+    return Response.json({ error: { type: 'invalid_request_error', code: 'synthetic_invalid_request',
+      param: 'synthetic_parameter' } }, { status: 400 });
   }, new AbortController().signal), code('INFERENCE_HTTP_400'));
   assert.equal(catalogCalls, 1); assert.equal(modelCalls, 1);
 });
 
-test('persistent SIWC ports generate and independently review separate requests with exact bound plan receipts', async t => {
+test('persistent SIWC ports preserve all four purposes and independent review for Info and Eason with exact bound receipts', async t => {
   const { vm } = await transferred(t, ['info', 'eason']);
-  const seen = [];
+  const seen = [], purposes = ['semantic_evidence_selection', 'support_decision', 'reply_generation', 'semantic_reply_review'];
+  const schema = { type: 'object', properties: { approved: { type: 'boolean' } }, required: ['approved'], additionalProperties: false };
+  let expected;
   const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async (url, init) => {
-    assert.equal(init.headers.Authorization, 'Bearer synthetic-info-access');
+    assert.equal(init.headers.Authorization, `Bearer synthetic-${expected.alias}-access`);
     if (url === `${RESOURCE}/models`) return catalog();
     assert.equal(url, `${RESOURCE}/responses`); assert.equal(init.credentials, 'omit'); assert.equal(init.redirect, 'error');
     const payload = JSON.parse(init.body); seen.push(payload);
-    return modelCompletion(payload.instructions.startsWith('Independent') ? '{"approved":true}' : 'Synthetic grounded answer.');
+    assert.deepEqual(payload, { model: MODEL, instructions: expected.input.system,
+      input: [{ role: 'user', content: expected.input.user }], store: false, stream: true, reasoning: { effort: 'low' },
+      text: { verbosity: 'low', ...(expected.input.responseSchema
+        ? { format: { type: 'json_schema', name: 'corely_model_output', strict: true, schema } } : {}) } });
+    assert.doesNotMatch(JSON.stringify(payload), /prompt_cache_|cache_control|metadata/);
+    return modelCompletion(expected.input.responseSchema ? '{"approved":true}' : 'Synthetic grounded answer.');
   } });
   const ports = createSiwcModelTransports(sessions);
   assert.equal(ports.info.authMode, 'siwc_plan');
   assert.equal(ports.info.capabilities.images, false);
-  const generate = modelRequest();
-  const first = ports.info.generate(generate, new AbortController().signal);
-  generate.user = 'Mutated after starting; must not be sent.';
-  const result = await first;
-  assert.deepEqual(result, { accountAlias: 'info', authMode: 'siwc_plan', accountVerified: true, model: MODEL,
-    callId: generate.callId, inputSha256: generate.inputSha256, schemaSha256: null, status: 'success', completionStatus: 'completed',
-    text: 'Synthetic grounded answer.', usage: { inputTokens: 21, outputTokens: 8, cachedInputTokens: 5 } });
-  const review = modelRequest({ callId: 'synthetic-independent-review', purpose: 'semantic_reply_review', system: 'Independent quality review.',
-    user: 'Synthetic customer question. Candidate: Synthetic grounded answer.',
-    responseSchema: { type: 'object', properties: { approved: { type: 'boolean' } }, required: ['approved'], additionalProperties: false } });
-  const reviewed = await ports.info.generate(review, new AbortController().signal);
-  assert.equal(reviewed.text, '{"approved":true}'); assert.equal(reviewed.inputSha256, review.inputSha256);
-  assert.notEqual(reviewed.callId, result.callId); assert.equal(seen.length, 2);
-  assert.equal(seen[0].input[0].content, 'Synthetic customer question.');
-  assert.equal(seen[1].instructions, 'Independent quality review.');
+  const receipts = [];
+  let lastInput;
+  for (const alias of ['info', 'eason']) for (const purpose of purposes) {
+    const prefix = '完整合成品牌事實🙂\r\n', user = prefix + `當前合成問題：${purpose}\r\n不能忽略補充內容。`;
+    const input = modelRequest({ callId: `synthetic-${alias}-${purpose}`, purpose,
+      workload: ['semantic_evidence_selection', 'support_decision'].includes(purpose) ? 'DECISION_LLM' : 'REPLY_LLM',
+      system: purpose === 'semantic_reply_review' ? 'Independent quality review.\r\n事實與問題必須一致🙂' : `Synthetic ${purpose}.\r\n完整系統規則🙂`,
+      user, promptCache: { key: `support-${'a'.repeat(64)}`, userPrefixChars: prefix.length }, reasoningEffort: 'low', verbosity: 'low',
+      ...(['semantic_evidence_selection', 'semantic_reply_review'].includes(purpose) ? { responseSchema: schema } : {}) });
+    expected = { alias, input: structuredClone(input) }; lastInput = structuredClone(input);
+    const pending = ports[alias].generate(input, new AbortController().signal);
+    input.user = 'Mutated after starting; must not be sent.';
+    const result = await pending; receipts.push(result);
+    assert.deepEqual(result, { accountAlias: alias, authMode: 'siwc_plan', accountVerified: true, model: MODEL,
+      callId: expected.input.callId, inputSha256: expected.input.inputSha256, schemaSha256: expected.input.schemaSha256,
+      status: 'success', completionStatus: 'completed', text: expected.input.responseSchema ? '{"approved":true}' : 'Synthetic grounded answer.',
+      usage: { inputTokens: 21, outputTokens: 8, cachedInputTokens: 5 } });
+  }
+  assert.equal(new Set(receipts.map(receipt => receipt.callId)).size, 8); assert.equal(seen.length, 8);
+  assert.equal(seen.filter(payload => payload.instructions.startsWith('Independent quality review.')).length, 2);
   assert.equal(seen.every(payload => payload.store === false && payload.stream === true && !payload.tools && !payload.previous_response_id), true);
-  await assert.rejects(ports.info.generate(review, new AbortController().signal), code('MODEL_CALL_REPLAY_OR_CAPACITY'));
-  assert.equal(seen.length, 2);
+  await assert.rejects(ports.eason.generate(lastInput, new AbortController().signal), code('MODEL_CALL_REPLAY_OR_CAPACITY'));
+  assert.equal(seen.length, 8);
 });
 
 test('only official authenticated plan exhaustion becomes a Corely SIWC quota receipt', async t => {
