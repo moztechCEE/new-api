@@ -9,7 +9,7 @@
 // responsibility; these focused controls are not a full ASVS compliance claim.
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
-import { MODEL, ProbeError, consumePlanTextStream, digest } from './siwc-local-runtime.mjs';
+import { MODEL, ProbeError, consumePlanTextStream, digest, inferenceErrorClasses } from './siwc-local-runtime.mjs';
 import { corelyPlanPayload } from './siwc-local-model-port.mjs';
 import { snapshotModelRequest, snapshotModelResult } from './corely-model-contract.mjs';
 
@@ -47,7 +47,8 @@ function failureDiagnostic(error) {
     if (DIAGNOSTIC_REASONS.has(code)) return { reason: code };
     if (typeof code === 'string') {
       const match = /^(INFERENCE|UPSTREAM)_HTTP_([1-5][0-9]{2})$/.exec(code);
-      if (match) return { reason: match[1] === 'INFERENCE' ? 'INFERENCE_HTTP_ERROR' : 'UPSTREAM_HTTP_ERROR', httpStatus: Number(match[2]) };
+      if (match) return { reason: match[1] === 'INFERENCE' ? 'INFERENCE_HTTP_ERROR' : 'UPSTREAM_HTTP_ERROR', httpStatus: Number(match[2]),
+        ...(match[1] === 'INFERENCE' ? inferenceErrorClasses(error) : undefined) };
     }
   } catch { /* Untrusted error objects never become diagnostic content. */ }
   return { reason: 'UNKNOWN_ERROR' };
@@ -160,7 +161,9 @@ export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gateway
     const failure = failureDiagnostic(error);
     const status = failure.httpStatus ?? httpStatus;
     const event = Object.freeze({ stage, reason: failure.reason,
-      httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null, consumed });
+      httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null, consumed,
+      ...(failure.providerErrorTypeClass ? { providerErrorTypeClass: failure.providerErrorTypeClass,
+        providerParamClass: failure.providerParamClass } : {}) });
     // Observers cannot affect admission, replay ownership, or failure handling;
     // neither a throw nor a rejected/slow promise is awaited or retried.
     try { void Promise.resolve(onDiagnostic(event)).catch(() => {}); } catch { /* Metadata-only observer failure is isolated. */ }

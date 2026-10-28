@@ -11,6 +11,9 @@ const PLAN_ERROR_CODES = new Set(['subscription_sharing_user_not_eligible', 'sub
   'subscription_sharing_usage_unavailable', 'subscription_sharing_unsupported_capability', 'subscription_sharing_route_not_supported',
   'subscription_sharing_invalid_user', 'chatpass_v2_scope_not_authorized', 'chatpass_v2_invalid_authorization_context',
   'subscription_sharing_user_unavailable']);
+const PROVIDER_ERROR_TYPES = new Set(['INVALID_REQUEST', 'AUTHENTICATION', 'PERMISSION', 'RATE_LIMIT', 'SERVER', 'OTHER', 'MISSING']);
+const PROVIDER_ERROR_PARAMS = new Set(['CACHE_KEY', 'CACHE_OPTIONS', 'INPUT_BREAKPOINT', 'INPUT_ROLE', 'STRUCTURED_SCHEMA', 'REASONING', 'OTHER', 'MISSING']);
+const INFERENCE_ERROR_CLASSES = new WeakMap();
 
 export class ProbeError extends Error {
   constructor(code, diagnostic) {
@@ -36,9 +39,23 @@ export class ProbeError extends Error {
     for (const key of ['finalTextHash', 'deltaTextHash']) {
       if (typeof diagnostic[key] === 'string' && /^[0-9a-f]{64}$/.test(diagnostic[key])) safe[key] = diagnostic[key];
     }
+    // Only fixed own data is admitted. Keep a private immutable snapshot so a
+    // later replacement/getter/Proxy on error.diagnostic cannot enter audits.
+    try {
+      const type = Object.getOwnPropertyDescriptor(diagnostic, 'providerErrorTypeClass');
+      const param = Object.getOwnPropertyDescriptor(diagnostic, 'providerParamClass');
+      if (type && Object.hasOwn(type, 'value') && PROVIDER_ERROR_TYPES.has(type.value) &&
+          param && Object.hasOwn(param, 'value') && PROVIDER_ERROR_PARAMS.has(param.value)) {
+        safe.providerErrorTypeClass = type.value; safe.providerParamClass = param.value;
+        INFERENCE_ERROR_CLASSES.set(this, Object.freeze({ providerErrorTypeClass: type.value, providerParamClass: param.value }));
+      }
+    } catch { /* Foreign descriptor traps never become diagnostic values. */ }
     this.diagnostic = Object.freeze(safe);
   }
 }
+/** Only actual local ProbeError instances carry this fixed diagnostic snapshot;
+ * arbitrary errors, accessors and proxies are never inspected by consumers. */
+export const inferenceErrorClasses = error => INFERENCE_ERROR_CLASSES.get(error);
 const fail = code => { throw new ProbeError(code); };
 export const digest = value => createHash('sha256').update(value).digest('hex');
 
@@ -222,6 +239,23 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
     diagnostic.bodyShape = Array.isArray(body) ? 'ARRAY' : body === null || typeof body !== 'object' ? 'SCALAR' :
       body.error && typeof body.error === 'object' && !Array.isArray(body.error) ? 'ERROR_OBJECT' :
       Object.hasOwn(body, 'detail') ? 'DETAIL_OBJECT' : body.object === 'response' ? 'RESPONSE_OBJECT' : 'OTHER_OBJECT';
+    if (diagnostic.bodyShape === 'ERROR_OBJECT') {
+      const type = Object.getOwnPropertyDescriptor(body.error, 'type')?.value;
+      const param = Object.getOwnPropertyDescriptor(body.error, 'param')?.value;
+      const types = new Map([['invalid_request_error', 'INVALID_REQUEST'], ['authentication_error', 'AUTHENTICATION'],
+        ['permission_error', 'PERMISSION'], ['rate_limit_error', 'RATE_LIMIT'], ['server_error', 'SERVER']]);
+      diagnostic.providerErrorTypeClass = type == null ? 'MISSING' : typeof type === 'string' && type.length <= 128
+        ? types.get(type) ?? 'OTHER' : 'OTHER';
+      diagnostic.providerParamClass = param == null ? 'MISSING' : 'OTHER';
+      if (typeof param === 'string' && param.length <= 256) {
+        if (param === 'prompt_cache_key') diagnostic.providerParamClass = 'CACHE_KEY';
+        else if (/^prompt_cache_options(?:\.(?:mode|ttl))?$/.test(param)) diagnostic.providerParamClass = 'CACHE_OPTIONS';
+        else if (/^input(?:\[\d{1,3}\]|\.\d{1,3})\.content(?:\[\d{1,3}\]|\.\d{1,3})\.prompt_cache_breakpoint(?:\.(?:mode|ttl))?$/.test(param)) diagnostic.providerParamClass = 'INPUT_BREAKPOINT';
+        else if (/^input(?:\[\d{1,3}\]|\.\d{1,3})\.role$/.test(param)) diagnostic.providerParamClass = 'INPUT_ROLE';
+        else if (/^text\.format(?:\.(?:type|name|strict)|\.schema(?:\.[A-Za-z0-9_.\[\]-]+)?)?$/.test(param)) diagnostic.providerParamClass = 'STRUCTURED_SCHEMA';
+        else if (/^reasoning(?:\.effort)?$/.test(param)) diagnostic.providerParamClass = 'REASONING';
+      }
+    }
     if (PLAN_ERROR_CODES.has(body?.error?.code)) diagnostic.errorCode = body.error.code;
     if (body?.object === 'response' && ['completed', 'in_progress', 'failed', 'incomplete', 'queued'].includes(body.status)) {
       diagnostic.responseStatus = body.status;

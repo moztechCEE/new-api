@@ -6,12 +6,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import { after, before, test } from 'node:test';
 import { openCorelyVmModelIdentity, openCorelyVmModelWorkerLifecycle, openCorelyVmModelGateway, runCorelyVmModelWorker,
   parseVmModelWorkerCommand, VmModelWorkerError } from './corely-vm-model-worker.mjs';
 import { CORELY_VM_MODEL_JOB_SCOPE as SCOPE, CORELY_VM_MODEL_JOB_RESOURCE as RESOURCE,
   CORELY_VM_HOST_ID_HASH as HOST, CORELY_VM_VERIFICATION_URI as VERIFICATION } from './corely-vm-model-job-client.mjs';
-import { createSiwcModelTransports } from './siwc-local-model-port.mjs';
+import { createSiwcModelTransports, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 import { digest, MODEL } from './siwc-local-runtime.mjs';
 
 const realFetch = globalThis.fetch;
@@ -99,7 +100,8 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
     server.closeAllConnections = () => {};
     listenerServer = server; return server;
   };
-  const sessions = { generate() { throw new Error('NO_INFERENCE_DURING_BOOTSTRAP'); } };
+  let generate = () => { throw new Error('NO_INFERENCE_DURING_BOOTSTRAP'); };
+  const sessions = { generate: (...args) => generate(...args) };
   for (const changed of [
     { gatewayUrl: 'https://newapi.corely.cc/v1/responses' }, { gatewayUrl: 'http://newapi-dev.corely.cc/v1/responses' },
     { gatewayToken: config.bridgeSecret }, { expiresAt: Date.now() - 1 }, { expiresAt: Date.now() + 86460_000 },
@@ -115,8 +117,22 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
   await chmod(path, 0o600);
   const diagnostics = [];
   await assert.rejects(openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory, onDiagnostic: {} }), code('WORKER_GATEWAY_INVALID'));
+  let gatewayCalls = 0;
   const gateway = await openCorelyVmModelGateway(f.root, sessions, controller.signal, { serverFactory,
-    onDiagnostic: value => diagnostics.push(value) });
+    onDiagnostic: value => diagnostics.push(value), fetchImpl: async (url, init) => {
+      gatewayCalls++; assert.equal(url, config.gatewayUrl);
+      const req = Readable.from([Buffer.from(init.body)]);
+      req.method = 'POST'; req.url = '/v1/responses'; req.socket = { remoteAddress: '127.0.0.1' };
+      req.headers = { authorization: `Bearer ${config.bridgeSecret}`, 'content-type': 'application/json' };
+      req.rawHeaders = Object.entries(req.headers).flat();
+      const res = new EventEmitter(); res.writableEnded = false; res.destroyed = false;
+      res.writeHead = (status, headers) => { res.status = status; res.headers = headers; };
+      res.end = body => { res.body = body; res.writableEnded = true; };
+      await handler(req, res);
+      assert.equal(res.status, 409);
+      assert.equal(res.body, '{"error":{"type":"corely_siwc_error","code":"bridge_request_held","message":"Corely SIWC request held"}}');
+      return new Response(res.body, { status: res.status, headers: res.headers });
+    } });
   assert.equal(options.minVersion, 'TLSv1.2'); assert.equal(options.handshakeTimeout, 10_000); assert.equal(typeof handler, 'function');
   assert.deepEqual(listenAddress, { port: 8443, host: '0.0.0.0' });
   assert.deepEqual(Object.keys(gateway.ports), ['info', 'eason']);
@@ -128,6 +144,45 @@ test('explicit gateway bootstrap requires private expiring DEV-only credentials 
   assert.deepEqual(diagnostics, [{ stage: 'BRIDGE_ADMISSION', reason: 'GATEWAY_REQUEST_REJECTED', httpStatus: 403, consumed: false }]);
   assert.deepEqual(Object.keys(diagnostics[0]).sort(), ['consumed', 'httpStatus', 'reason', 'stage']);
   assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE|test_gateway|test_bridge|gatewayToken|bridgeSecret|203\.0/);
+  let catalogCalls = 0, providerCalls = 0;
+  const aliases = [];
+  generate = (alias, input, signal) => {
+    aliases.push(alias);
+    return runCorelyPlanRequest({ alias, accessToken: 'PRIVATE_SYNTHETIC_PROVIDER_TOKEN', expiresAt: Date.now() + 3_600_000,
+      planScopeGranted: true, accountMatchesExpected: true }, input, async (url, init) => {
+      if (url === 'https://api.openai.com/v1/models') {
+        catalogCalls++; return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+      }
+      providerCalls++; assert.equal(url, 'https://api.openai.com/v1/responses');
+      const payload = JSON.parse(init.body);
+      assert.equal(payload.input[0].role, 'developer'); assert.deepEqual(payload.prompt_cache_options, { mode: 'implicit' });
+      assert.equal(Object.hasOwn(payload, 'metadata'), false);
+      return Response.json({ error: { type: 'invalid_request_error', param: 'prompt_cache_options',
+        code: 'PRIVATE_PROVIDER_CODE', message: 'PRIVATE_PROVIDER_INPUT_AND_CREDENTIAL' } }, { status: 400 });
+    }, signal);
+  };
+  const worker = workerFixture({ purposes: ['support_decision'] }), claim = worker.options.client.claimModel;
+  worker.options.client.claimModel = async alias => {
+    const lease = await claim(alias);
+    if (lease) {
+      const { inputSha256: _old, ...content } = lease.request;
+      content.promptCache = { key: `support-${'a'.repeat(64)}`, userPrefixChars: 10 };
+      lease.request = { ...content, inputSha256: digest(JSON.stringify(canonical(content))) };
+    }
+    return lease;
+  };
+  worker.options.ports = gateway.ports;
+  await assert.rejects(runCorelyVmModelWorker(worker.options), code('WORKER_EXECUTION_HELD'));
+  assert.deepEqual(aliases, ['info']); assert.deepEqual(worker.claims, ['info']);
+  assert.equal(catalogCalls, 1); assert.equal(providerCalls, 1); assert.equal(gatewayCalls, 1);
+  assert.equal(worker.completions.length, 0); assert.equal(worker.closed(), 1);
+  assert.deepEqual(diagnostics.slice(1), [
+    { stage: 'BRIDGE_SESSION', reason: 'INFERENCE_HTTP_ERROR', httpStatus: 400, consumed: true,
+      providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'CACHE_OPTIONS' },
+    { stage: 'GATEWAY_FETCH', reason: 'GATEWAY_CALL_ABORTED', httpStatus: null, consumed: true },
+  ]);
+  const emitted = JSON.stringify(diagnostics.map(value => ({ status: 'CORELY_DEV_SIWC_GATEWAY_DIAGNOSTIC', ...value })));
+  assert.doesNotMatch(emitted, /PRIVATE|test_gateway|test_bridge|prompt_cache_options|invalid_request_error|Bearer|@/);
   const unnegotiated = new EventEmitter(); let destroyed = 0;
   unnegotiated.destroy = () => { assert.equal(closed, 1, 'stop accepting before destroying unnegotiated sockets'); destroyed++; unnegotiated.emit('close'); };
   listenerServer.emit('connection', unnegotiated);

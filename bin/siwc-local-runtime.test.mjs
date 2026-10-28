@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   ISSUER, RESOURCE, MODEL, PROBE_INPUT, PROBE_OUTPUT, SCOPES, ProbeError,
   createAttempt, consumeCallback, validateSession, publicJson, selectExactModel,
-  syntheticRequest, consumeProbeStream, runSyntheticProbe, inferenceFailureDiagnostic, digest,
+  syntheticRequest, consumeProbeStream, runSyntheticProbe, inferenceFailureDiagnostic, inferenceErrorClasses, digest,
 } from './siwc-local-runtime.mjs';
 import { loadRegistration, saveRegistration, startLocalPilot } from './siwc-local-pilot.mjs';
 
@@ -610,7 +610,7 @@ test('inference diagnostic exposes only bounded structural classes and known pro
     const diagnostic = await inferenceFailureDiagnostic(jsonResponse({ error: { code,
       message: 'SYNTHETIC_SECRET_DO_NOT_EMIT', detail: 'synthetic-access-token' } }, 403));
     assert.deepEqual(diagnostic, { httpStatus: 403, contentTypeClass: 'JSON',
-      catalogModelVerified: true, bodyShape: 'ERROR_OBJECT', errorCode: code });
+      catalogModelVerified: true, bodyShape: 'ERROR_OBJECT', providerErrorTypeClass: 'MISSING', providerParamClass: 'MISSING', errorCode: code });
   });
   for (const [body, shape] of [[{ error: { code: 'unknown-private-code', message: 'SYNTHETIC_SECRET_DO_NOT_EMIT' } }, 'ERROR_OBJECT'],
     [{ detail: { access_token: 'SYNTHETIC_SECRET_DO_NOT_EMIT' } }, 'DETAIL_OBJECT'],
@@ -626,6 +626,66 @@ test('inference diagnostic exposes only bounded structural classes and known pro
     assert.equal((await inferenceFailureDiagnostic(jsonResponse({ object: 'response', status }))).responseStatus, status);
   }
   assert.equal('responseStatus' in await inferenceFailureDiagnostic(jsonResponse({ object: 'response', status: 'private-unknown-status' })), false);
+});
+
+test('provider error classification uses only bounded fixed type and parameter classes, never raw values', async t => {
+  const secret = 'PRIVATE_PROVIDER_CREDENTIAL_OR_INPUT';
+  for (const [name, error, typeClass, paramClass] of [
+    ['cache key', { type: 'invalid_request_error', param: 'prompt_cache_key' }, 'INVALID_REQUEST', 'CACHE_KEY'],
+    ['cache options', { type: 'invalid_request_error', param: 'prompt_cache_options.mode' }, 'INVALID_REQUEST', 'CACHE_OPTIONS'],
+    ['cache options ttl', { type: 'invalid_request_error', param: 'prompt_cache_options.ttl' }, 'INVALID_REQUEST', 'CACHE_OPTIONS'],
+    ['bracket breakpoint', { type: 'invalid_request_error', param: 'input[0].content[1].prompt_cache_breakpoint' }, 'INVALID_REQUEST', 'INPUT_BREAKPOINT'],
+    ['dot breakpoint', { type: 'invalid_request_error', param: 'input.0.content.1.prompt_cache_breakpoint.mode' }, 'INVALID_REQUEST', 'INPUT_BREAKPOINT'],
+    ['breakpoint ttl', { type: 'invalid_request_error', param: 'input[0].content[1].prompt_cache_breakpoint.ttl' }, 'INVALID_REQUEST', 'INPUT_BREAKPOINT'],
+    ['unknown cache options suffix', { type: 'invalid_request_error', param: 'prompt_cache_options.private' }, 'INVALID_REQUEST', 'OTHER'],
+    ['unknown breakpoint suffix', { type: 'invalid_request_error', param: 'input.0.content.1.prompt_cache_breakpoint.private' }, 'INVALID_REQUEST', 'OTHER'],
+    ['input role', { type: 'permission_error', param: 'input[0].role' }, 'PERMISSION', 'INPUT_ROLE'],
+    ['schema', { type: 'invalid_request_error', param: 'text.format.schema.properties.synthetic.items' }, 'INVALID_REQUEST', 'STRUCTURED_SCHEMA'],
+    ['format', { type: 'invalid_request_error', param: 'text.format.strict' }, 'INVALID_REQUEST', 'STRUCTURED_SCHEMA'],
+    ['reasoning', { type: 'invalid_request_error', param: 'reasoning.effort' }, 'INVALID_REQUEST', 'REASONING'],
+    ['authentication', { type: 'authentication_error', param: null }, 'AUTHENTICATION', 'MISSING'],
+    ['rate limit class is not a quota code', { type: 'rate_limit_error' }, 'RATE_LIMIT', 'MISSING'],
+    ['server', { type: 'server_error', param: 'other' }, 'SERVER', 'OTHER'],
+    ['missing', {}, 'MISSING', 'MISSING'],
+    ['unknown', { type: secret, param: secret, code: secret }, 'OTHER', 'OTHER'],
+    ['overlong strings', { type: 'invalid_request_error' + 'x'.repeat(129), param: 'text.format.schema.' + 'x'.repeat(257) }, 'OTHER', 'OTHER'],
+    ['non-string fields', { type: { token: secret }, param: [secret] }, 'OTHER', 'OTHER'],
+    ['prototype-looking strings', { type: '__proto__', param: 'constructor' }, 'OTHER', 'OTHER'],
+  ]) await t.test(name, async () => {
+    const diagnostic = await inferenceFailureDiagnostic(jsonResponse({ error: { ...error, message: secret, detail: secret } }, 400));
+    assert.equal(diagnostic.providerErrorTypeClass, typeClass); assert.equal(diagnostic.providerParamClass, paramClass);
+    assert.equal(diagnostic.errorCode, undefined);
+    const classified = new ProbeError('INFERENCE_HTTP_400', diagnostic);
+    assert.deepEqual(inferenceErrorClasses(classified), { providerErrorTypeClass: typeClass, providerParamClass: paramClass });
+    assert.equal(Object.isFrozen(inferenceErrorClasses(classified)), true);
+    assert.doesNotMatch(JSON.stringify(classified), /PRIVATE|prompt_cache|text\.format|input\[|reasoning\.effort|invalid_request_error/);
+  });
+  for (const error of [null, false, [], secret]) {
+    const diagnostic = await inferenceFailureDiagnostic(jsonResponse({ error }, 400));
+    assert.equal(Object.hasOwn(diagnostic, 'providerErrorTypeClass'), false);
+    assert.equal(Object.hasOwn(diagnostic, 'providerParamClass'), false);
+  }
+});
+
+test('fixed classification snapshots reject unknown values and never evaluate diagnostic accessors or foreign proxies', () => {
+  let reads = 0;
+  const input = { providerParamClass: 'CACHE_KEY' };
+  Object.defineProperty(input, 'providerErrorTypeClass', { get() { reads++; throw new Error('PRIVATE_GETTER'); } });
+  assert.equal(inferenceErrorClasses(new ProbeError('INFERENCE_HTTP_400', input)), undefined);
+  assert.equal(reads, 0);
+  for (const values of [{ providerErrorTypeClass: 'private', providerParamClass: 'CACHE_KEY' },
+    { providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'prompt_cache_key' },
+    { providerErrorTypeClass: 'INVALID_REQUEST' }]) {
+    const error = new ProbeError('INFERENCE_HTTP_400', values);
+    assert.equal(inferenceErrorClasses(error), undefined);
+    assert.equal(Object.hasOwn(error.diagnostic, 'providerErrorTypeClass'), false);
+  }
+  const error = new ProbeError('INFERENCE_HTTP_400', { providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'CACHE_OPTIONS' });
+  Object.defineProperty(error, 'diagnostic', { get() { reads++; throw new Error('PRIVATE_ERROR_GETTER'); } });
+  assert.deepEqual(inferenceErrorClasses(error), { providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'CACHE_OPTIONS' });
+  const foreign = new Proxy(error, { get() { reads++; throw new Error('PRIVATE_PROXY'); },
+    getOwnPropertyDescriptor() { reads++; throw new Error('PRIVATE_PROXY_DESCRIPTOR'); } });
+  assert.equal(inferenceErrorClasses(foreign), undefined); assert.equal(reads, 0);
 });
 
 test('inference diagnostic hashes request IDs and never returns raw headers', async () => {

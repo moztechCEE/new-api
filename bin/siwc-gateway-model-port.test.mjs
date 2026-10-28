@@ -217,7 +217,8 @@ test('fixed bridge failure enums locate model/catalog, inference and output fail
     const request = requestFixture('diagnostic-failure-call', { responseSchema: schema });
     await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_CALL_ABORTED' });
     assert.deepEqual(state.diagnostics, [
-      { stage, reason, httpStatus, consumed: true },
+      { stage, reason, httpStatus, consumed: true, ...(name === 'inference HTTP'
+        ? { providerErrorTypeClass: 'MISSING', providerParamClass: 'MISSING' } : {}) },
       { stage: 'GATEWAY_FETCH', reason: 'GATEWAY_CALL_ABORTED', httpStatus: null, consumed: true },
     ]);
     assert.equal(codeGetterReads, 0);
@@ -225,6 +226,70 @@ test('fixed bridge failure enums locate model/catalog, inference and output fail
     await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
     assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1); assert.equal(state.diagnostics.length, 2);
     assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE|Synthetic|@|Bearer|nonce|\.cc/);
+  });
+});
+
+test('only branded fixed inference classes cross the Gateway audit boundary; diagnostic getters and proxies cannot forge them', async t => {
+  let reads = 0;
+  const classes = { providerErrorTypeClass: 'INVALID_REQUEST', providerParamClass: 'CACHE_OPTIONS' };
+  const trusted = () => {
+    const error = new ProbeError('INFERENCE_HTTP_400', classes);
+    Object.defineProperty(error, 'diagnostic', { get() { reads++; throw new Error('PRIVATE_GETTER'); } });
+    return error;
+  };
+  for (const [name, create, expectedClasses] of [
+    ['original trusted snapshot', trusted, classes],
+    ['foreign diagnostic getter', () => Object.defineProperty(Object.assign(new Error('PRIVATE_MESSAGE'), { code: 'INFERENCE_HTTP_400' }),
+      'diagnostic', { get() { reads++; throw new Error('PRIVATE_FOREIGN_GETTER'); } }), {}],
+    ['foreign fixed-looking data', () => Object.assign(new Error('PRIVATE_MESSAGE'), { code: 'INFERENCE_HTTP_400', diagnostic: classes }), {}],
+    ['proxy of trusted error', () => new Proxy(trusted(), { get() { reads++; throw new Error('PRIVATE_PROXY_GETTER'); } }), {}],
+    ['non-inference trusted error', () => new ProbeError('UPSTREAM_HTTP_403', classes), {}],
+  ]) await t.test(name, async t => {
+    const state = harness(t, { generate: () => { throw create(); } });
+    const request = requestFixture('fixed-class-boundary');
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_CALL_ABORTED' });
+    assert.deepEqual(state.diagnostics[0], { stage: 'BRIDGE_SESSION', reason: name === 'non-inference trusted error'
+      ? 'UPSTREAM_HTTP_ERROR' : 'INFERENCE_HTTP_ERROR', httpStatus: name === 'non-inference trusted error' ? 403 : 400,
+    consumed: true, ...expectedClasses });
+    assert.deepEqual(state.diagnostics[1], { stage: 'GATEWAY_FETCH', reason: 'GATEWAY_CALL_ABORTED', httpStatus: null, consumed: true });
+    assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1);
+    assert.equal(reads, 0); assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE|prompt_cache|Bearer/);
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+    assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1);
+  });
+});
+
+test('provider type and parameter classes never become quota authority or trigger another account', async t => {
+  for (const [name, status, error, exhausted] of [
+    ['quota-looking type and parameter only', 400, { type: 'subscription_sharing_usage_limit_exceeded',
+      param: 'subscription_sharing_usage_limit_exceeded' }, false],
+    ['ordinary rate limit', 429, { type: 'rate_limit_error', param: 'reasoning.effort', code: 'rate_limit_exceeded' }, false],
+    ['exact authenticated quota code retained', 429, { type: 'invalid_request_error', param: 'prompt_cache_key',
+      code: 'subscription_sharing_usage_limit_exceeded' }, true],
+  ]) await t.test(name, async t => {
+    let catalogCalls = 0, providerCalls = 0;
+    const state = harness(t, { generate: (alias, request, signal) => runCorelyPlanRequest({ alias,
+      accessToken: 'PRIVATE_SYNTHETIC_PROVIDER_TOKEN', expiresAt: Date.now() + 3_600_000,
+      planScopeGranted: true, accountMatchesExpected: true }, request, async url => {
+      if (url === 'https://api.openai.com/v1/models') {
+        catalogCalls++; return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+      }
+      providerCalls++; assert.equal(url, 'https://api.openai.com/v1/responses');
+      return Response.json({ error: { ...error, message: 'PRIVATE_PROVIDER_ERROR' } }, { status });
+    }, signal) });
+    if (exhausted) {
+      const result = await state.instance.ports.info.generate(requestFixture(), new AbortController().signal);
+      assert.equal(result.status, 'quota_exhausted'); assert.equal(result.authenticated, true);
+      assert.equal(state.diagnostics.length, 0);
+    } else {
+      await assert.rejects(state.instance.ports.info.generate(requestFixture(), new AbortController().signal), { code: 'GATEWAY_CALL_ABORTED' });
+      assert.equal(state.diagnostics[0].reason, 'INFERENCE_HTTP_ERROR');
+      assert.equal(state.diagnostics[0].providerErrorTypeClass, status === 400 ? 'OTHER' : 'RATE_LIMIT');
+      assert.equal(state.diagnostics[0].providerParamClass, status === 400 ? 'OTHER' : 'REASONING');
+    }
+    assert.equal(catalogCalls, 1); assert.equal(providerCalls, 1);
+    assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1); assert.equal(state.calls[0].alias, 'info');
+    assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE|subscription_sharing|rate_limit_error|reasoning\.effort/);
   });
 });
 
