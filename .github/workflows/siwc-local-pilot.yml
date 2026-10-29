@@ -10,6 +10,7 @@ on:
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
+      - 'bin/codex-local-gateway-model-port*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
@@ -22,6 +23,7 @@ on:
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
+      - 'bin/codex-local-gateway-model-port*.mjs'
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
@@ -86,10 +88,12 @@ jobs:
           node --check bin/codex-harness-model-session.test.mjs
           node --check bin/codex-harness-model-job-client.mjs
           node --check bin/codex-harness-model-job-client.test.mjs
+          node --check bin/codex-local-gateway-model-port.mjs
+          node --check bin/codex-local-gateway-model-port.test.mjs
       - name: Run synthetic offline protocol regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs bin/siwc-gateway-model-port.test.mjs
       - name: Run synthetic offline harness regression
-        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-model-worker.test.mjs
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/codex-local-gateway-model-port.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-model-worker.test.mjs
       - name: Build and smoke-test the private VM runtime without network or credentials
         if: matrix.node == '22'
         run: |
