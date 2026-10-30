@@ -2,15 +2,145 @@ package channel
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// The real request helpers need only these adaptor methods. All network work
+// below goes to a loopback fixture, never a provider or database.
+type cancellationTestAdaptor struct {
+	Adaptor
+	url string
+}
+
+func (a *cancellationTestAdaptor) GetRequestURL(*relaycommon.RelayInfo) (string, error) {
+	return a.url, nil
+}
+
+func (*cancellationTestAdaptor) SetupRequestHeader(*gin.Context, *http.Header, *relaycommon.RelayInfo) error {
+	return nil
+}
+
+func TestRelayRequestsInheritClientCancellation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	for _, form := range []bool{false, true} {
+		for _, phase := range []string{"before-headers", "stream-body", "normal-success"} {
+			name := "api/" + phase
+			if form {
+				name = "form/" + phase
+			}
+			t.Run(name, func(t *testing.T) {
+				arrived := make(chan struct{})
+				upstreamCanceled := make(chan error, 1)
+				release := make(chan struct{})
+				var attempts atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					attempts.Add(1)
+					_, _ = io.Copy(io.Discard, r.Body)
+					if phase == "normal-success" {
+						_, _ = io.WriteString(w, "complete")
+						return
+					}
+					if phase == "stream-body" {
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush()
+					}
+					close(arrived)
+					select {
+					case <-r.Context().Done():
+						upstreamCanceled <- r.Context().Err()
+					case <-release:
+					}
+				}))
+				defer upstream.Close()
+				defer close(release)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("fixture-body")).WithContext(ctx)
+				info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}, IsStream: phase == "stream-body", DisablePing: true}
+				adaptor := &cancellationTestAdaptor{url: upstream.URL}
+				type outcome struct {
+					response *http.Response
+					err      error
+				}
+				result := make(chan outcome, 1)
+				go func() {
+					var response *http.Response
+					var err error
+					if form {
+						response, err = DoFormRequest(adaptor, c, info, strings.NewReader("fixture-body"))
+					} else {
+						response, err = DoApiRequest(adaptor, c, info, strings.NewReader("fixture-body"))
+					}
+					result <- outcome{response: response, err: err}
+				}()
+				if phase != "normal-success" {
+					select {
+					case <-arrived:
+					case <-time.After(3 * time.Second):
+						t.Fatal("loopback upstream did not receive request")
+					}
+				}
+				if phase == "before-headers" {
+					cancel()
+				}
+				var received outcome
+				select {
+				case received = <-result:
+				case <-time.After(3 * time.Second):
+					t.Fatal("relay request did not finish after cancellation")
+				}
+				if phase == "before-headers" {
+					require.Error(t, received.err)
+					require.Nil(t, received.response)
+				} else {
+					require.NoError(t, received.err)
+					require.NotNil(t, received.response)
+					defer received.response.Body.Close()
+					if phase == "stream-body" {
+						cancel()
+						readFinished := make(chan error, 1)
+						go func() { _, err := io.ReadAll(received.response.Body); readFinished <- err }()
+						select {
+						case err := <-readFinished:
+							require.ErrorIs(t, err, context.Canceled)
+						case <-time.After(3 * time.Second):
+							t.Fatal("upstream stream read did not finish after cancellation")
+						}
+					} else {
+						body, err := io.ReadAll(received.response.Body)
+						require.NoError(t, err)
+						assert.Equal(t, "complete", string(body))
+						assert.Equal(t, http.StatusOK, received.response.StatusCode)
+					}
+				}
+				if phase != "normal-success" {
+					select {
+					case err := <-upstreamCanceled:
+						require.ErrorIs(t, err, context.Canceled)
+					case <-time.After(3 * time.Second):
+						t.Fatal("upstream request context was not canceled")
+					}
+				}
+				assert.EqualValues(t, 1, attempts.Load(), "cancellation must not create a second attempt")
+			})
+		}
+	}
+}
 
 func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	recorder := httptest.NewRecorder()

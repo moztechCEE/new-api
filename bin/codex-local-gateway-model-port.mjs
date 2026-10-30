@@ -77,6 +77,10 @@ const SOURCE_VERSION = 'new-api.local-codex-attest.v1', SOURCE_RPC_TTL_MS = 5000
 const HEX64 = /^[a-f0-9]{64}$/;
 const SOURCE_RESPONSE_KEYS = ['version', 'channel_id', 'model', 'group', 'nonce', 'phase', 'call_id_hash',
   'input_sha256', 'schema_sha256', 'route_revision', 'issued_at', 'expires_at', 'proof'];
+const QUOTA_REQUEST_HEADERS = ['X-New-Api-Local-Codex-Nonce', 'X-New-Api-Local-Codex-Call-Sha256',
+  'X-New-Api-Local-Codex-Input-Sha256', 'X-New-Api-Local-Codex-Schema-Sha256'];
+const QUOTA_RECEIPT_HEADER = 'X-New-Api-Local-Codex-Quota', QUOTA_VERSION = 'new-api.local-codex-quota.v1';
+const CODEX_UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex/responses';
 
 function framedParts(digest, values) {
   for (const value of values) {
@@ -84,6 +88,17 @@ function framedParts(digest, values) {
     size.writeUInt32BE(bytes.length); digest.update(size); digest.update(bytes); bytes.fill(0);
   }
   return digest;
+}
+
+function synchronousQuotaValue(value) {
+  if (types.isProxy(value)) reject('ATTESTATION_FAILED');
+  if (types.isPromise(value)) {
+    // Optional quota callbacks are deliberately CPU-only. Observe rejection
+    // without invoking a foreign .then/.catch accessor or retaining its cause.
+    void Promise.prototype.then.call(value, undefined, () => {});
+    reject('ATTESTATION_FAILED');
+  }
+  return value;
 }
 
 /** Only a fresh, dedicated local login bootstrap may supply these four values.
@@ -224,7 +239,45 @@ export function createCodexLocalSourceAttestor(options) {
       reject('ATTESTATION_FAILED');
     }
   };
-  return Object.freeze({ attest, close });
+  const quotaState = (input, phase, allowed) => {
+    const context = ownData(input, allowed, 'ATTESTATION_FAILED');
+    ownData(context.handle, [], 'ATTESTATION_FAILED');
+    const state = handles.get(context.handle), binding = sourceBinding(context.binding);
+    if (types.isProxy(context.signal) || !(context.signal instanceof AbortSignal)) reject('ATTESTATION_FAILED');
+    checkActive(AbortSignal.any([context.signal, lifetime.signal]));
+    if (!state || state.phase !== phase || state.signal !== context.signal || state.expiresAt <= clock() ||
+        Object.keys(binding).some(key => binding[key] !== state.binding[key])) reject('ATTESTATION_FAILED');
+    return { context, state, binding, account: credentials.get(binding.accountAlias) };
+  };
+  // Synchronous owner-local calculations only: these callbacks never receive
+  // or return the credential key, and have no HTTP, refresh or MFA capability.
+  const quotaRequest = input => {
+    const { state, binding } = quotaState(input, 'before-complete', ['handle', 'binding', 'signal']);
+    if (state.quotaRequested) reject('ATTESTATION_FAILED');
+    state.quotaRequested = true; state.quotaNonce = randomBytes(32).toString('hex');
+    return Object.freeze({ [QUOTA_REQUEST_HEADERS[0]]: state.quotaNonce,
+      [QUOTA_REQUEST_HEADERS[1]]: createHash('sha256').update(binding.callId, 'utf8').digest('hex'),
+      [QUOTA_REQUEST_HEADERS[2]]: binding.inputSha256, [QUOTA_REQUEST_HEADERS[3]]: binding.schemaSha256 ?? '-' });
+  };
+  const quotaVerify = input => {
+    const { context, state, binding, account } = quotaState(input, 'after-complete', ['handle', 'binding', 'signal', 'status', 'receipt']);
+    if (!state.quotaRequested || state.quotaConsumed) reject('ATTESTATION_FAILED');
+    state.quotaConsumed = true;
+    if (context.status !== 429 || typeof context.receipt !== 'string' || context.receipt.length > 128) reject('ATTESTATION_FAILED');
+    const match = /^v1\.([0-9]{1,16})\.([0-9]{1,16})\.([a-f0-9]{64})$/.exec(context.receipt);
+    if (!match) reject('ATTESTATION_FAILED');
+    const issued = Number(match[1]), expires = Number(match[2]), currentTime = clock();
+    if (!Number.isSafeInteger(issued) || !Number.isSafeInteger(expires) || Math.abs(issued - currentTime) > 5000 ||
+        expires <= currentTime || expires <= issued || expires - issued > OWNER_TTL_MS || state.expiresAt <= currentTime) reject('ATTESTATION_FAILED');
+    const expected = framedParts(createHmac('sha256', account.key), [QUOTA_VERSION, state.quotaNonce,
+      createHash('sha256').update(binding.callId, 'utf8').digest('hex'), binding.inputSha256, binding.schemaSha256 ?? '-',
+      CODEX_UPSTREAM_URL, binding.model, account.group, `${account.channelId}`, '429', 'usage_limit_reached', '1', match[1], match[2]]).digest();
+    if (!timingSafeEqual(expected, Buffer.from(match[3], 'hex'))) reject('ATTESTATION_FAILED');
+    checkActive(AbortSignal.any([context.signal, lifetime.signal]));
+    if (Math.min(expires, state.expiresAt) <= clock()) reject('ATTESTATION_FAILED');
+    return true;
+  };
+  return Object.freeze({ attest, quotaRequest, quotaVerify, close });
 }
 
 /** The trusted LOCAL bootstrap supplies the fresh-login/account/model evidence
@@ -236,11 +289,17 @@ export function createCodexLocalSourceAttestor(options) {
  * There is deliberately no HTTP listener, account switching, or API fallback.
  */
 export function createCodexLocalGatewayModelTransports(options) {
-  const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now'], 'INVALID_CONFIGURATION');
+  const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
+    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
   if (typeof attest !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' ||
       types.isProxy(config.signal) || !(config.signal instanceof AbortSignal)) reject('INVALID_CONFIGURATION');
+  const quotaEnabled = config.quotaRequest !== undefined || config.quotaVerify !== undefined;
+  if ((quotaEnabled && (typeof config.quotaRequest !== 'function' || types.isProxy(config.quotaRequest) ||
+      typeof config.quotaVerify !== 'function' || types.isProxy(config.quotaVerify))) ||
+      (config.allowHistoricalRegression !== undefined && typeof config.allowHistoricalRegression !== 'boolean')) reject('INVALID_CONFIGURATION');
+  const localAdmission = config.allowHistoricalRegression === true ? Object.freeze({ allowHistoricalRegression: true }) : undefined;
   const accounts = ownData(config.accounts, ['info', 'eason'], 'INVALID_CONFIGURATION'), tokens = new Map();
   for (const alias of ['info', 'eason']) {
     const account = ownData(accounts[alias], ['gatewayToken'], 'INVALID_CONFIGURATION');
@@ -273,7 +332,8 @@ export function createCodexLocalGatewayModelTransports(options) {
   };
   const generate = async (alias, input, signal) => {
     let request;
-    try { request = snapshotModelRequest(input); } catch { reject('INVALID_REQUEST'); }
+    try { request = snapshotModelRequest(input, localAdmission); } catch { reject('INVALID_REQUEST'); }
+    if (request.scope.dataClass === 'historical_regression' && config.allowHistoricalRegression !== true) reject('INVALID_REQUEST');
     if (types.isProxy(signal) || !(signal instanceof AbortSignal)) reject('INVALID_REQUEST');
     const ownerActive = AbortSignal.any([signal, lifetime.signal]);
     activeCheck(ownerActive);
@@ -300,7 +360,14 @@ export function createCodexLocalGatewayModelTransports(options) {
     let response, responseBody, modelDeadline, modelActive, modelFinished = false;
     try {
       const before = await fresh('before', 'pending');
-      const { payload } = corelyPlanPayload(request, alias);
+      const { payload } = corelyPlanPayload(request, alias, localAdmission);
+      let quotaHeaders = Object.create(null);
+      if (quotaEnabled) {
+        try { quotaHeaders = ownData(synchronousQuotaValue(config.quotaRequest(Object.freeze({ handle, binding, signal: ownerActive }))), QUOTA_REQUEST_HEADERS, 'ATTESTATION_FAILED'); }
+        catch { reject('ATTESTATION_FAILED'); }
+        if (Object.keys(quotaHeaders).length !== 4 || QUOTA_REQUEST_HEADERS.slice(0, 3).some(key => typeof quotaHeaders[key] !== 'string' || !HEX64.test(quotaHeaders[key])) ||
+            (quotaHeaders[QUOTA_REQUEST_HEADERS[3]] !== '-' && (typeof quotaHeaders[QUOTA_REQUEST_HEADERS[3]] !== 'string' || !HEX64.test(quotaHeaders[QUOTA_REQUEST_HEADERS[3]])))) reject('ATTESTATION_FAILED');
+      }
       // The 60s budget starts at dispatch, not while source verification waits,
       // and ends only after the full model stream has completed.
       modelDeadline = AbortSignal.timeout(CALL_TTL_MS);
@@ -310,7 +377,7 @@ export function createCodexLocalGatewayModelTransports(options) {
         if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
         return fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
           headers: { Authorization: `Bearer ${tokens.get(alias)}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
-            'X-Client-Request-Id': randomUUID() }, body: JSON.stringify(payload), signal: modelActive });
+            'X-Client-Request-Id': randomUUID(), ...quotaHeaders }, body: JSON.stringify(payload), signal: modelActive });
       });
       // A fetch implementation may ignore cancellation and resolve only after
       // its owner has gone away. Observe and discard that late body as well.
@@ -325,6 +392,16 @@ export function createCodexLocalGatewayModelTransports(options) {
         const after = await fresh('after', 'http_failure');
         if (after.configurationRevision !== before.configurationRevision) reject('ATTESTATION_CHANGED');
         if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
+        if (quotaEnabled && response.status === 429 && response.headers.has(QUOTA_RECEIPT_HEADER)) {
+          let verified;
+          try { verified = synchronousQuotaValue(config.quotaVerify(Object.freeze({ handle, binding, signal: ownerActive, status: response.status,
+            receipt: response.headers.get(QUOTA_RECEIPT_HEADER) }))); } catch { reject('ATTESTATION_FAILED'); }
+          activeCheck(ownerActive);
+          if (verified !== true) reject('ATTESTATION_FAILED');
+          return snapshotModelResult({ accountAlias: alias, authMode: 'managed_chatgpt', accountVerified: true, model: MODEL,
+            callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
+            status: 'quota_exhausted', code: 'QUOTA_EXHAUSTED', authenticated: true }, request, alias, 'managed_chatgpt');
+        }
         // Native errors cannot attest account funding or quota. In particular,
         // generic 429 never triggers Eason or paid API fallback from this port.
         reject('GATEWAY_HTTP_FAILURE');

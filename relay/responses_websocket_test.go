@@ -2,11 +2,16 @@ package relay
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -696,6 +701,174 @@ func TestSIWCGatewayResponsesPassthroughAndSingleAttempt(t *testing.T) {
 	if storage, err := common.GetBodyStorage(c); err == nil {
 		t.Cleanup(func() { require.NoError(t, storage.Close()) })
 	}
+}
+
+// Fixture-backed protocol validation only. This never exhausts or queries a
+// real account and must not be reported as naturally observed quota failover.
+func TestNativeCodexQuotaDataPlaneReceipt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	const payload = `{"model":"gpt-6.1-sol","stream":true,"input":"synthetic question","instructions":"synthetic policy"}`
+	const credential = `{"access_token":"synthetic-access","id_token":"synthetic-id","refresh_token":"synthetic-refresh","account_id":"synthetic-account"}`
+	const quotaError = `{"error":{"type":"usage_limit_reached","message":"synthetic-private-message"}}`
+	for _, test := range []struct {
+		name, body, change string
+		status             int
+		wantReceipt        bool
+	}{
+		{name: "actual native upstream quota", status: 429, body: quotaError, wantReceipt: true},
+		{name: "typed quota without message", status: 429, body: `{"error":{"type":"usage_limit_reached"}}`, wantReceipt: true},
+		{name: "generic rate limit", status: 429, body: `{"error":{"type":"rate_limit_error","message":"usage_limit_reached"}}`},
+		{name: "forged upstream receipt header", status: 429, body: `{"error":{"type":"rate_limit_error","message":"limited"}}`, change: "forged-header"},
+		{name: "code is not typed quota", status: 429, body: `{"error":{"code":"usage_limit_reached","message":"limited"}}`},
+		{name: "not included", status: 429, body: `{"error":{"type":"usage_not_included","message":"not included"}}`},
+		{name: "API balance", status: 429, body: `{"error":{"type":"insufficient_quota","message":"API exhausted"}}`},
+		{name: "authorization failure", status: 401, body: quotaError},
+		{name: "wrong status", status: 503, body: quotaError},
+		{name: "non native channel", status: 429, body: quotaError, change: "other-type"},
+		{name: "prior writer commit", status: 429, body: quotaError, change: "written"},
+		{name: "route rewrite", status: 429, body: quotaError, change: "override"},
+		{name: "model rewrite", status: 429, body: quotaError, change: "model-mapping"},
+		{name: "parameter rewrite", status: 429, body: quotaError, change: "param-override"},
+		{name: "group rewrite", status: 429, body: quotaError, change: "group"},
+		{name: "retry enabled", status: 429, body: quotaError, change: "retry-enabled"},
+		{name: "status rewrite", status: 429, body: quotaError, change: "status-mapping"},
+		{name: "multiple attempts", status: 429, body: quotaError, change: "retry"},
+		{name: "missing binding", status: 429, body: quotaError, change: "missing-hash"},
+		{name: "disabled feature", status: 429, body: quotaError, change: "disabled"},
+		{name: "oversized body", status: 429, body: `{"error":{"type":"usage_limit_reached","message":"` + strings.Repeat("x", 4096) + `"}}`},
+		{name: "not JSON", status: 429, body: `<html>usage_limit_reached</html>`},
+		{name: "redirect out of scope", status: 307, body: quotaError, change: "redirect"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("NEW_API_OWNER_LOCAL_ATTESTATION_ENABLED", "true")
+			if test.change == "disabled" {
+				t.Setenv("NEW_API_OWNER_LOCAL_ATTESTATION_ENABLED", "false")
+			}
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if test.change != "other-type" {
+					assert.Equal(t, "/backend-api/codex/responses", r.URL.Path)
+					assert.Equal(t, "Bearer synthetic-access", r.Header.Get("Authorization"))
+					assert.Equal(t, "synthetic-account", r.Header.Get("chatgpt-account-id"))
+				}
+				for _, header := range []string{"X-New-Api-Local-Codex-Nonce", "X-New-Api-Local-Codex-Call-Sha256", "X-New-Api-Local-Codex-Input-Sha256", "X-New-Api-Local-Codex-Schema-Sha256"} {
+					assert.Empty(t, r.Header.Get(header), "local control hashes must not reach the upstream")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if test.change == "redirect" {
+					w.Header().Set("Location", "http://127.0.0.1:1/not-contacted")
+				}
+				if test.change == "forged-header" {
+					w.Header().Set("X-New-Api-Local-Codex-Quota", "v1.10000.130000."+strings.Repeat("0", 64))
+				}
+				w.WriteHeader(test.status)
+				_, err := io.WriteString(w, test.body)
+				require.NoError(t, err)
+			}))
+			t.Cleanup(upstream.Close)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(payload))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Header.Set("X-New-Api-Local-Codex-Nonce", strings.Repeat("a", 64))
+			c.Request.Header.Set("X-New-Api-Local-Codex-Call-Sha256", strings.Repeat("b", 64))
+			c.Request.Header.Set("X-New-Api-Local-Codex-Input-Sha256", strings.Repeat("c", 64))
+			c.Request.Header.Set("X-New-Api-Local-Codex-Schema-Sha256", "-")
+			if test.change == "missing-hash" {
+				c.Request.Header.Del("X-New-Api-Local-Codex-Input-Sha256")
+			}
+			channelType := constant.ChannelTypeCodex
+			if test.change == "other-type" {
+				channelType = constant.ChannelTypeOpenAI
+			}
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-6.1-sol")
+			common.SetContextKey(c, constant.ContextKeyChannelType, channelType)
+			common.SetContextKey(c, constant.ContextKeyChannelId, 71)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelKey, credential)
+			common.SetContextKey(c, constant.ContextKeyTokenGroup, "synthetic-info")
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, "synthetic-info")
+			if test.change == "group" {
+				common.SetContextKey(c, constant.ContextKeyTokenGroup, "different-group")
+			}
+			if test.change != "retry-enabled" {
+				service.GetChannelConstraints(c).AddPin(appdto.ChannelPin{ChannelId: 71, Source: appdto.PinSourceToken, Rank: appdto.PinRankToken, RetryMode: appdto.PinRetrySingleAttempt})
+			}
+			service.RequestPolicy(c).BeginAttempt(&model.Channel{Id: 71}, "synthetic-info")
+			if test.change == "retry" {
+				service.RequestPolicy(c).BeginAttempt(&model.Channel{Id: 71}, "synthetic-info")
+			}
+			if test.change == "override" {
+				common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, map[string]any{"*": ""})
+			}
+			if test.change == "param-override" {
+				common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{"model": "different-model"})
+			}
+			if test.change == "model-mapping" {
+				common.SetContextKey(c, constant.ContextKeyChannelModelMapping, `{"gpt-6.1-sol":"different-model"}`)
+			}
+			if test.change == "status-mapping" {
+				c.Set("status_code_mapping", `{"429":503}`)
+			}
+			if test.change == "written" {
+				_, err := w.WriteString(": ping\n\n")
+				require.NoError(t, err)
+				c.Writer.WriteHeaderNow()
+			}
+			var request dto.OpenAIResponsesRequest
+			require.NoError(t, common.Unmarshal([]byte(payload), &request))
+			info := relaycommon.GenRelayInfoResponses(c, &request)
+			info.DisablePing = true
+			apiErr := ResponsesHelper(c, info)
+			require.NotNil(t, apiErr)
+			c.JSON(apiErr.StatusCode, gin.H{"error": apiErr.ToOpenAIError()})
+			assert.EqualValues(t, 1, calls.Load())
+			header := w.Header().Get("X-New-Api-Local-Codex-Quota")
+			if !test.wantReceipt {
+				assert.Empty(t, header)
+				return
+			}
+			require.NotEmpty(t, header)
+			assert.Equal(t, 429, apiErr.StatusCode)
+			assert.Equal(t, 429, w.Code, "typed upstream and final downstream statuses must match")
+			parts := strings.Split(header, ".")
+			require.Len(t, parts, 4)
+			assert.Equal(t, "v1", parts[0])
+			issued, err := strconv.ParseInt(parts[1], 10, 64)
+			require.NoError(t, err)
+			expires, err := strconv.ParseInt(parts[2], 10, 64)
+			require.NoError(t, err)
+			assert.InDelta(t, time.Now().UnixMilli(), issued, 5000)
+			assert.Equal(t, int64(120000), expires-issued)
+			key, err := hex.DecodeString("c233d1039bd4e49f09a30672ebb6f0b73578c77e8ef9da0a2305b4c3bb63000f")
+			require.NoError(t, err)
+			mac := hmac.New(sha256.New, key)
+			for _, value := range []string{"new-api.local-codex-quota.v1", strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), "-", upstream.URL + "/backend-api/codex/responses", "gpt-6.1-sol", "synthetic-info", "71", "429", "usage_limit_reached", "1", parts[1], parts[2]} {
+				require.NoError(t, binary.Write(mac, binary.BigEndian, uint32(len(value))))
+				_, err := mac.Write([]byte(value))
+				require.NoError(t, err)
+			}
+			assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), parts[3])
+			assert.NotContains(t, header, "synthetic-private-message")
+			assert.NotContains(t, header, "synthetic-access")
+			if storage, err := common.GetBodyStorage(c); err == nil {
+				require.NoError(t, storage.Close())
+			}
+		})
+	}
+}
+
+// This literal is shared with the Node quota verifier fixture. Together with
+// the real-adaptor test above it detects cross-language framing/URL omissions.
+func TestCodexLocalQuotaCrossLanguageFixedVector(t *testing.T) {
+	key, ok := service.CodexCredentialProofKey(`{"access_token":"synthetic-access","id_token":"synthetic-id","refresh_token":"synthetic-refresh","account_id":"synthetic-account"}`)
+	require.True(t, ok)
+	assert.Equal(t, "c233d1039bd4e49f09a30672ebb6f0b73578c77e8ef9da0a2305b4c3bb63000f", hex.EncodeToString(key[:]))
+	proof := service.CodexProofMAC(key, "new-api.local-codex-quota.v1", strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), "-",
+		"https://chatgpt.com/backend-api/codex/responses", "gpt-6.1-sol", "synthetic-info", "71", "429", "usage_limit_reached", "1", "10000", "130000")
+	assert.Equal(t, "d32bf1ca651b432953ce64c201a0e023f707d5e7dc7e2cdf4f6c607d7b8fa2c7", proof)
 }
 
 func TestResponsesWSStreamIdentity(t *testing.T) {

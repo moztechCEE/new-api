@@ -7,6 +7,7 @@ on:
       - 'bin/siwc-local-*.mjs'
       - 'bin/siwc-gateway-*.mjs'
       - 'bin/corely-model-contract.mjs'
+      - 'bin/corely-model-contract-local-regression.test.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
@@ -15,6 +16,11 @@ on:
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
       - 'controller/codex_local_attestation*.go'
+      - 'service/codex_local_proof.go'
+      - 'relay/codex_local_quota.go'
+      - 'relay/responses_handler.go'
+      - 'relay/channel/api_request.go'
+      - 'relay/channel/api_request_test.go'
       - 'router/channel-router.go'
       - '.dockerignore'
   pull_request:
@@ -22,6 +28,7 @@ on:
       - 'bin/siwc-local-*.mjs'
       - 'bin/siwc-gateway-*.mjs'
       - 'bin/corely-model-contract.mjs'
+      - 'bin/corely-model-contract-local-regression.test.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/codex-harness-*.mjs'
@@ -30,6 +37,11 @@ on:
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
       - 'controller/codex_local_attestation*.go'
+      - 'service/codex_local_proof.go'
+      - 'relay/codex_local_quota.go'
+      - 'relay/responses_handler.go'
+      - 'relay/channel/api_request.go'
+      - 'relay/channel/api_request_test.go'
       - 'router/channel-router.go'
       - '.dockerignore'
   workflow_dispatch:
@@ -53,9 +65,11 @@ jobs:
             relaykit/go.sum
             tokenkit/go.sum
       - name: Real Go Responses passthrough, SSE and first-attempt retry contract
-        run: go test ./relay -run '^TestSIWCGatewayResponsesPassthroughAndSingleAttempt$' -count=1
+        run: go test ./relay -run '^Test(SIWCGatewayResponsesPassthroughAndSingleAttempt|NativeCodexQuotaDataPlaneReceipt|CodexLocalQuotaCrossLanguageFixedVector)$' -count=1
       - name: Owner-local non-secret credential attestation security contract
         run: go test ./controller -run '^TestCodexLocalAttestation' -count=1
+      - name: Forward caller cancellation to real upstream HTTP requests
+        run: go test ./relay/channel -run '^Test(RelayRequestsInheritClientCancellation|NewTaskAPIRequestInheritsClientCancellation)$' -count=1
   local-protocol:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -79,6 +93,7 @@ jobs:
           node --check bin/siwc-gateway-model-port.mjs
           node --check bin/siwc-local-corely-worker.mjs
           node --check bin/corely-model-contract.mjs
+          node --check bin/corely-model-contract-local-regression.test.mjs
           node --check bin/corely-vm-model-job-client.mjs
           node --check bin/corely-vm-model-job-client.test.mjs
           node --check bin/corely-vm-model-worker.mjs
@@ -99,7 +114,7 @@ jobs:
       - name: Run synthetic offline protocol regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs bin/siwc-gateway-model-port.test.mjs
       - name: Run synthetic offline harness regression
-        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/codex-local-gateway-model-port.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-model-worker.test.mjs
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/codex-local-gateway-model-port.test.mjs bin/corely-model-contract-local-regression.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-model-worker.test.mjs
       - name: Build and smoke-test the private VM runtime without network or credentials
         if: matrix.node == '22'
         run: |

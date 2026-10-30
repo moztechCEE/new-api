@@ -64,9 +64,14 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		httpResp = resp.(*http.Response)
 
 		if httpResp.StatusCode != http.StatusOK {
+			quotaReceipt := codexLocalQuotaReceipt(c, info, httpResp)
 			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+			if quotaReceipt != "" && newAPIError.StatusCode == http.StatusTooManyRequests && !c.Writer.Written() {
+				c.Header(service.CodexLocalQuotaHeader, quotaReceipt)
+				c.Header("Cache-Control", "no-store")
+			}
 			return newAPIError
 		}
 	}

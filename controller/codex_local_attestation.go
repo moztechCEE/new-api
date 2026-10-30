@@ -1,11 +1,8 @@
 package controller
 
 import (
-	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
-	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -121,7 +118,7 @@ func CreateCodexLocalAttestation(c *gin.Context) {
 		localAttestationError(c, http.StatusConflict)
 		return
 	}
-	credentialKey, ok := localCodexCredentialProofKey(channel.Key)
+	credentialKey, ok := service.CodexCredentialProofKey(channel.Key)
 	if !ok {
 		localAttestationError(c, http.StatusConflict)
 		return
@@ -137,9 +134,7 @@ func CreateCodexLocalAttestation(c *gin.Context) {
 	if response.SchemaSHA256 != nil {
 		schemaHash = *response.SchemaSHA256
 	}
-	mac := hmac.New(sha256.New, credentialKey[:])
-	writeLocalAttestationParts(mac, response.Version, response.Nonce, response.Phase, response.CallIDHash, response.InputSHA256, schemaHash, response.Model, response.Group, strconv.Itoa(response.ChannelID), response.RouteRevision, strconv.FormatInt(response.IssuedAt, 10), strconv.FormatInt(response.ExpiresAt, 10))
-	response.Proof = hex.EncodeToString(mac.Sum(nil))
+	response.Proof = service.CodexProofMAC(credentialKey, response.Version, response.Nonce, response.Phase, response.CallIDHash, response.InputSHA256, schemaHash, response.Model, response.Group, strconv.Itoa(response.ChannelID), response.RouteRevision, strconv.FormatInt(response.IssuedAt, 10), strconv.FormatInt(response.ExpiresAt, 10))
 	if err := service.ValidateStepUpIdentity(identity); err != nil {
 		localAttestationError(c, http.StatusForbidden)
 		return
@@ -173,34 +168,6 @@ func localAttestationName(value string, limit int) bool {
 		}
 	}
 	return true
-}
-
-func localCodexCredentialProofKey(raw string) ([32]byte, bool) {
-	var credential service.CodexOAuthKey
-	if len(raw) > 4*65536+4096 || common.UnmarshalJsonStr(raw, &credential) != nil || (credential.Type != "" && credential.Type != "codex") {
-		return [32]byte{}, false
-	}
-	values := []string{credential.AccessToken, credential.IDToken, credential.RefreshToken, credential.AccountID}
-	for _, value := range values {
-		if value == "" || len(value) > 65536 {
-			return [32]byte{}, false
-		}
-	}
-	digest := sha256.New()
-	_, _ = digest.Write([]byte("new-api.codex-credential.v1\x00"))
-	writeLocalAttestationParts(digest, values...)
-	var key [32]byte
-	copy(key[:], digest.Sum(nil))
-	return key, true
-}
-
-func writeLocalAttestationParts(digest hash.Hash, parts ...string) {
-	for _, part := range parts {
-		var size [4]byte
-		binary.BigEndian.PutUint32(size[:], uint32(len(part)))
-		_, _ = digest.Write(size[:])
-		_, _ = digest.Write([]byte(part))
-	}
 }
 
 func localCodexRouteRevision(channel *model.Channel, credentialKey [32]byte) (string, error) {

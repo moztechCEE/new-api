@@ -8,8 +8,8 @@ import { snapshotModelRequest, validateModelOutput } from './corely-model-contra
 /** Preserve the complete prompt and strict output contract. SIWC uses the
  * public Responses endpoint, not Chat Completions or a ChatGPT backend proxy.
  * Unsupported API parameters are not forwarded or silently substituted. */
-export function corelyPlanPayload(input, accountAlias) {
-  const request = snapshotModelRequest(input);
+export function corelyPlanPayload(input, accountAlias, localAdmission) {
+  const request = snapshotModelRequest(input, localAdmission);
   if (accountAlias !== undefined && !['info', 'eason'].includes(accountAlias)) throw new ProbeError('MODEL_PORT_INVALID');
   const text = {};
   if (request.responseSchema) text.format = { type: 'json_schema', name: 'corely_model_output', strict: true, schema: request.responseSchema };

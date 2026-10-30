@@ -485,3 +485,123 @@ test('native before and after source caps discard late attestations without weak
     assert.equal(state.calls.length, phase === 'before' ? 0 : 1); timeout.mock.restore();
   }
 });
+
+const QUOTA_HEADERS = ['X-New-Api-Local-Codex-Nonce', 'X-New-Api-Local-Codex-Call-Sha256',
+  'X-New-Api-Local-Codex-Input-Sha256', 'X-New-Api-Local-Codex-Schema-Sha256'];
+const QUOTA_RECEIPT_HEADER = 'X-New-Api-Local-Codex-Quota';
+function quotaReceipt(headers, alias = 'info', changes = {}) {
+  const values = { nonce: headers[QUOTA_HEADERS[0]], call: headers[QUOTA_HEADERS[1]], input: headers[QUOTA_HEADERS[2]],
+    schema: headers[QUOTA_HEADERS[3]], url: 'https://chatgpt.com/backend-api/codex/responses', model: MODEL, group: SOURCE_ACCOUNTS[alias].group,
+    channel: `${SOURCE_ACCOUNTS[alias].channelId}`, status: '429', kind: 'usage_limit_reached', attempt: '1',
+    issued: '10000', expires: '130000', ...changes };
+  const mac = createHmac('sha256', Buffer.from(SOURCE_ACCOUNTS[alias].credentialProofKey64hex, 'hex'));
+  for (const part of ['new-api.local-codex-quota.v1', values.nonce, values.call, values.input, values.schema, values.url, values.model,
+    values.group, values.channel, values.status, values.kind, values.attempt, values.issued, values.expires]) {
+    const bytes = Buffer.from(part, 'utf8'), length = Buffer.alloc(4); length.writeUInt32BE(bytes.length); mac.update(length); mac.update(bytes);
+  }
+  return `v1.${values.issued}.${values.expires}.${mac.digest('hex')}`;
+}
+const quotaContext = context => Object.freeze({ handle: context.handle, binding: context.binding, signal: context.signal });
+
+test('quota HMAC framing matches the shared literal Go producer vector including actual upstream URL', () => {
+  const headers = { [QUOTA_HEADERS[0]]: 'a'.repeat(64), [QUOTA_HEADERS[1]]: 'b'.repeat(64),
+    [QUOTA_HEADERS[2]]: 'c'.repeat(64), [QUOTA_HEADERS[3]]: '-' };
+  assert.equal(quotaReceipt(headers), 'v1.10000.130000.d32bf1ca651b432953ce64c201a0e023f707d5e7dc7e2cdf4f6c607d7b8fa2c7');
+});
+
+test('source quota callbacks release only bound hashes and verify one post-source data-plane receipt without exposing keys', async t => {
+  const state = sourceHarness(t), before = sourceContext();
+  await assert.rejects(async () => state.instance.quotaRequest(quotaContext(before)), { code: 'ATTESTATION_FAILED' });
+  await state.instance.attest(before);
+  const headers = state.instance.quotaRequest(quotaContext(before));
+  assert.equal(Object.isFrozen(headers), true); assert.deepEqual(Object.keys(headers).sort(), [...QUOTA_HEADERS].sort());
+  assert.doesNotMatch(JSON.stringify(headers), /synthetic-access|synthetic-refresh|credentialProofKey|gatewayToken|synthetic-account/);
+  assert.throws(() => state.instance.quotaRequest(quotaContext(before)), { code: 'ATTESTATION_FAILED' });
+  const receipt = quotaReceipt(headers);
+  assert.throws(() => state.instance.quotaVerify({ ...quotaContext(before), status: 429, receipt }), { code: 'ATTESTATION_FAILED' });
+  await state.instance.attest(finishContext(before));
+  assert.equal(state.instance.quotaVerify(Object.freeze({ ...quotaContext(before), status: 429, receipt })), true);
+  assert.throws(() => state.instance.quotaVerify({ ...quotaContext(before), status: 429, receipt }), { code: 'ATTESTATION_FAILED' });
+  assert.deepEqual(Object.keys(state.instance).sort(), ['attest', 'close', 'quotaRequest', 'quotaVerify']);
+});
+
+test('quota receipts bind every scope/hash/status/attempt and expire without accepting a forged or stale header', async t => {
+  for (const change of [{ nonce: 'e'.repeat(64) }, { call: 'e'.repeat(64) }, { input: 'e'.repeat(64) }, { schema: 'e'.repeat(64) },
+    { url: 'https://not-official.invalid/backend-api/codex/responses' }, { model: 'other' }, { group: 'other-brand' }, { channel: '72' }, { status: '401' }, { kind: 'rate_limit_error' }, { attempt: '2' },
+    { issued: '4000' }, { issued: '16000' }, { expires: '10000' }, { expires: '130001' }]) {
+    const state = sourceHarness(t), before = sourceContext(); await state.instance.attest(before);
+    const headers = state.instance.quotaRequest(quotaContext(before)); await state.instance.attest(finishContext(before));
+    assert.throws(() => state.instance.quotaVerify({ ...quotaContext(before), status: 429, receipt: quotaReceipt(headers, 'info', change) }), { code: 'ATTESTATION_FAILED' });
+  }
+  const state = sourceHarness(t), before = sourceContext(); await state.instance.attest(before);
+  const headers = state.instance.quotaRequest(quotaContext(before)); await state.instance.attest(finishContext(before)); state.setTime(130000);
+  assert.throws(() => state.instance.quotaVerify({ ...quotaContext(before), status: 429, receipt: quotaReceipt(headers) }), error => ['GATEWAY_EXPIRED', 'GATEWAY_CLOSED'].includes(error.code));
+});
+
+// These are deterministic fixtures signed for the documented Go error path,
+// not evidence that Info/Eason has naturally exhausted its personal allowance.
+test('native quota results require both source phases and a valid actual-route receipt; bare errors never authorize fallback', async t => {
+  for (const alias of ['info', 'eason']) {
+    const source = sourceHarness(t), state = harness(t, { config: { attest: source.instance.attest,
+      quotaRequest: source.instance.quotaRequest, quotaVerify: source.instance.quotaVerify },
+    fetch: (_url, init) => new Response('{"error":{"type":"usage_limit_reached","message":"private-provider-diagnostic"}}', {
+      status: 429, headers: { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers, alias) },
+    }) });
+    const input = request(`quota-${alias}`), result = await run(state, input, alias);
+    assert.equal(result.status, 'quota_exhausted'); assert.equal(result.authenticated, true); assert.equal(result.code, 'QUOTA_EXHAUSTED');
+    assert.equal(result.accountAlias, alias); assert.equal(result.inputSha256, input.inputSha256);
+    assert.equal(source.calls.length, 2); assert.equal(state.calls.length, 1);
+    assert.doesNotMatch(JSON.stringify(result), /private-provider|synthetic-access|synthetic-refresh|receipt|nonce|proof/);
+  }
+  for (const receipt of [undefined, 'v1.10000.130000.' + '0'.repeat(64), 'untrusted', 'x'.repeat(1000)]) {
+    const source = sourceHarness(t), state = harness(t, { config: { attest: source.instance.attest,
+      quotaRequest: source.instance.quotaRequest, quotaVerify: source.instance.quotaVerify },
+    fetch: () => new Response('{"error":{"type":"usage_limit_reached"}}', { status: 429,
+      headers: receipt === undefined ? {} : { [QUOTA_RECEIPT_HEADER]: receipt } }) });
+    await assert.rejects(run(state), error => ['GATEWAY_HTTP_FAILURE', 'ATTESTATION_FAILED'].includes(error.code));
+    assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
+  }
+});
+
+test('quota outcome cannot bypass revoked/changed source, caller abort, or a partial successful-status stream', async t => {
+  for (const mode of ['revoke', 'changed', 'partial', 'abort']) {
+    const caller = new AbortController();
+    const source = sourceHarness(t, { respond: (context, proof) => context.payload.phase === 'after' && mode === 'revoke' ? { ...proof, proof: '0'.repeat(64) } :
+      context.payload.phase === 'after' && mode === 'changed' ? signSourceProof({ ...proof, route_revision: 'e'.repeat(64) }) : proof });
+    const state = harness(t, { config: { attest: source.instance.attest, quotaRequest: source.instance.quotaRequest,
+      quotaVerify: source.instance.quotaVerify }, fetch: (_url, init) => {
+      if (mode === 'abort') caller.abort();
+      const headers = { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers) };
+      return mode === 'partial' ? new Response('data: {"type":"response.created"}\n\n', { headers: { ...headers, 'content-type': 'text/event-stream' } }) :
+        new Response('{"error":{"type":"usage_limit_reached"}}', { status: 429, headers });
+    } });
+    await assert.rejects(run(state, request(), 'info', caller.signal)); assert.equal(state.calls.length, 1);
+  }
+});
+
+test('native historical-regression admission is explicit, fixed-corpus only and never inferred from wire scope', async t => {
+  const scope = { tenantId: 'moztech', brandId: 'moztech-test', dataClass: 'historical_regression',
+    corpusSha256: 'c895a50c382ef87751f00cca0899b1660a0f77eca7b5cb72a8fc139573aba5e3', jobId: 'historical-local-test' };
+  const denied = harness(t);
+  await assert.rejects(run(denied, request('historical-denied', { scope })), { code: 'INVALID_REQUEST' }); assert.equal(denied.calls.length, 0);
+  const allowed = harness(t, { config: { allowHistoricalRegression: true } });
+  const result = await run(allowed, request('historical-allowed', { scope })); assert.equal(result.status, 'success');
+  for (const invalid of [{ ...scope, synthetic: true }, { ...scope, corpusSha256: 'f'.repeat(64) }, { ...scope, brandId: 'real-brand' }]) {
+    await assert.rejects(run(allowed, request('historical-invalid', { scope: invalid })), { code: 'INVALID_REQUEST' });
+  }
+  assert.equal(allowed.calls.length, 1);
+});
+
+test('optional quota callbacks are paired, synchronous and cannot leak rejection causes or executable header values', async t => {
+  assert.throws(() => harness(t, { config: { quotaRequest: () => ({}) } }), { code: 'INVALID_CONFIGURATION' });
+  assert.throws(() => harness(t, { config: { quotaVerify: () => true } }), { code: 'INVALID_CONFIGURATION' });
+  for (const mode of ['request-promise', 'verify-promise', 'getter']) {
+    const source = sourceHarness(t), state = harness(t, { config: { attest: source.instance.attest,
+      quotaRequest: mode === 'request-promise' ? () => Promise.reject(new Error('private-quota-secret')) : mode === 'getter' ?
+        () => Object.defineProperty({}, QUOTA_HEADERS[0], { enumerable: true, get() { throw new Error('private-quota-secret'); } }) : source.instance.quotaRequest,
+      quotaVerify: mode === 'verify-promise' ? () => Promise.reject(new Error('private-quota-secret')) : source.instance.quotaVerify },
+    fetch: (_url, init) => new Response('not read', { status: 429, headers: { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers) } }) });
+    await assert.rejects(run(state), error => error.code === 'ATTESTATION_FAILED' && !`${error}`.includes('private-quota-secret'));
+    assert.equal(state.calls.length, mode === 'verify-promise' ? 1 : 0);
+  }
+});
