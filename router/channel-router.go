@@ -38,6 +38,15 @@ func joinPaths(absolutePath, relativePath string) string {
 }
 
 func registerChannelRoutes(apiRouter *gin.RouterGroup) {
+	const localAttestationPath = "/channel/:id/codex-local-attestation"
+	middleware.DeclareAccessTokenPermissionRoute(http.MethodPost, joinPaths(apiRouter.BasePath(), localAttestationPath), authz.ChannelSecretView)
+	apiRouter.POST(localAttestationPath,
+		controller.CodexLocalAttestationGate,
+		middleware.RootAuth(),
+		middleware.RequirePermission(authz.ChannelSecretView),
+		controller.CreateCodexLocalAttestation,
+	)
+
 	channelRoute := apiRouter.Group("/channel")
 	channelRoute.Use(middleware.AdminAuth())
 

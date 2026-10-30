@@ -14,6 +14,8 @@ on:
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
+      - 'controller/codex_local_attestation*.go'
+      - 'router/channel-router.go'
       - '.dockerignore'
   pull_request:
     paths:
@@ -27,6 +29,8 @@ on:
       - '.github/workflows/siwc-local-pilot.yml'
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
+      - 'controller/codex_local_attestation*.go'
+      - 'router/channel-router.go'
       - '.dockerignore'
   workflow_dispatch:
 
@@ -50,6 +54,8 @@ jobs:
             tokenkit/go.sum
       - name: Real Go Responses passthrough, SSE and first-attempt retry contract
         run: go test ./relay -run '^TestSIWCGatewayResponsesPassthroughAndSingleAttempt$' -count=1
+      - name: Owner-local non-secret credential attestation security contract
+        run: go test ./controller -run '^TestCodexLocalAttestation' -count=1
   local-protocol:
     runs-on: ubuntu-latest
     timeout-minutes: 5
