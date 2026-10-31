@@ -1,5 +1,6 @@
 // Local personal-project SIWC probe. Not a hosted-service credential importer.
 import { createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, verify } from 'node:crypto';
+import { types } from 'node:util';
 
 export const ISSUER = 'https://auth.openai.com';
 export const RESOURCE = 'https://api.openai.com/v1';
@@ -265,10 +266,23 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
   return diagnostic;
 }
 
-async function consumeTextStream(body, expectedText, signal) {
+async function consumeTextStream(body, expectedText, signal, onPhase) {
   if (!body) fail('MISSING_COMPLETED_EVENT');
   const decoder = new TextDecoder('utf8', { fatal: true });
   let buffer = '', total = 0, text = '', completed, responseId;
+  const observed = new Set();
+  // Observation receives fixed phase codes only, never an event or text. It
+  // cannot replace the original parser result/error or make a receipt valid.
+  const observe = phase => {
+    if (typeof onPhase !== 'function' || observed.has(phase)) return;
+    observed.add(phase);
+    try { const result = onPhase(phase);
+      // Cross-realm native Promises are not instanceof this realm's Promise.
+      // Use the trusted intrinsic without reading a foreign then/catch field.
+      if (types.isPromise(result)) void Promise.prototype.then.call(result, undefined, () => {});
+    }
+    catch { /* Diagnostic failures never become provider/parser failures. */ }
+  };
   const parts = new Map(), identities = new Map();
   function partFor(outputIndex, contentIndex, itemId) {
     if (!Number.isSafeInteger(outputIndex) || outputIndex < 0 || outputIndex > 63 ||
@@ -320,6 +334,7 @@ async function consumeTextStream(body, expectedText, signal) {
         if (part.done !== undefined) fail('INVALID_STREAM_EVENT');
         part.delta += event.delta;
       }
+      if (event.delta.length) observe('first_text');
     }
     if (event.type === 'response.output_text.done') {
       if (completed) fail('INVALID_STREAM_EVENT');
@@ -337,6 +352,7 @@ async function consumeTextStream(body, expectedText, signal) {
       if (completed || event.response?.status !== 'completed' || event.response.error != null || event.response?.model !== MODEL ||
           typeof event.response?.id !== 'string' || !event.response.id) fail('INVALID_COMPLETION');
       completed = event.response;
+      observe('terminal');
     }
   }
   let iterator, finished = false;
@@ -363,6 +379,7 @@ async function consumeTextStream(body, expectedText, signal) {
     }
     buffer += decoder.decode();
     if (buffer.trim()) consume(buffer);
+    observe('stream_end');
   } catch (error) {
     if (error instanceof ProbeError) throw error;
     fail('STREAM_INTERRUPTED');
@@ -404,6 +421,7 @@ async function consumeTextStream(body, expectedText, signal) {
     cachedInputTokens = source.input_tokens_details?.cached_tokens ?? 0;
     if (!Number.isSafeInteger(cachedInputTokens) || cachedInputTokens < 0 || cachedInputTokens > source.input_tokens) fail('INVALID_USAGE_RECEIPT');
   }
+  if (!observed.has('first_text')) observe('final_text_only');
   return { completed: true, model: MODEL, responseIdHash: digest(completed.id), outputHash: digest(finalText),
     text: finalText, ...(usage ? { usage, cachedInputTokens } : {}) };
 }
@@ -416,8 +434,8 @@ export async function consumeProbeStream(body) {
 
 /** Internal text result for the bounded Corely adapter, never a public proxy.
  * Usage and terminal completion must both be attested by the provider. */
-export async function consumePlanTextStream(body, signal) {
-  const receipt = await consumeTextStream(body, undefined, signal);
+export async function consumePlanTextStream(body, signal, onPhase) {
+  const receipt = await consumeTextStream(body, undefined, signal, onPhase);
   if (!receipt.usage) fail('INVALID_USAGE_RECEIPT');
   return receipt;
 }

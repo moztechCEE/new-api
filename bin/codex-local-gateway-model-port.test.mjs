@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
+import { spawnSync } from 'node:child_process';
 import { after, before, test } from 'node:test';
 import { createCodexLocalGatewayModelTransports, createCodexLocalSourceAttestor, deriveCodexLocalAttestationKey } from './codex-local-gateway-model-port.mjs';
 import * as gateway from './codex-local-gateway-model-port.mjs';
 import { ModelContractError, snapshotModelRequest } from './corely-model-contract.mjs';
-import { ProbeError } from './siwc-local-runtime.mjs';
+import { ProbeError, consumePlanTextStream } from './siwc-local-runtime.mjs';
 import { corelyPlanPayload, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 
 // Injected HTTP/SSE fixtures only: no credential, provider, DB, or listener.
@@ -48,6 +50,7 @@ function harness(t, options = {}) {
   return { instance, calls, checks, owner, setTime: value => { time = value; } };
 }
 const run = (state, input = request(), alias = 'info', signal = new AbortController().signal) => state.instance.ports[alias].generate(input, signal);
+const flush = async () => { for (let index = 0; index < 30; index++) await Promise.resolve(); };
 
 test('native local ports preserve full schema, prompt, hashes, usage, and per-account tokens without SIWC relabeling', async t => {
   const schema = { type: 'object', properties: { reply: { type: 'string', minLength: 2 } }, required: ['reply'], additionalProperties: false };
@@ -394,13 +397,15 @@ test('abort/owner-close during model wait discards late provider success and ret
 
 test('cancellation while the final attestation waits cannot accept its late success', async t => {
   const waiting = deferred(), entered = deferred(), abort = new AbortController();
-  const state = harness(t, { attest: ({ phase }, proof) => {
+  const state = harness(t, { config: { diagnostics: true }, attest: ({ phase }, proof) => {
     if (phase === 'before') return proof;
     entered.resolve(); return waiting.promise.then(() => proof);
   } });
   const pending = run(state, request(), 'info', abort.signal); await entered.promise; abort.abort();
   await assert.rejects(pending, { code: 'GATEWAY_ABORTED' }); waiting.resolve(); await Promise.resolve();
   assert.equal(state.calls.length, 1); assert.equal(state.checks.length, 2);
+  const [timing] = gateway.codexLocalGatewayTimingSnapshot(state.instance).records;
+  assert.equal(timing.status, 'FAILED'); assert.equal(timing.abortPhase, 'AFTER_PROOF'); assert.equal(timing.sourceAfterMs, null);
   await assert.rejects(run(state), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
 });
 
@@ -646,7 +651,7 @@ test('native source waits have separate phase caps and cannot spend or outlive t
     else { assert.equal(ms, 5000); sourceDeadlines.push(deadline); }
     return deadline.signal;
   });
-  const state = harness(t, { attest: ({ phase }, proof) => {
+  const state = harness(t, { config: { diagnostics: true }, attest: ({ phase }, proof) => {
     if (phase === 'before') { preEntered.resolve(); return preRelease.promise.then(() => proof); }
     postEntered.resolve(); return postRelease.promise.then(() => proof);
   }, fetch: () => { state.setTime(64_000); return sse(); } });
@@ -662,6 +667,8 @@ test('native source waits have separate phase caps and cannot spend or outlive t
   state.setTime(68_000); postRelease.resolve();
   const result = await observed; assert.equal(result.error, undefined); assert.equal(result.value.status, 'success');
   assert.equal(state.checks[0].signal, state.checks[1].signal, 'the source attestor retains one owner/caller lifetime across phases');
+  assert.equal(gateway.codexLocalGatewayTimingSnapshot(state.instance).records[0].abortOffsetMs, null,
+    'an elapsed completed-model deadline during after-proof is not an owner cancellation');
 });
 
 test('native model deadline still covers the entire unfinished SSE and never runs the after proof on timeout', async t => {
@@ -753,7 +760,7 @@ test('quota receipts bind every scope/hash/status/attempt and expire without acc
 // not evidence that Info/Eason has naturally exhausted its personal allowance.
 test('native quota results require both source phases and a valid actual-route receipt; bare errors never authorize fallback', async t => {
   for (const alias of ['info', 'eason']) {
-    const source = sourceHarness(t), state = harness(t, { config: { attest: source.instance.attest,
+    const source = sourceHarness(t), state = harness(t, { config: { diagnostics: true, attest: source.instance.attest,
       quotaRequest: source.instance.quotaRequest, quotaVerify: source.instance.quotaVerify },
     fetch: (_url, init) => new Response('{"error":{"type":"usage_limit_reached","message":"private-provider-diagnostic"}}', {
       status: 429, headers: { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers, alias) },
@@ -762,6 +769,8 @@ test('native quota results require both source phases and a valid actual-route r
     assert.equal(result.status, 'quota_exhausted'); assert.equal(result.authenticated, true); assert.equal(result.code, 'QUOTA_EXHAUSTED');
     assert.equal(result.accountAlias, alias); assert.equal(result.inputSha256, input.inputSha256);
     assert.equal(source.calls.length, 2); assert.equal(state.calls.length, 1);
+    const [timing] = gateway.codexLocalGatewayTimingSnapshot(state.instance).records;
+    assert.equal(timing.status, 'QUOTA_EXHAUSTED'); assert.equal(timing.terminalOffsetMs, null);
     assert.doesNotMatch(JSON.stringify(result), /private-provider|synthetic-access|synthetic-refresh|receipt|nonce|proof/);
   }
   for (const receipt of [undefined, 'v1.10000.130000.' + '0'.repeat(64), 'untrusted', 'x'.repeat(1000)]) {
@@ -1006,7 +1015,7 @@ test('stream failures retain only a fixed private class while public errors, val
     ['output limit', () => stream(frame({ type: 'response.output_text.delta', delta: 'x'.repeat(65_537) })), 'STREAM_LIMIT'],
   ];
   for (const [name, response, responseFailureClass] of cases) await t.test(name, async child => {
-    const state = harness(child, { fetch: response });
+    const state = harness(child, { config: { diagnostics: true }, fetch: response });
     await assert.rejects(run(state), error => {
       assert.equal(error.code, 'GATEWAY_RESPONSE_INVALID');
       const diagnostic = gateway.codexLocalGatewayResponseDiagnostic(error);
@@ -1016,6 +1025,7 @@ test('stream failures retain only a fixed private class while public errors, val
     });
     assert.equal(state.calls.length, 1); assert.equal(state.checks.length, 1);
     assert.equal(state.checks[0].binding.accountAlias, 'info');
+    assert.equal(gateway.codexLocalGatewayTimingSnapshot(state.instance).records[0].status, 'FAILED');
   });
 });
 
@@ -1083,4 +1093,196 @@ test('owner cancellation and model timeout keep priority over a simultaneous str
     });
     assert.equal(state.calls.length, 1);
   });
+});
+
+test('stage timing requires an own literal trusted opt-in and never changes owner/request/result contracts', async t => {
+  const previous = process.env.CORELY_LOCAL_MODEL_DIAGNOSTICS;
+  process.env.CORELY_LOCAL_MODEL_DIAGNOSTICS = 'true';
+  try {
+    for (const diagnostics of [undefined, false]) {
+      const state = harness(t, { config: { diagnostics } });
+      const result = await run(state);
+      assert.deepEqual(gateway.codexLocalGatewayTimingSnapshot(state.instance), { records: [], droppedCount: 0 });
+      assert.deepEqual(Object.keys(state.instance).sort(), ['close', 'ports']);
+      assert.deepEqual(result.usage, { inputTokens: 20, outputTokens: 7, cachedInputTokens: 3 });
+    }
+  } finally { if (previous === undefined) delete process.env.CORELY_LOCAL_MODEL_DIAGNOSTICS; else process.env.CORELY_LOCAL_MODEL_DIAGNOSTICS = previous; }
+  for (const value of ['true', 1, null, new Boolean(true), {}, []]) {
+    assert.throws(() => harness(t, { config: { diagnostics: value } }), { code: 'INVALID_CONFIGURATION' });
+  }
+  let touched = 0;
+  const base = { gatewayUrl: URL, accounts: { info: { gatewayToken: TOKENS.info }, eason: { gatewayToken: TOKENS.eason } },
+    attest: async () => { throw Error('NOT_REACHED'); }, signal: new AbortController().signal };
+  for (const bad of [Object.defineProperty({ ...base }, 'diagnostics', { enumerable: true, get() { touched++; return true; } }),
+    Object.assign(Object.create({ diagnostics: true }), base), new Proxy({ ...base, diagnostics: true }, {})]) {
+    assert.throws(() => createCodexLocalGatewayModelTransports(bad), { code: 'INVALID_CONFIGURATION' });
+  }
+  const state = harness(t, { config: { diagnostics: true } });
+  await assert.rejects(run(state, request('caller-diagnostics', { diagnostics: true })), { code: 'INVALID_REQUEST' });
+  assert.deepEqual(gateway.codexLocalGatewayTimingSnapshot(state.instance), { records: [], droppedCount: 0 });
+  assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0); assert.equal(touched, 0);
+  const foreign = new Proxy({}, { get() { touched++; throw Error('PRIVATE_INPUT'); } });
+  assert.deepEqual(gateway.codexLocalGatewayTimingSnapshot(foreign), { records: [], droppedCount: 0 }); assert.equal(touched, 0);
+});
+
+test('numeric stages separate source proof, fetch headers, first text, terminal, stream end and final source check', async t => {
+  let time = 100, controller;
+  t.mock.method(performance, 'now', () => time);
+  const frame = value => new TextEncoder().encode(`data: ${JSON.stringify(value)}\n\n`);
+  const state = harness(t, { config: { diagnostics: true },
+    attest: ({ phase }, proof) => { time += phase === 'before' ? 10 : 7; return proof; },
+    fetch: () => { time += 20; return new Response(new ReadableStream({ start(value) { controller = value; } }),
+      { headers: { 'content-type': 'text/event-stream' } }); } });
+  const input = request('PRIVATE_CALL_IDENTIFIER', { user: 'PRIVATE_INPUT', system: 'PRIVATE_SYSTEM' });
+  const pending = run(state, input); await flush();
+  const empty = gateway.codexLocalGatewayTimingSnapshot(state.instance); assert.deepEqual(empty, { records: [], droppedCount: 0 });
+  time = 160; controller.enqueue(frame({ type: 'response.output_text.delta', delta: 'PRIVATE_' })); await flush();
+  time = 200; controller.enqueue(frame({ type: 'response.output_text.delta', delta: 'OUTPUT' })); await flush();
+  time = 250; controller.enqueue(frame({ type: 'response.completed', response: completion('PRIVATE_OUTPUT') })); await flush();
+  time = 253; controller.close(); const result = await pending;
+  const snapshot = gateway.codexLocalGatewayTimingSnapshot(state.instance);
+  assert.deepEqual(snapshot, { droppedCount: 0, records: [{ attempt: 1, account: 'info', purpose: 'reply_generation', status: 'SUCCESS', clockStatus: 'OBSERVED',
+    totalMs: 160, sourceBeforeMs: 10, dispatchOffsetMs: 10, dispatchToHeadersMs: 20,
+    headersToFirstTextMs: 30, firstTextToTerminalMs: 90, terminalToStreamEndMs: 3,
+    headersToValidatedFinalOnlyTextMs: null, firstTextKind: 'DELTA', terminalOffsetMs: 150, streamEndOffsetMs: 153,
+    sourceAfterMs: 7, abortOffsetMs: null, abortPhase: null }] });
+  assert.equal(result.text, 'PRIVATE_OUTPUT'); assert.equal(result.inputSha256, input.inputSha256);
+  assert.deepEqual(Object.keys(result).sort(), ['accountAlias', 'accountVerified', 'authMode', 'callId', 'completionStatus',
+    'inputSha256', 'model', 'schemaSha256', 'status', 'text', 'usage']);
+  assert.deepEqual(Object.keys(state.instance).sort(), ['close', 'ports']);
+  assert.deepEqual(state.checks.map(x => x.phase), ['before', 'after']); assert.equal(state.calls.length, 1);
+  assert.deepEqual(JSON.parse(state.calls[0].init.body), corelyPlanPayload(input, 'info').payload);
+  assert.equal(Object.isFrozen(snapshot), true); assert.equal(Object.isFrozen(snapshot.records), true); assert.equal(Object.isFrozen(snapshot.records[0]), true);
+  assert.throws(() => { snapshot.records[0].status = 'SUCCESS_OVERRIDE'; }, TypeError);
+  assert.deepEqual(empty, { records: [], droppedCount: 0 }, 'a previously returned snapshot cannot grow');
+  assert.doesNotMatch(JSON.stringify(snapshot), /PRIVATE_|token|Authorization|gateway|schema|input|response|callId|cause/);
+  state.instance.close(); assert.deepEqual(gateway.codexLocalGatewayTimingSnapshot(state.instance), snapshot);
+});
+
+test('final-only text and a seen terminal remain observations, never early acceptance of invalid usage or structured output', async t => {
+  for (const mode of ['valid', 'missing-usage', 'invalid-output']) await t.test(mode, async child => {
+    let time = 0;
+    child.mock.method(performance, 'now', () => time++);
+    const state = harness(child, { config: { diagnostics: true }, fetch: () => sse(completion('PRIVATE_OUTPUT',
+      mode === 'missing-usage' ? { usage: undefined } : {})) });
+    const input = request(`final-only-${mode}`, mode === 'invalid-output' ? { responseFormat: 'json' } : {});
+    if (mode === 'valid') assert.equal((await run(state, input, 'eason')).status, 'success');
+    else await assert.rejects(run(state, input, 'eason'), { code: mode === 'missing-usage' ? 'GATEWAY_RESPONSE_INVALID' : 'INVALID_STRUCTURED_OUTPUT' });
+    const [row] = gateway.codexLocalGatewayTimingSnapshot(state.instance).records;
+    assert.equal(row.status, mode === 'valid' ? 'SUCCESS' : 'FAILED'); assert.equal(row.account, 'eason');
+    assert.equal(row.firstTextKind, 'FINAL_ONLY_VALIDATED'); assert.equal(row.headersToFirstTextMs, null);
+    assert.equal(row.firstTextToTerminalMs, null); assert.ok(row.terminalOffsetMs <= row.streamEndOffsetMs);
+    assert.ok(row.headersToValidatedFinalOnlyTextMs >= 0);
+    assert.equal(state.calls.length, 1); assert.equal(state.checks.length, mode === 'valid' ? 2 : 1);
+  });
+});
+
+test('diagnostic observer failure cannot swallow a parser error or change a completed receipt', async () => {
+  const expected = await consumePlanTextStream(sse().body, new AbortController().signal);
+  for (const asyncFailure of [false, true]) {
+    const phases = [];
+    const result = await consumePlanTextStream(sse().body, new AbortController().signal, (...args) => {
+      assert.equal(args.length, 1); phases.push(args[0]);
+      if (asyncFailure) return Promise.reject(new Error('PRIVATE_OBSERVER_FAILURE'));
+      throw new Error('PRIVATE_OBSERVER_FAILURE');
+    });
+    assert.deepEqual(result, expected);
+    assert.deepEqual(phases, ['terminal', 'stream_end', 'final_text_only']);
+    await assert.rejects(consumePlanTextStream(new Response('data: {PRIVATE_STREAM_VALUE}\n\n').body,
+      new AbortController().signal, () => { throw Error('PRIVATE_OBSERVER_FAILURE'); }), { code: 'INVALID_STREAM_EVENT' });
+  }
+});
+
+test('cross-realm observer rejection is absorbed without reading its own then/catch accessors or replacing a parser error', () => {
+  // Isolate intentional rejected-Promise fixtures so Node's test runner never
+  // mistakes the regression's unhandled events for provider/parser failures.
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import { runInNewContext } from 'node:vm';
+    import { consumePlanTextStream, MODEL } from ${JSON.stringify(new globalThis.URL('./siwc-local-runtime.mjs', import.meta.url).href)};
+    let unhandled = 0, getters = 0, observed = 0, originalParserError = false;
+    process.on('unhandledRejection', () => { unhandled++; });
+    const completed = { type: 'response.completed', response: { id: 'synthetic', status: 'completed', model: MODEL,
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'PRIVATE_TEXT' }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } };
+    const body = () => new Response('data: ' + JSON.stringify(completed) + '\\n\\n').body;
+    const observer = () => {
+      observed++;
+      const rejected = runInNewContext('Promise.reject(new Error("PRIVATE_OBSERVER"))');
+      for (const key of ['then', 'catch']) Object.defineProperty(rejected, key, { get() { getters++; throw Error('PRIVATE_GETTER'); } });
+      return rejected;
+    };
+    await consumePlanTextStream(body(), new AbortController().signal, observer);
+    const invalid = 'data: ' + JSON.stringify(completed) + '\\n\\ndata: {PRIVATE_INVALID}\\n\\n';
+    try { await consumePlanTextStream(new Response(invalid).body, new AbortController().signal, observer); }
+    catch (error) { originalParserError = error.code === 'INVALID_STREAM_EVENT'; }
+    await new Promise(resolve => setImmediate(resolve));
+    console.log(JSON.stringify({ unhandled, getters, observed, originalParserError }));
+  `], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: '/private/tmp' }, timeout: 5000 });
+  assert.equal(child.status, 0);
+  const receipt = JSON.parse(child.stdout.trim());
+  assert.ok(receipt.observed >= 3); assert.equal(receipt.unhandled, 0); assert.equal(receipt.getters, 0);
+  assert.equal(receipt.originalParserError, true); assert.doesNotMatch(child.stdout + child.stderr, /PRIVATE_/);
+});
+
+test('timing preserves caller/owner/model cancellation and immutable snapshots after a noncooperative late fetch', async t => {
+  for (const mode of ['caller', 'owner', 'model']) await t.test(mode, async child => {
+    let time = 100, modelDeadline;
+    child.mock.method(performance, 'now', () => time);
+    child.mock.method(AbortSignal, 'timeout', ms => { const deadline = new AbortController();
+      if (ms === 60000) modelDeadline = deadline; else assert.equal(ms, 5000); return deadline.signal; });
+    const entered = deferred(), release = deferred(), caller = new AbortController();
+    const state = harness(child, { config: { diagnostics: true }, fetch: () => { entered.resolve(); return release.promise; } });
+    const pending = run(state, request(`late-timing-${mode}`), 'info', caller.signal); await entered.promise;
+    time = 160;
+    if (mode === 'caller') caller.abort('PRIVATE_ABORT_REASON'); else if (mode === 'owner') state.owner.abort('PRIVATE_ABORT_REASON'); else modelDeadline.abort('PRIVATE_ABORT_REASON');
+    await assert.rejects(pending, { code: mode === 'caller' ? 'GATEWAY_ABORTED' : mode === 'owner' ? 'GATEWAY_CLOSED' : 'GATEWAY_TIMEOUT' });
+    const before = gateway.codexLocalGatewayTimingSnapshot(state.instance); assert.equal(before.records.length, 1);
+    assert.equal(before.records[0].status, 'FAILED'); assert.equal(before.records[0].abortOffsetMs, 60); assert.equal(before.records[0].abortPhase, 'DISPATCH');
+    assert.equal(before.records[0].dispatchToHeadersMs, null); assert.equal(before.records[0].terminalOffsetMs, null);
+    time = 999; release.resolve(sse(completion('PRIVATE_LATE_OUTPUT'))); await flush();
+    assert.deepEqual(gateway.codexLocalGatewayTimingSnapshot(state.instance), before);
+    assert.equal(state.calls.length, 1); assert.equal(state.checks.length, 1);
+    assert.doesNotMatch(JSON.stringify(before), /PRIVATE_|reason|inputSha|callId|gatewayToken/);
+  });
+});
+
+test('invalid diagnostic clock is not an authority clock and cannot change model acceptance', async t => {
+  t.mock.method(performance, 'now', () => { throw Error('PRIVATE_DIAGNOSTIC_CLOCK_FAILURE'); });
+  const state = harness(t, { config: { diagnostics: true } });
+  assert.equal((await run(state)).status, 'success');
+  const [row] = gateway.codexLocalGatewayTimingSnapshot(state.instance).records;
+  assert.equal(row.clockStatus, 'UNAVAILABLE'); assert.equal(row.totalMs, null); assert.equal(row.status, 'SUCCESS');
+  assert.equal(state.calls.length, 1); assert.equal(state.checks.length, 2);
+});
+
+test('cancellation after first text or a terminal event cannot publish or later amend an observed receipt', async t => {
+  for (const terminalSeen of [false, true]) await t.test(String(terminalSeen), async child => {
+    let time = 100, stream;
+    child.mock.method(performance, 'now', () => time);
+    const caller = new AbortController(), encode = event => new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`);
+    const state = harness(child, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+      start(controller) { stream = controller; }, cancel() {},
+    }), { headers: { 'content-type': 'text/event-stream' } }) });
+    const pending = run(state, request(`stream-timing-${terminalSeen}`), 'info', caller.signal); await flush();
+    time = 150; stream.enqueue(encode({ type: 'response.output_text.delta', delta: 'PRIVATE_STREAM_TEXT' })); await flush();
+    if (terminalSeen) { time = 160; stream.enqueue(encode({ type: 'response.completed', response: completion('PRIVATE_STREAM_TEXT') })); await flush(); }
+    time = 170; caller.abort('PRIVATE_REASON'); await assert.rejects(pending, { code: 'GATEWAY_ABORTED' });
+    const snapshot = gateway.codexLocalGatewayTimingSnapshot(state.instance), [row] = snapshot.records;
+    assert.equal(row.status, 'FAILED'); assert.equal(row.firstTextKind, 'DELTA');
+    assert.equal(row.abortPhase, 'STREAM'); assert.equal(row.abortOffsetMs, 70);
+    assert.equal(row.terminalOffsetMs, terminalSeen ? 60 : null); assert.equal(row.streamEndOffsetMs, null);
+    time = 1000; await flush();
+    assert.deepEqual(gateway.codexLocalGatewayTimingSnapshot(state.instance), snapshot);
+    assert.equal(state.checks.length, 1); assert.equal(state.calls.length, 1);
+    assert.doesNotMatch(JSON.stringify(snapshot), /PRIVATE_|reason|text|body/);
+  });
+});
+
+test('bounded timing history reports dropped observations without changing subsequent model admission or results', async t => {
+  const state = harness(t, { config: { diagnostics: true } });
+  for (let index = 0; index < 34; index++) assert.equal((await run(state, request(`bounded-stage-${index}`))).status, 'success');
+  const snapshot = gateway.codexLocalGatewayTimingSnapshot(state.instance);
+  assert.equal(snapshot.records.length, 32); assert.equal(snapshot.droppedCount, 2);
+  assert.equal(snapshot.records[0].attempt, 1); assert.equal(snapshot.records.at(-1).attempt, 32);
+  assert.equal(state.calls.length, 34); assert.equal(state.checks.length, 68);
 });

@@ -2,6 +2,7 @@
 // This is not SIWC, a hosted deployment, a billing proof, or a credential importer.
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { types } from 'node:util';
+import { performance } from 'node:perf_hooks';
 import { corelyPlanPayload } from './siwc-local-model-port.mjs';
 import { consumePlanTextStream, MODEL, ProbeError } from './siwc-local-runtime.mjs';
 import { ModelContractError, snapshotModelRequest, snapshotModelResult } from './corely-model-contract.mjs';
@@ -12,6 +13,9 @@ const ERROR_CODES = new Set(['INVALID_CONFIGURATION', 'INVALID_REQUEST', 'ATTEST
   'GATEWAY_UNAVAILABLE', 'GATEWAY_RESPONSE_INVALID', 'GATEWAY_HTTP_FAILURE', 'INVALID_OUTPUT', 'INVALID_STRUCTURED_OUTPUT']);
 const ERRORS = new WeakMap();
 const RESPONSE_DIAGNOSTICS = new WeakMap();
+const TIMING_SNAPSHOTS = new WeakMap();
+const MAX_TIMING_RECORDS = 32;
+const EMPTY_TIMING_SNAPSHOT = Object.freeze({ records: Object.freeze([]), droppedCount: 0 });
 const RESPONSE_FAILURE_CLASSES = new Map([
   ['MISSING_COMPLETED_EVENT', 'TERMINAL_MISSING'], ['INFERENCE_NOT_COMPLETED', 'TERMINAL_NOT_COMPLETED'],
   ['NON_TEXT_OUTPUT_REJECTED', 'NON_TEXT_OUTPUT'], ['INVALID_USAGE_RECEIPT', 'USAGE_INVALID'],
@@ -28,7 +32,50 @@ export class CodexLocalGatewayError extends Error {
 /** Fixed local observation only, never a quota/authentication/fallback proof.
  * WeakMap lookup does not inspect a foreign error, its properties or causes. */
 export const codexLocalGatewayResponseDiagnostic = error => RESPONSE_DIAGNOSTICS.get(error);
+/** Owner-local observation only. No request/result fields, text, identifiers,
+ * credentials or authority are added; unknown/disabled owners expose nothing. */
+export const codexLocalGatewayTimingSnapshot = owner => TIMING_SNAPSHOTS.get(owner)?.() ?? EMPTY_TIMING_SNAPSHOT;
 const reject = code => { throw new CodexLocalGatewayError(code); };
+
+function beginLocalModelTiming(attempt, account, purpose) {
+  const marks = Object.create(null);
+  let start, last, clockUnavailable = false, phase = 'BEFORE_PROOF', abortPhase = null;
+  const elapsed = () => {
+    if (clockUnavailable) return null;
+    try {
+      const value = performance.now();
+      if (!Number.isFinite(value) || value < 0 || last !== undefined && value < last) throw new Error();
+      last = value; start ??= value; return Math.round(value - start);
+    } catch { clockUnavailable = true; return null; }
+  };
+  elapsed();
+  return {
+    mark(name) {
+      if (!Object.hasOwn(marks, name)) marks[name] = elapsed();
+      if (name === 'dispatch') phase = 'DISPATCH';
+      if (name === 'headers') phase = 'STREAM';
+      if (name === 'after_start') phase = 'AFTER_PROOF';
+      if (name === 'abort' && abortPhase === null) abortPhase = phase;
+    },
+    finish(status) {
+      const totalMs = elapsed();
+      const between = (from, to) => Number.isSafeInteger(from) && Number.isSafeInteger(to) && to >= from ? to - from : null;
+      return Object.freeze({ attempt, account, purpose, status, clockStatus: clockUnavailable ? 'UNAVAILABLE' : 'OBSERVED',
+        totalMs, sourceBeforeMs: between(0, marks.before_end), dispatchOffsetMs: marks.dispatch ?? null,
+        dispatchToHeadersMs: between(marks.dispatch, marks.headers),
+        headersToFirstTextMs: between(marks.headers, marks.first_text),
+        firstTextToTerminalMs: between(marks.first_text, marks.terminal),
+        terminalToStreamEndMs: between(marks.terminal, marks.stream_end),
+        // Without a delta, only the final validated text is observed after
+        // EOF. This is not provider TTFT or evidence of receipt acceptance.
+        headersToValidatedFinalOnlyTextMs: between(marks.headers, marks.final_text_only),
+        firstTextKind: Object.hasOwn(marks, 'first_text') ? 'DELTA' : Object.hasOwn(marks, 'final_text_only') ? 'FINAL_ONLY_VALIDATED' : 'NONE',
+        terminalOffsetMs: marks.terminal ?? null, streamEndOffsetMs: marks.stream_end ?? null,
+        sourceAfterMs: between(marks.after_start, marks.after_end),
+        abortOffsetMs: marks.abort ?? null, abortPhase });
+    },
+  };
+}
 
 function ownData(input, allowed, code) {
   try {
@@ -301,7 +348,7 @@ export function createCodexLocalSourceAttestor(options) {
  */
 export function createCodexLocalGatewayModelTransports(options) {
   const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
-    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache'], 'INVALID_CONFIGURATION');
+    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache', 'diagnostics'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
   if (typeof attest !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' ||
@@ -313,6 +360,7 @@ export function createCodexLocalGatewayModelTransports(options) {
       (config.allowJointUnderstanding !== undefined && typeof config.allowJointUnderstanding !== 'boolean') ||
       (config.nativeExplicitPrefixCache !== undefined && typeof config.nativeExplicitPrefixCache !== 'boolean') ||
       (config.nativeMessagePrefixCache !== undefined && typeof config.nativeMessagePrefixCache !== 'boolean') ||
+      (config.diagnostics !== undefined && typeof config.diagnostics !== 'boolean') ||
       (config.nativeExplicitPrefixCache === true && config.nativeMessagePrefixCache === true)) reject('INVALID_CONFIGURATION');
   const localAdmission = config.allowHistoricalRegression === true || config.allowJointUnderstanding === true ? Object.freeze({
     ...(config.allowHistoricalRegression === true ? { allowHistoricalRegression: true } : {}),
@@ -334,6 +382,8 @@ export function createCodexLocalGatewayModelTransports(options) {
     lastClock = value; return value;
   };
   const expiresAt = clock() + OWNER_TTL_MS, lifetime = new AbortController(), seen = new Set(), busy = new Set();
+  const timings = [];
+  let droppedTimings = 0;
   let closed = false;
   const close = () => {
     if (closed) return;
@@ -358,6 +408,7 @@ export function createCodexLocalGatewayModelTransports(options) {
     const key = `${alias}:${request.callId}`;
     if (seen.has(key) || seen.size >= MAX_CALLS || busy.has(alias)) reject('GATEWAY_REPLAY_OR_CAPACITY');
     seen.add(key); busy.add(alias);
+    const timing = config.diagnostics === true ? beginLocalModelTiming(seen.size, alias, request.purpose) : undefined;
     const binding = Object.freeze({ accountAlias: alias, model: MODEL, callId: request.callId,
       inputSha256: request.inputSha256, schemaSha256: request.schemaSha256, gatewayUrl: endpoint });
     const handle = Object.freeze({});
@@ -376,8 +427,13 @@ export function createCodexLocalGatewayModelTransports(options) {
       return attestationSnapshot(value, binding, clock());
     };
     let response, responseBody, modelDeadline, modelActive, modelFinished = false, streamConsumptionFailed = false;
+    let timingStatus = 'FAILED';
+    const observeOwnerAbort = () => timing?.mark('abort');
+    const observeModelAbort = () => { if (!modelFinished) timing?.mark('abort'); };
+    if (timing) ownerActive.addEventListener('abort', observeOwnerAbort, { once: true });
     try {
       const before = await fresh('before', 'pending');
+      timing?.mark('before_end');
       let { payload } = corelyPlanPayload(request, alias, localAdmission);
       // Native-only, default-OFF protocol prototype. The existing request
       // snapshot validates the exact prefix and Unicode/hash boundaries. Keep
@@ -409,9 +465,13 @@ export function createCodexLocalGatewayModelTransports(options) {
       // and ends only after the full model stream has completed.
       modelDeadline = AbortSignal.timeout(CALL_TTL_MS);
       modelActive = AbortSignal.any([ownerActive, modelDeadline]);
+      if (timing) modelActive.addEventListener('abort', observeModelAbort, { once: true });
       const fetching = Promise.resolve().then(() => {
         activeCheck(modelActive);
         if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
+        // This is the configured fetch invocation, not proof of upstream TCP
+        // dispatch: a trusted injected wrapper may still run local guards.
+        timing?.mark('dispatch');
         return fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
           headers: { Authorization: `Bearer ${tokens.get(alias)}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
             'X-Client-Request-Id': randomUUID(), ...quotaHeaders }, body: JSON.stringify(payload), signal: modelActive });
@@ -423,10 +483,13 @@ export function createCodexLocalGatewayModelTransports(options) {
       activeCheck(modelActive);
       if (!response || types.isProxy(response) || !(response instanceof Response) || response.redirected ||
           (response.url && response.url !== endpoint)) reject('GATEWAY_RESPONSE_INVALID');
+      timing?.mark('headers');
       responseBody = response.body;
       if (!response.ok) {
         modelFinished = true;
+        timing?.mark('after_start');
         const after = await fresh('after', 'http_failure');
+        timing?.mark('after_end');
         if (after.configurationRevision !== before.configurationRevision) reject('ATTESTATION_CHANGED');
         if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
         if (quotaEnabled && response.status === 429 && response.headers.has(QUOTA_RECEIPT_HEADER)) {
@@ -435,9 +498,10 @@ export function createCodexLocalGatewayModelTransports(options) {
             receipt: response.headers.get(QUOTA_RECEIPT_HEADER) }))); } catch { reject('ATTESTATION_FAILED'); }
           activeCheck(ownerActive);
           if (verified !== true) reject('ATTESTATION_FAILED');
-          return snapshotModelResult({ accountAlias: alias, authMode: 'managed_chatgpt', accountVerified: true, model: MODEL,
+          const result = snapshotModelResult({ accountAlias: alias, authMode: 'managed_chatgpt', accountVerified: true, model: MODEL,
             callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
             status: 'quota_exhausted', code: 'QUOTA_EXHAUSTED', authenticated: true }, request, alias, 'managed_chatgpt');
+          timingStatus = 'QUOTA_EXHAUSTED'; return result;
         }
         // Native errors cannot attest account funding or quota. In particular,
         // generic 429 never triggers Eason or paid API fallback from this port.
@@ -446,7 +510,7 @@ export function createCodexLocalGatewayModelTransports(options) {
       const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
       if (media !== 'text/event-stream') reject('GATEWAY_RESPONSE_INVALID');
       let receipt;
-      try { receipt = await whileActive(consumePlanTextStream(responseBody, modelActive), modelActive); }
+      try { receipt = await whileActive(consumePlanTextStream(responseBody, modelActive, timing ? phase => timing.mark(phase) : undefined), modelActive); }
       catch (error) { streamConsumptionFailed = true; throw error; }
       activeCheck(modelActive);
       modelFinished = true;
@@ -455,10 +519,12 @@ export function createCodexLocalGatewayModelTransports(options) {
         status: 'success', completionStatus: 'completed', text: receipt.text,
         usage: { inputTokens: receipt.usage.inputTokens, outputTokens: receipt.usage.outputTokens,
           cachedInputTokens: receipt.cachedInputTokens } }, request, alias, 'managed_chatgpt');
+      timing?.mark('after_start');
       const after = await fresh('after', 'success');
+      timing?.mark('after_end');
       if (after.configurationRevision !== before.configurationRevision) reject('ATTESTATION_CHANGED');
       if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
-      activeCheck(ownerActive); return result;
+      activeCheck(ownerActive); timingStatus = 'SUCCESS'; return result;
     } catch (error) {
       if (ownerActive.aborted) reject(closed ? 'GATEWAY_CLOSED' : 'GATEWAY_ABORTED');
       if (!modelFinished && modelDeadline?.aborted) reject('GATEWAY_TIMEOUT');
@@ -493,6 +559,12 @@ export function createCodexLocalGatewayModelTransports(options) {
       }
       reject('GATEWAY_UNAVAILABLE');
     } finally {
+      if (timing) {
+        ownerActive.removeEventListener('abort', observeOwnerAbort);
+        modelActive?.removeEventListener('abort', observeModelAbort);
+        if (timings.length < MAX_TIMING_RECORDS) timings.push(timing.finish(timingStatus));
+        else droppedTimings++;
+      }
       busy.delete(alias);
       discardResponse(response);
     }
@@ -500,5 +572,7 @@ export function createCodexLocalGatewayModelTransports(options) {
   const port = alias => Object.freeze({ authMode: 'managed_chatgpt',
     capabilities: Object.freeze({ text: true, structuredJson: true, images: false }),
     generate: (request, signal) => generate(alias, request, signal) });
-  return Object.freeze({ ports: Object.freeze({ info: port('info'), eason: port('eason') }), close });
+  const owner = Object.freeze({ ports: Object.freeze({ info: port('info'), eason: port('eason') }), close });
+  if (config.diagnostics === true) TIMING_SNAPSHOTS.set(owner, () => Object.freeze({ records: Object.freeze([...timings]), droppedCount: droppedTimings }));
+  return owner;
 }
