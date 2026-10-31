@@ -348,7 +348,7 @@ export function createCodexLocalSourceAttestor(options) {
  */
 export function createCodexLocalGatewayModelTransports(options) {
   const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
-    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache', 'diagnostics'], 'INVALID_CONFIGURATION');
+    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache', 'nativeSessionAffinity', 'diagnostics'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
   if (typeof attest !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' ||
@@ -360,6 +360,7 @@ export function createCodexLocalGatewayModelTransports(options) {
       (config.allowJointUnderstanding !== undefined && typeof config.allowJointUnderstanding !== 'boolean') ||
       (config.nativeExplicitPrefixCache !== undefined && typeof config.nativeExplicitPrefixCache !== 'boolean') ||
       (config.nativeMessagePrefixCache !== undefined && typeof config.nativeMessagePrefixCache !== 'boolean') ||
+      (config.nativeSessionAffinity !== undefined && typeof config.nativeSessionAffinity !== 'boolean') ||
       (config.diagnostics !== undefined && typeof config.diagnostics !== 'boolean') ||
       (config.nativeExplicitPrefixCache === true && config.nativeMessagePrefixCache === true)) reject('INVALID_CONFIGURATION');
   const localAdmission = config.allowHistoricalRegression === true || config.allowJointUnderstanding === true ? Object.freeze({
@@ -454,6 +455,18 @@ export function createCodexLocalGatewayModelTransports(options) {
           { role: 'user', content: request.user.slice(boundary) },
         ] });
       }
+      // Default-OFF cache hint only, never a CLI session, turn state or grant.
+      // A domain-separated HMAC hides scope/material values and reuses only the
+      // existing short-lived route token; rotating it rotates this namespace.
+      // Call/job IDs, dynamic suffixes and proof nonces/times are excluded.
+      let sessionId;
+      if (config.nativeSessionAffinity === true && request.promptCache?.userPrefixChars !== undefined) {
+        sessionId = framedParts(createHmac('sha256', tokens.get(alias)), ['new-api.local-codex-cache-affinity.v1', alias,
+          request.scope.tenantId, request.scope.brandId, MODEL, request.workload, request.purpose,
+          request.reasoningEffort ?? '-', request.verbosity ?? '-', request.promptCache.key,
+          createHash('sha256').update(request.system, 'utf8').digest('hex'), request.schemaSha256 ?? '-',
+          createHash('sha256').update(request.user.slice(0, request.promptCache.userPrefixChars), 'utf8').digest('hex')]).digest('hex');
+      }
       let quotaHeaders = Object.create(null);
       if (quotaEnabled) {
         try { quotaHeaders = ownData(synchronousQuotaValue(config.quotaRequest(Object.freeze({ handle, binding, signal: ownerActive }))), QUOTA_REQUEST_HEADERS, 'ATTESTATION_FAILED'); }
@@ -474,7 +487,7 @@ export function createCodexLocalGatewayModelTransports(options) {
         timing?.mark('dispatch');
         return fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
           headers: { Authorization: `Bearer ${tokens.get(alias)}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
-            'X-Client-Request-Id': randomUUID(), ...quotaHeaders }, body: JSON.stringify(payload), signal: modelActive });
+            'X-Client-Request-Id': randomUUID(), ...(sessionId === undefined ? {} : { 'session-id': sessionId }), ...quotaHeaders }, body: JSON.stringify(payload), signal: modelActive });
       });
       // A fetch implementation may ignore cancellation and resolve only after
       // its owner has gone away. Observe and discard that late body as well.

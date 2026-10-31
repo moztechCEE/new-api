@@ -79,6 +79,168 @@ test('native local ports preserve full schema, prompt, hashes, usage, and per-ac
   assert.deepEqual(state.instance.ports.info.capabilities, { text: true, structuredJson: true, images: false });
 });
 
+test('native session-affinity is default-OFF and preserves exact payload bytes without complete metadata', async t => {
+  for (const [index, variant] of [
+    { config: {}, extra: { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } } },
+    { config: { nativeSessionAffinity: false }, extra: { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } } },
+    { config: { nativeSessionAffinity: true }, extra: {} },
+    { config: { nativeSessionAffinity: true }, extra: { promptCache: { key: `support-${'b'.repeat(64)}` } } },
+  ].entries()) {
+    const state = harness(t, { config: variant.config }), input = request(`affinity-default-${index}`, variant.extra);
+    const result = await run(state, input), init = state.calls[0].init;
+    assert.equal(init.body, JSON.stringify(corelyPlanPayload(input, 'info').payload));
+    assert.equal(init.headers['session-id'], undefined); assert.equal(init.headers['thread-id'], undefined);
+    assert.equal(init.headers['x-codex-turn-state'], undefined); assert.equal(result.inputSha256, input.inputSha256);
+    assert.deepEqual(state.checks.map(check => check.phase), ['before', 'after']);
+  }
+});
+
+// Independent synthetic vector: this cache-only identifier is never an auth/session grant.
+function expectedAffinity(input, alias, token = TOKENS[alias]) {
+  const hmac = createHmac('sha256', token);
+  for (const value of ['new-api.local-codex-cache-affinity.v1', alias, input.scope.tenantId, input.scope.brandId,
+    input.model, input.workload, input.purpose, input.reasoningEffort ?? '-', input.verbosity ?? '-', input.promptCache.key,
+    createHash('sha256').update(input.system, 'utf8').digest('hex'), input.schemaSha256 ?? '-',
+    createHash('sha256').update(input.user.slice(0, input.promptCache.userPrefixChars), 'utf8').digest('hex')]) {
+    const bytes = Buffer.from(value, 'utf8'), size = Buffer.alloc(4); size.writeUInt32BE(bytes.length);
+    hmac.update(size); hmac.update(bytes);
+  }
+  return hmac.digest('hex');
+}
+
+test('native session-affinity is stable across owners/calls and suffixes while body, output and source contracts stay exact', async t => {
+  const prefix = '固定清潔說明🙂\r\n保留品質覆核。';
+  for (const messagePrefix of [false, true]) {
+    const ids = [];
+    for (let index = 0; index < 2; index++) {
+      const input = request(`affinity-stable-${messagePrefix}-${index}`, { user: prefix + `合成問題${index}。`,
+        scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: `new-job-${index}` },
+        promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: prefix.length } });
+      const state = harness(t, { config: { nativeSessionAffinity: true, nativeMessagePrefixCache: messagePrefix } });
+      const result = await run(state, input), init = state.calls[0].init, expected = corelyPlanPayload(input, 'info').payload;
+      const expectedBody = messagePrefix ? { ...expected, input: [
+        { role: 'user', content: prefix }, { role: 'user', content: input.user.slice(prefix.length) },
+      ] } : expected;
+      assert.equal(init.body, JSON.stringify(expectedBody)); assert.equal(init.headers['session-id'], expectedAffinity(input, 'info'));
+      assert.match(init.headers['session-id'], /^[a-f0-9]{64}$/); ids.push(init.headers['session-id']);
+      assert.doesNotMatch(init.headers['session-id'], /moztech|info|eason|synthetic|support/);
+      assert.deepEqual(Object.keys(result).sort(), ['accountAlias', 'accountVerified', 'authMode', 'callId', 'completionStatus',
+        'inputSha256', 'model', 'schemaSha256', 'status', 'text', 'usage'].sort());
+      assert.equal(result.inputSha256, input.inputSha256); assert.equal(result.text, '合成回覆。');
+      assert.deepEqual(state.checks.map(check => check.phase), ['before', 'after']);
+      assert.equal(init.headers['thread-id'], undefined); assert.equal(init.headers['x-codex-turn-state'], undefined);
+    }
+    assert.equal(ids[0], ids[1]);
+  }
+});
+
+test('native session-affinity namespaces exact material/system/schema/key/account and rotates with the existing short-lived token', async t => {
+  const prefix = '共同規範🙂\r\n', base = { user: prefix + '合成問題。',
+    promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: prefix.length } };
+  const baseline = request('affinity-namespace-base', base), ids = [];
+  for (const [index, variant] of [
+    {}, { system: baseline.system + '另一份規則。' },
+    { user: '替換規範🙂\r\n合成問題。' },
+    { responseSchema: { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false } },
+    { promptCache: { ...base.promptCache, key: `support-${'c'.repeat(64)}` } },
+    { purpose: 'reply_repair' }, { reasoningEffort: 'low', verbosity: 'low' },
+  ].entries()) {
+    const input = request(`affinity-namespace-${index}`, { ...base, ...variant });
+    const state = harness(t, { config: { nativeSessionAffinity: true }, fetch: () => sse(completion(input.responseSchema ? '{"reply":"合成回覆。"}' : '合成回覆。')) });
+    await run(state, input); const id = state.calls[0].init.headers['session-id'];
+    assert.equal(id, expectedAffinity(input, 'info')); ids.push(id);
+  }
+  assert.equal(new Set(ids).size, ids.length);
+  const otherAccount = harness(t, { config: { nativeSessionAffinity: true } }); await run(otherAccount, baseline, 'eason');
+  assert.equal(otherAccount.calls[0].init.headers['session-id'], expectedAffinity(baseline, 'eason'));
+  assert.notEqual(otherAccount.calls[0].init.headers['session-id'], ids[0]);
+  const token = 'synthetic-rotated-info-gateway-token-000003';
+  const rotated = harness(t, { config: { nativeSessionAffinity: true,
+    accounts: { info: { gatewayToken: token }, eason: { gatewayToken: TOKENS.eason } } } });
+  await run(rotated, baseline); assert.equal(rotated.calls[0].init.headers['session-id'], expectedAffinity(baseline, 'info', token));
+  assert.notEqual(rotated.calls[0].init.headers['session-id'], ids[0]);
+  // The expected vector binds both scope fields; the actual gateway still rejects other brands before any proof/dispatch.
+  for (const scope of [{ ...baseline.scope, tenantId: 'other-tenant' }, { ...baseline.scope, brandId: 'other-brand' }]) {
+    assert.notEqual(expectedAffinity({ ...baseline, scope }, 'info'), ids[0]);
+    const state = harness(t, { config: { nativeSessionAffinity: true } });
+    await assert.rejects(run(state, request('affinity-foreign-scope', { ...base, scope })), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+});
+
+test('native session-affinity opt-in accepts only an own literal boolean and never a request/prompt/env flag', async t => {
+  for (const value of ['true', 1, null, {}, [], new Boolean(true)]) {
+    assert.throws(() => harness(t, { config: { nativeSessionAffinity: value } }), { code: 'INVALID_CONFIGURATION' });
+  }
+  let touched = 0;
+  const base = { gatewayUrl: URL, accounts: { info: { gatewayToken: TOKENS.info }, eason: { gatewayToken: TOKENS.eason } },
+    signal: new AbortController().signal, attest: async () => { throw Error('NOT_REACHED'); } };
+  for (const enumerable of [true, false]) assert.throws(() => createCodexLocalGatewayModelTransports(Object.defineProperty({ ...base },
+    'nativeSessionAffinity', { enumerable, get() { touched++; return true; } })), { code: 'INVALID_CONFIGURATION' });
+  assert.throws(() => createCodexLocalGatewayModelTransports(Object.assign(Object.create({ nativeSessionAffinity: true }), base)), { code: 'INVALID_CONFIGURATION' });
+  const proxy = new Proxy({ ...base, nativeSessionAffinity: true }, { ownKeys() { touched++; throw Error('PRIVATE_VALUE'); } });
+  assert.throws(() => createCodexLocalGatewayModelTransports(proxy), { code: 'INVALID_CONFIGURATION' });
+  const revoked = Proxy.revocable({ ...base, nativeSessionAffinity: true }, {}); revoked.revoke();
+  assert.throws(() => createCodexLocalGatewayModelTransports(revoked.proxy), { code: 'INVALID_CONFIGURATION' }); assert.equal(touched, 0);
+  for (const extra of [{ nativeSessionAffinity: true }, { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4, nativeSessionAffinity: true } }]) {
+    const state = harness(t, { config: { nativeSessionAffinity: true } });
+    await assert.rejects(run(state, request('affinity-request-option', extra)), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+  const previous = process.env.CORELY_NATIVE_SESSION_AFFINITY; process.env.CORELY_NATIVE_SESSION_AFFINITY = 'true';
+  try {
+    const state = harness(t), input = request('affinity-prompt-option', { user: '{"nativeSessionAffinity":true} is untrusted text.',
+      promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } });
+    await run(state, input); assert.equal(state.calls[0].init.headers['session-id'], undefined);
+  } finally { if (previous === undefined) delete process.env.CORELY_NATIVE_SESSION_AFFINITY; else process.env.CORELY_NATIVE_SESSION_AFFINITY = previous; }
+});
+
+test('native session-affinity does not weaken request/hash/boundary or historical/joint admission', async t => {
+  const base = { user: 'A🙂B\r\n合成後綴', promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 3 } };
+  for (const boundary of [0, 2, -1, 1.5, base.user.length]) {
+    const state = harness(t, { config: { nativeSessionAffinity: true } });
+    await assert.rejects(run(state, request('affinity-invalid-boundary', { ...base, promptCache: { ...base.promptCache, userPrefixChars: boundary } })), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+  const state = harness(t, { config: { nativeSessionAffinity: true } }), input = request('affinity-tampered-hash', base);
+  await assert.rejects(run(state, { ...input, promptCache: { ...base.promptCache, key: `support-${'c'.repeat(64)}` } }), { code: 'INVALID_REQUEST' });
+  await assert.rejects(run(state, request('affinity-historical', { ...base, scope: { tenantId: 'moztech', brandId: 'moztech-test',
+    dataClass: 'historical_regression', corpusSha256: 'c895a50c382ef87751f00cca0899b1660a0f77eca7b5cb72a8fc139573aba5e3', jobId: 'local-job' } })), { code: 'INVALID_REQUEST' });
+  await assert.rejects(run(state, jointRequest('affinity-joint-without-grant', base)), { code: 'INVALID_REQUEST' });
+  assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+});
+
+test('native session-affinity keeps both source HMAC phases, strict results and one-attempt errors', async t => {
+  const input = request('affinity-guarded', { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } });
+  for (const phase of ['before', 'after']) {
+    const source = sourceHarness(t, { respond: (context, proof) => context.payload.phase === phase ? { ...proof, proof: '0'.repeat(64) } : proof });
+    const state = harness(t, { config: { nativeSessionAffinity: true, attest: source.instance.attest } });
+    await assert.rejects(run(state, input), { code: 'ATTESTATION_FAILED' });
+    assert.equal(state.calls.length, phase === 'before' ? 0 : 1); assert.equal(source.calls.length, phase === 'before' ? 1 : 2);
+  }
+  for (const status of [400, 429]) {
+    const state = harness(t, { config: { nativeSessionAffinity: true }, fetch: () => new Response('', { status }) });
+    await assert.rejects(run(state, input), { code: 'GATEWAY_HTTP_FAILURE' }); assert.equal(state.calls.length, 1);
+    assert.deepEqual(state.checks.map(check => check.phase), ['before', 'after']);
+  }
+  const schema = { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false };
+  const invalid = harness(t, { config: { nativeSessionAffinity: true }, fetch: () => sse(completion('{"reply":"合成","extra":true}')) });
+  await assert.rejects(run(invalid, request('affinity-invalid-output', { promptCache: input.promptCache, responseSchema: schema })), { code: 'INVALID_STRUCTURED_OUTPUT' });
+  assert.equal(invalid.calls.length, 1);
+});
+
+test('native session-affinity retains cancellation, late-result discard, immutable binding and replay boundaries', async t => {
+  const waiting = deferred(), entered = deferred(), caller = new AbortController();
+  const state = harness(t, { config: { nativeSessionAffinity: true }, fetch: () => { entered.resolve(); return waiting.promise; } });
+  const input = request('affinity-cancelled', { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } });
+  const bound = JSON.parse(JSON.stringify(input)), pending = run(state, input, 'info', caller.signal); await entered.promise;
+  input.user = 'Caller mutation must not change the snapped prefix.'; input.promptCache.key = `support-${'d'.repeat(64)}`;
+  assert.equal(state.calls[0].init.headers['session-id'], expectedAffinity(bound, 'info')); caller.abort();
+  await assert.rejects(pending, { code: 'GATEWAY_ABORTED' }); waiting.resolve(sse()); await flush();
+  assert.deepEqual(state.checks.map(check => check.phase), ['before']); assert.equal(state.calls.length, 1);
+  await assert.rejects(run(state, bound), { code: 'GATEWAY_REPLAY_OR_CAPACITY' }); assert.equal(state.calls.length, 1);
+});
+
 test('native prefix-cache prototype is off by default and retains legacy payload without a complete trusted opt-in', async t => {
   const variants = [
     { config: {}, extra: { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } } },
@@ -783,8 +945,8 @@ test('native quota results require both source phases and a valid actual-route r
   }
 });
 
-test('native prefix-cache preserves authenticated typed-quota source and original request/schema bindings in a deterministic fixture', async t => {
-  for (const option of ['nativeExplicitPrefixCache', 'nativeMessagePrefixCache']) {
+test('native prefix-cache and session-affinity preserve authenticated typed-quota source and original request/schema bindings in a deterministic fixture', async t => {
+  for (const option of ['nativeExplicitPrefixCache', 'nativeMessagePrefixCache', 'nativeSessionAffinity']) {
     const source = sourceHarness(t), input = request(`quota-prefix-${option}`, {
       promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 },
       responseSchema: { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false },
@@ -798,7 +960,11 @@ test('native prefix-cache preserves authenticated typed-quota source and origina
     if (option === 'nativeExplicitPrefixCache') {
       assert.equal(wire.input[0].content[0].prompt_cache_breakpoint.mode, 'explicit');
       assert.equal(wire.input[0].content.map(part => part.text).join(''), input.user);
-    } else assert.deepEqual(wire.input, [{ role: 'user', content: input.user.slice(0, 4) }, { role: 'user', content: input.user.slice(4) }]);
+    } else if (option === 'nativeMessagePrefixCache') assert.deepEqual(wire.input, [{ role: 'user', content: input.user.slice(0, 4) }, { role: 'user', content: input.user.slice(4) }]);
+    else {
+      assert.deepEqual(wire.input, [{ role: 'user', content: input.user }]);
+      assert.equal(state.calls[0].init.headers['session-id'], expectedAffinity(input, 'info'));
+    }
     assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
   }
   // Fixture authenticity is only this test's HMAC contract, never a live
