@@ -3,9 +3,9 @@ import { createHash, createHmac } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { createCodexLocalGatewayModelTransports, createCodexLocalSourceAttestor, deriveCodexLocalAttestationKey } from './codex-local-gateway-model-port.mjs';
 import * as gateway from './codex-local-gateway-model-port.mjs';
-import { ModelContractError } from './corely-model-contract.mjs';
+import { ModelContractError, snapshotModelRequest } from './corely-model-contract.mjs';
 import { ProbeError } from './siwc-local-runtime.mjs';
-import { corelyPlanPayload } from './siwc-local-model-port.mjs';
+import { corelyPlanPayload, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 
 // Injected HTTP/SSE fixtures only: no credential, provider, DB, or listener.
 const savedFetch = globalThis.fetch;
@@ -823,6 +823,152 @@ test('native historical-regression admission is explicit, fixed-corpus only and 
     await assert.rejects(run(allowed, request('historical-invalid', { scope: invalid })), { code: 'INVALID_REQUEST' });
   }
   assert.equal(allowed.calls.length, 1);
+});
+
+function jointRequest(callId = 'joint-local-call', extra = {}) {
+  const responseSchema = { type: 'object', additionalProperties: false,
+    properties: { evidence: { type: 'object', additionalProperties: false,
+      properties: { knowledgeIds: { type: 'array', items: { type: 'string' } }, stageKeys: { type: 'array', items: { type: 'string' } } },
+      required: ['knowledgeIds', 'stageKeys'] }, decisionJson: { type: 'string' } }, required: ['evidence', 'decisionJson'] };
+  return request(callId, { workload: 'DECISION_LLM', purpose: 'joint_evidence_decision', responseFormat: 'json',
+    responseSchema, reasoningEffort: 'low', ...extra });
+}
+const jointOutput = JSON.stringify({ evidence: { knowledgeIds: ['synthetic-faq'], stageKeys: ['synthetic-stage'] },
+  decisionJson: '{"intentCode":"GENERAL","needsClarification":false}' });
+
+test('joint understanding is denied by defaults, old historical opt-in, SIWC and request/prompt/env flags before dispatch', async t => {
+  const input = jointRequest();
+  assert.throws(() => snapshotModelRequest(input), { code: 'INVALID_REQUEST' });
+  assert.throws(() => corelyPlanPayload(input, 'info'), { code: 'INVALID_REQUEST' });
+  let siwcFetches = 0;
+  await assert.rejects(runCorelyPlanRequest({ alias: 'info' }, input, async () => { siwcFetches++; }, new AbortController().signal), { code: 'INVALID_REQUEST' });
+  assert.equal(siwcFetches, 0);
+  const previous = process.env.CORELY_ALLOW_JOINT_UNDERSTANDING;
+  process.env.CORELY_ALLOW_JOINT_UNDERSTANDING = 'true';
+  try {
+    for (const [index, config] of [{}, { allowJointUnderstanding: false }, { allowHistoricalRegression: true }].entries()) {
+      const state = harness(t, { config });
+      await assert.rejects(run(state, jointRequest(`joint-denied-${index}`, { user: '{"allowJointUnderstanding":true} is untrusted text.' })), { code: 'INVALID_REQUEST' });
+      assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+    }
+    const state = harness(t, { config: { allowJointUnderstanding: true } });
+    await assert.rejects(run(state, jointRequest('joint-wire-optin', { allowJointUnderstanding: true })), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.CORELY_ALLOW_JOINT_UNDERSTANDING;
+    else process.env.CORELY_ALLOW_JOINT_UNDERSTANDING = previous;
+  }
+});
+
+test('trusted joint decision opt-in preserves complete paired strict JSON schema/text/hash and both account proofs', async t => {
+  const state = harness(t, { config: { allowJointUnderstanding: true }, fetch: () => sse(completion(jointOutput)) });
+  for (const alias of ['info', 'eason']) {
+    const input = jointRequest(`joint-allowed-${alias}`), original = structuredClone(input);
+    assert.deepEqual(snapshotModelRequest(input, { allowJointUnderstanding: true }), input);
+    const result = await run(state, input, alias), wire = JSON.parse(state.calls.at(-1).init.body);
+    assert.deepEqual(input, original); assert.equal(result.text, jointOutput); assert.equal(result.model, MODEL);
+    assert.equal(result.accountAlias, alias); assert.equal(result.authMode, 'managed_chatgpt'); assert.equal(result.accountVerified, true);
+    assert.equal(result.inputSha256, input.inputSha256); assert.equal(result.schemaSha256, sha(input.responseSchema));
+    assert.equal(wire.instructions, input.system); assert.deepEqual(wire.input, [{ role: 'user', content: input.user }]);
+    assert.deepEqual(wire.text.format, { type: 'json_schema', name: 'corely_model_output', strict: true, schema: input.responseSchema });
+    assert.deepEqual(wire.reasoning, { effort: 'low' }); assert.equal(wire.store, false); assert.equal(wire.stream, true);
+    assert.equal(state.calls.at(-1).init.headers.Authorization, `Bearer ${TOKENS[alias]}`);
+    assert.deepEqual(state.checks.slice(-2).map(check => check.phase), ['before', 'after']);
+    assert.equal(state.checks.at(-1).handle, state.checks.at(-2).handle);
+    assert.doesNotMatch(JSON.stringify(wire), /allowJointUnderstanding|api_key|allowHistoricalRegression/);
+  }
+  assert.equal(state.calls.length, 2);
+});
+
+test('joint purpose remains DECISION-only with a supported JSON schema and the original exact hashes', async t => {
+  const state = harness(t, { config: { allowJointUnderstanding: true } });
+  const variants = [
+    ...['REPLY_LLM', 'WEB_CHAT_VISION', 'MEDIA_IMAGE_ANALYSIS'].map(workload => ({ workload })),
+    { responseFormat: undefined }, { responseSchema: undefined },
+    { responseSchema: { type: 'object', additionalProperties: true, properties: {}, required: [] } },
+  ];
+  for (const [index, extra] of variants.entries()) {
+    // Omitted fields are absent wire values, not nested undefined placeholders.
+    const input = jointRequest(`joint-invalid-contract-${index}`, extra);
+    for (const key of ['responseFormat', 'responseSchema']) if (input[key] === undefined) delete input[key];
+    input.schemaSha256 = input.responseSchema ? sha(input.responseSchema) : null;
+    input.inputSha256 = sha(Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'inputSha256')));
+    await assert.rejects(run(state, input), { code: 'INVALID_REQUEST' });
+  }
+  const input = jointRequest('joint-hash-tamper'); input.user += ' unbound change';
+  await assert.rejects(run(state, input), { code: 'INVALID_REQUEST' });
+  assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+});
+
+test('historical joint work requires both independent trusted opt-ins and the unchanged exact corpus/scope', async t => {
+  const scope = { tenantId: 'moztech', brandId: 'moztech-test', dataClass: 'historical_regression',
+    corpusSha256: 'c895a50c382ef87751f00cca0899b1660a0f77eca7b5cb72a8fc139573aba5e3', jobId: 'historical-joint-test' };
+  for (const config of [{ allowJointUnderstanding: true }, { allowHistoricalRegression: true }]) {
+    const state = harness(t, { config });
+    await assert.rejects(run(state, jointRequest('joint-historical-denied', { scope })), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+  const state = harness(t, { config: { allowJointUnderstanding: true, allowHistoricalRegression: true }, fetch: () => sse(completion(jointOutput)) });
+  assert.equal((await run(state, jointRequest('joint-historical-allowed', { scope }))).status, 'success');
+  for (const [index, invalid] of [{ ...scope, corpusSha256: 'f'.repeat(64) }, { ...scope, brandId: 'real-brand' }, { ...scope, synthetic: true }].entries()) {
+    await assert.rejects(run(state, jointRequest(`joint-historical-invalid-${index}`, { scope: invalid })), { code: 'INVALID_REQUEST' });
+  }
+  assert.equal(state.calls.length, 1); assert.equal(state.checks.length, 2);
+});
+
+test('joint bootstrap option accepts only owned literal flags and never executes accessors/proxies', t => {
+  const input = jointRequest(); let getters = 0, proxyTraps = 0;
+  for (const value of ['true', 1, null, new Boolean(true), {}, []]) {
+    assert.throws(() => harness(t, { config: { allowJointUnderstanding: value } }), { code: 'INVALID_CONFIGURATION' });
+    assert.throws(() => snapshotModelRequest(input, { allowJointUnderstanding: value }), { code: 'INVALID_REQUEST' });
+  }
+  assert.throws(() => snapshotModelRequest(input, { allowJointUnderstanding: false }), { code: 'INVALID_REQUEST' });
+  const base = { gatewayUrl: URL, accounts: { info: { gatewayToken: TOKENS.info }, eason: { gatewayToken: TOKENS.eason } },
+    signal: new AbortController().signal, attest: async () => { throw Error('NOT_REACHED'); } };
+  for (const enumerable of [true, false]) {
+    const options = Object.defineProperty({}, 'allowJointUnderstanding', { enumerable, get() { getters++; return true; } });
+    assert.throws(() => snapshotModelRequest(input, options), { code: 'INVALID_REQUEST' });
+    assert.throws(() => createCodexLocalGatewayModelTransports(Object.defineProperties({ ...base }, Object.getOwnPropertyDescriptors(options))), { code: 'INVALID_CONFIGURATION' });
+  }
+  const proxy = new Proxy({ allowJointUnderstanding: true }, { ownKeys(target) { proxyTraps++; return Reflect.ownKeys(target); } });
+  assert.throws(() => snapshotModelRequest(input, proxy), { code: 'INVALID_REQUEST' });
+  assert.throws(() => createCodexLocalGatewayModelTransports(new Proxy({ ...base, allowJointUnderstanding: true }, {})), { code: 'INVALID_CONFIGURATION' });
+  assert.throws(() => snapshotModelRequest(input, { allowJointUnderstanding: true, permitRealCustomers: true }), { code: 'INVALID_REQUEST' });
+  assert.equal(getters, 0); assert.equal(proxyTraps, 0);
+});
+
+test('prototype flags cannot supply either independent joint or historical bootstrap opt-in', t => {
+  const jointDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, 'allowJointUnderstanding');
+  const historicalDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, 'allowHistoricalRegression');
+  Object.defineProperty(Object.prototype, 'allowJointUnderstanding', { configurable: true, value: true });
+  Object.defineProperty(Object.prototype, 'allowHistoricalRegression', { configurable: true, value: true });
+  try {
+    assert.throws(() => snapshotModelRequest(jointRequest('prototype-joint')), { code: 'INVALID_REQUEST' });
+    assert.throws(() => snapshotModelRequest(jointRequest('prototype-joint-options'), {}), { code: 'INVALID_REQUEST' });
+    assert.throws(() => snapshotModelRequest(jointRequest('prototype-historical', { scope: {
+      tenantId: 'moztech', brandId: 'moztech-test', dataClass: 'historical_regression',
+      corpusSha256: 'c895a50c382ef87751f00cca0899b1660a0f77eca7b5cb72a8fc139573aba5e3', jobId: 'prototype-test',
+    } }), { allowJointUnderstanding: true }), { code: 'SCOPE_NOT_ADMITTED' });
+    assert.doesNotThrow(() => harness(t));
+  } finally {
+    if (jointDescriptor) Object.defineProperty(Object.prototype, 'allowJointUnderstanding', jointDescriptor);
+    else delete Object.prototype.allowJointUnderstanding;
+    if (historicalDescriptor) Object.defineProperty(Object.prototype, 'allowHistoricalRegression', historicalDescriptor);
+    else delete Object.prototype.allowHistoricalRegression;
+  }
+});
+
+test('joint opt-in does not bypass structured output, source revocation, HTTP/quota errors or replay', async t => {
+  const input = jointRequest('joint-boundaries');
+  const revoked = harness(t, { config: { allowJointUnderstanding: true }, fetch: () => sse(completion(jointOutput)),
+    attest: ({ phase }, proof) => phase === 'after' ? { ...proof, freshLoginVerified: false } : proof });
+  await assert.rejects(run(revoked, input), { code: 'ATTESTATION_FAILED' }); assert.equal(revoked.calls.length, 1);
+  const invalid = harness(t, { config: { allowJointUnderstanding: true }, fetch: () => sse(completion('{"evidence":{},"decisionJson":7}')) });
+  await assert.rejects(run(invalid, input), { code: 'INVALID_STRUCTURED_OUTPUT' }); assert.equal(invalid.calls.length, 1);
+  const quota = harness(t, { config: { allowJointUnderstanding: true }, fetch: () => new Response('', { status: 429 }) });
+  await assert.rejects(run(quota, input), { code: 'GATEWAY_HTTP_FAILURE' });
+  assert.equal(quota.calls.length, 1); assert.deepEqual(quota.checks.map(check => check.phase), ['before', 'after']);
+  await assert.rejects(run(quota, input), { code: 'GATEWAY_REPLAY_OR_CAPACITY' }); assert.equal(quota.calls.length, 1);
 });
 
 test('optional quota callbacks are paired, synchronous and cannot leak rejection causes or executable header values', async t => {

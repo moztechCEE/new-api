@@ -301,7 +301,7 @@ export function createCodexLocalSourceAttestor(options) {
  */
 export function createCodexLocalGatewayModelTransports(options) {
   const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
-    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache'], 'INVALID_CONFIGURATION');
+    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
   if (typeof attest !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' ||
@@ -310,10 +310,14 @@ export function createCodexLocalGatewayModelTransports(options) {
   if ((quotaEnabled && (typeof config.quotaRequest !== 'function' || types.isProxy(config.quotaRequest) ||
       typeof config.quotaVerify !== 'function' || types.isProxy(config.quotaVerify))) ||
       (config.allowHistoricalRegression !== undefined && typeof config.allowHistoricalRegression !== 'boolean') ||
+      (config.allowJointUnderstanding !== undefined && typeof config.allowJointUnderstanding !== 'boolean') ||
       (config.nativeExplicitPrefixCache !== undefined && typeof config.nativeExplicitPrefixCache !== 'boolean') ||
       (config.nativeMessagePrefixCache !== undefined && typeof config.nativeMessagePrefixCache !== 'boolean') ||
       (config.nativeExplicitPrefixCache === true && config.nativeMessagePrefixCache === true)) reject('INVALID_CONFIGURATION');
-  const localAdmission = config.allowHistoricalRegression === true ? Object.freeze({ allowHistoricalRegression: true }) : undefined;
+  const localAdmission = config.allowHistoricalRegression === true || config.allowJointUnderstanding === true ? Object.freeze({
+    ...(config.allowHistoricalRegression === true ? { allowHistoricalRegression: true } : {}),
+    ...(config.allowJointUnderstanding === true ? { allowJointUnderstanding: true } : {}),
+  }) : undefined;
   const accounts = ownData(config.accounts, ['info', 'eason'], 'INVALID_CONFIGURATION'), tokens = new Map();
   for (const alias of ['info', 'eason']) {
     const account = ownData(accounts[alias], ['gatewayToken'], 'INVALID_CONFIGURATION');

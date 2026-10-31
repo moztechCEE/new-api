@@ -2,6 +2,7 @@
 // each port separately authorizes its own local synthetic or regression scope.
 // It validates JSON only: no process, network, credentials or model execution.
 import { createHash } from 'node:crypto';
+import { types } from 'node:util';
 const MODEL = 'gpt-6.1-sol';
 export const LOCAL_ORIGINAL50_CORPUS_SHA256 = 'c895a50c382ef87751f00cca0899b1660a0f77eca7b5cb72a8fc139573aba5e3';
 const MAX_BYTES = 1024 * 1024;
@@ -9,7 +10,7 @@ const REQUEST_KEYS = new Set(['version', 'callId', 'workload', 'purpose', 'model
   'responseSchema', 'image', 'reasoningEffort', 'verbosity', 'promptCache', 'inputSha256', 'schemaSha256']);
 const WORKLOADS = new Set(['DECISION_LLM', 'REPLY_LLM', 'WEB_CHAT_VISION', 'MEDIA_IMAGE_ANALYSIS']);
 const PURPOSES = new Set(['semantic_reply_review', 'semantic_evidence_selection', 'support_decision', 'reply_generation',
-  'reply_repair', 'structured_output', 'text_generation', 'image_analysis']);
+  'reply_repair', 'structured_output', 'text_generation', 'image_analysis', 'joint_evidence_decision']);
 const SCHEMA_KEYS = new Set(['type', 'description', 'title', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
   'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'uniqueItems']);
 const TYPES = new Set(['null', 'object', 'array', 'string', 'integer', 'number', 'boolean']);
@@ -123,10 +124,11 @@ export function validateModelOutput(text, request) {
 function snapshotRequest(input, options) {
   // This opt-in is only a private in-process bootstrap capability. Ordinary
   // SIWC, VM and synthetic workers call without it and keep their old scope.
+  if (types.isProxy(options)) held('INVALID_REQUEST');
   const admission = options === undefined ? {} : copyCanonical(options);
   if (!admission || typeof admission !== 'object' || Array.isArray(admission) ||
-      Object.keys(admission).some(key => key !== 'allowHistoricalRegression') ||
-      (Object.hasOwn(admission, 'allowHistoricalRegression') && admission.allowHistoricalRegression !== true)) held('INVALID_REQUEST');
+      Object.keys(admission).some(key => !['allowHistoricalRegression', 'allowJointUnderstanding'].includes(key)) ||
+      Object.values(admission).some(value => value !== true)) held('INVALID_REQUEST');
   const request = copyCanonical(input);
   if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !REQUEST_KEYS.has(key)) ||
       request.version !== 1 || request.model !== MODEL || typeof request.callId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(request.callId) ||
@@ -134,12 +136,14 @@ function snapshotRequest(input, options) {
       typeof request.user !== 'string' || !request.user.trim() || (request.responseFormat !== undefined && request.responseFormat !== 'json') ||
       (request.verbosity !== undefined && request.verbosity !== 'low') ||
       (request.reasoningEffort !== undefined && (typeof request.reasoningEffort !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/.test(request.reasoningEffort)))) held('INVALID_REQUEST');
+  if (request.purpose === 'joint_evidence_decision' && (!Object.hasOwn(admission, 'allowJointUnderstanding') || admission.allowJointUnderstanding !== true ||
+      request.workload !== 'DECISION_LLM' || request.responseFormat !== 'json' || !request.responseSchema)) held('INVALID_REQUEST');
   const s = request.scope;
   if (!s || typeof s !== 'object' || Array.isArray(s) || s.tenantId !== 'moztech' || s.brandId !== 'moztech-test' ||
       typeof s.jobId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(s.jobId)) held('SCOPE_NOT_ADMITTED');
   const synthetic = Object.keys(s).length === 4 && s.synthetic === true &&
     Object.keys(s).every(key => ['tenantId', 'brandId', 'synthetic', 'jobId'].includes(key));
-  const historical = admission.allowHistoricalRegression === true && Object.keys(s).length === 5 &&
+  const historical = Object.hasOwn(admission, 'allowHistoricalRegression') && admission.allowHistoricalRegression === true && Object.keys(s).length === 5 &&
     s.dataClass === 'historical_regression' && s.corpusSha256 === LOCAL_ORIGINAL50_CORPUS_SHA256 &&
     Object.keys(s).every(key => ['tenantId', 'brandId', 'dataClass', 'corpusSha256', 'jobId'].includes(key));
   if (!synthetic && !historical) held('SCOPE_NOT_ADMITTED');
