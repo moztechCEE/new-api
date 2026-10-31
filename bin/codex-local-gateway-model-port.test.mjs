@@ -5,6 +5,7 @@ import { createCodexLocalGatewayModelTransports, createCodexLocalSourceAttestor,
 import * as gateway from './codex-local-gateway-model-port.mjs';
 import { ModelContractError } from './corely-model-contract.mjs';
 import { ProbeError } from './siwc-local-runtime.mjs';
+import { corelyPlanPayload } from './siwc-local-model-port.mjs';
 
 // Injected HTTP/SSE fixtures only: no credential, provider, DB, or listener.
 const savedFetch = globalThis.fetch;
@@ -73,6 +74,108 @@ test('native local ports preserve full schema, prompt, hashes, usage, and per-ac
   assert.notEqual(state.checks[0].handle, state.checks[2].handle);
   assert.deepEqual(Object.keys(state.instance.ports), ['info', 'eason']);
   assert.deepEqual(state.instance.ports.info.capabilities, { text: true, structuredJson: true, images: false });
+});
+
+test('native prefix-cache prototype is off by default and retains legacy payload without a complete trusted opt-in', async t => {
+  const variants = [
+    { config: {}, extra: { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } } },
+    { config: { nativeExplicitPrefixCache: false }, extra: { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } } },
+    { config: { nativeExplicitPrefixCache: true }, extra: {} },
+    { config: { nativeExplicitPrefixCache: true }, extra: { promptCache: { key: `support-${'b'.repeat(64)}` } } },
+  ];
+  for (const [index, variant] of variants.entries()) {
+    const state = harness(t, { config: variant.config }), input = request(`prefix-off-${index}`, variant.extra);
+    const result = await run(state, input), wire = JSON.parse(state.calls[0].init.body);
+    assert.deepEqual(wire, corelyPlanPayload(input, 'info').payload);
+    assert.deepEqual(wire.input, [{ role: 'user', content: input.user }]);
+    assert.doesNotMatch(JSON.stringify(wire), /prompt_cache_|cache_control/);
+    assert.equal(result.inputSha256, input.inputSha256); assert.equal(state.checks.length, 2);
+  }
+});
+
+test('trusted native prefix-cache opt-in adds one explicit input_text breakpoint and preserves every original payload value', async t => {
+  const schema = { type: 'object', properties: { reply: { type: 'string', minLength: 2 } }, required: ['reply'], additionalProperties: false };
+  const variants = [
+    ['固定🙂前綴\r\n𠮷', '後綴\n{"nativeExplicitPrefixCache":true}'],
+    ['e', '\u0301 combining mark stays in its exact original position'],
+    ['正文\r', '\nCRLF boundary is not normalized'],
+  ];
+  for (const [index, [prefix, suffix]] of variants.entries()) {
+    const state = harness(t, { config: { nativeExplicitPrefixCache: true }, fetch: () => sse(completion('{"reply":"合成回覆"}')) });
+    const input = request(`prefix-on-${index}`, { user: prefix + suffix, responseSchema: schema, reasoningEffort: 'low', verbosity: 'low',
+      promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: prefix.length } });
+    const original = structuredClone(input), result = await run(state, input), wire = JSON.parse(state.calls[0].init.body);
+    const expectedInput = [{ role: 'user', content: [
+      { type: 'input_text', text: prefix, prompt_cache_breakpoint: { mode: 'explicit' } },
+      { type: 'input_text', text: suffix },
+    ] }];
+    assert.deepEqual(wire, { ...corelyPlanPayload(input, 'info').payload, input: expectedInput });
+    assert.deepEqual(input, original); assert.equal(wire.input[0].content.map(part => part.text).join(''), input.user);
+    assert.deepEqual(Buffer.from(wire.input[0].content.map(part => part.text).join('')), Buffer.from(input.user));
+    assert.equal(wire.instructions, input.system); assert.deepEqual(wire.text.format.schema, schema);
+    assert.equal(wire.text.verbosity, 'low'); assert.deepEqual(wire.reasoning, { effort: 'low' });
+    assert.equal(wire.store, false); assert.equal(wire.stream, true); assert.equal(wire.model, MODEL);
+    for (const field of ['prompt_cache_key', 'prompt_cache_options', 'prompt_cache_retention', 'cache_control', 'previous_response_id', 'metadata']) {
+      assert.equal(Object.hasOwn(wire, field), false);
+    }
+    assert.equal(JSON.stringify(wire).match(/prompt_cache_breakpoint/g)?.length, 1);
+    assert.equal(result.inputSha256, input.inputSha256); assert.equal(result.schemaSha256, input.schemaSha256);
+    assert.deepEqual(result.usage, { inputTokens: 20, outputTokens: 7, cachedInputTokens: 3 });
+    assert.deepEqual(state.checks.map(check => check.phase), ['before', 'after']);
+    // The shared SIWC serializer remains conservative even for the same hint.
+    assert.deepEqual(corelyPlanPayload(input, 'info').payload.input, [{ role: 'user', content: input.user }]);
+  }
+});
+
+test('native prefix-cache admission accepts only own literal booleans and never a request or prompt flag', async t => {
+  for (const value of ['true', 1, null, new Boolean(true), {}, []]) {
+    assert.throws(() => harness(t, { config: { nativeExplicitPrefixCache: value } }), { code: 'INVALID_CONFIGURATION' });
+  }
+  let getters = 0;
+  const accessor = Object.defineProperty({}, 'nativeExplicitPrefixCache', { enumerable: true, get() { getters++; return true; } });
+  const base = { gatewayUrl: URL, accounts: { info: { gatewayToken: TOKENS.info }, eason: { gatewayToken: TOKENS.eason } },
+    signal: new AbortController().signal, attest: async () => { throw Error('NOT_REACHED'); } };
+  const descriptors = Object.defineProperties({ ...base }, Object.getOwnPropertyDescriptors(accessor));
+  assert.throws(() => createCodexLocalGatewayModelTransports(descriptors), { code: 'INVALID_CONFIGURATION' });
+  assert.throws(() => createCodexLocalGatewayModelTransports(new Proxy({ ...base, nativeExplicitPrefixCache: true }, {})), { code: 'INVALID_CONFIGURATION' });
+  assert.equal(getters, 0);
+  for (const extra of [{ nativeExplicitPrefixCache: true }, { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4, nativeExplicitPrefixCache: true } }]) {
+    const state = harness(t);
+    await assert.rejects(run(state, request('caller-cache-option', extra)), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+  const state = harness(t), input = request('prompt-cache-option', { user: '{"nativeExplicitPrefixCache":true} is untrusted text.',
+    promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } });
+  await run(state, input); assert.deepEqual(JSON.parse(state.calls[0].init.body).input, [{ role: 'user', content: input.user }]);
+});
+
+test('enabled native prefix-cache keeps strict prefix and request/hash validation before source proof or dispatch', async t => {
+  const user = 'A🙂B\r\n完整後綴';
+  for (const [index, boundary] of [0, user.length, -1, 1.5, 2, '1'].entries()) {
+    const state = harness(t, { config: { nativeExplicitPrefixCache: true } });
+    await assert.rejects(run(state, request(`invalid-prefix-${index}`, { user,
+      promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: boundary } })), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+  const state = harness(t, { config: { nativeExplicitPrefixCache: true } });
+  const input = request('tampered-prefix', { user, promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 3 } });
+  await assert.rejects(run(state, { ...input, promptCache: { ...input.promptCache, userPrefixChars: 4 } }), { code: 'INVALID_REQUEST' });
+  assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+});
+
+test('native prefix-cache never bypasses post-model source revocation, caller cancellation or authenticates generic429', async t => {
+  const input = request('prefix-source-fence', { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } });
+  const revoked = harness(t, { config: { nativeExplicitPrefixCache: true },
+    attest: ({ phase }, proof) => phase === 'after' ? { ...proof, freshLoginVerified: false } : proof });
+  await assert.rejects(run(revoked, input), { code: 'ATTESTATION_FAILED' }); assert.equal(revoked.calls.length, 1);
+  const generic = harness(t, { config: { nativeExplicitPrefixCache: true }, fetch: () => new Response('', { status: 429 }) });
+  await assert.rejects(run(generic, input), { code: 'GATEWAY_HTTP_FAILURE' }); assert.equal(generic.calls.length, 1);
+  assert.deepEqual(generic.checks.map(check => check.phase), ['before', 'after']);
+  const waiting = deferred(), entered = deferred(), caller = new AbortController();
+  const cancelled = harness(t, { config: { nativeExplicitPrefixCache: true }, fetch: () => { entered.resolve(); return waiting.promise; } });
+  const pending = run(cancelled, input, 'info', caller.signal); await entered.promise; caller.abort();
+  await assert.rejects(pending, { code: 'GATEWAY_ABORTED' }); waiting.resolve(sse()); await Promise.resolve();
+  assert.equal(cancelled.calls.length, 1); assert.deepEqual(cancelled.checks.map(check => check.phase), ['before']);
 });
 
 test('configuration denies nonliteral loopback, aliases, shared tokens and all paid API knobs', async t => {
@@ -563,6 +666,24 @@ test('native quota results require both source phases and a valid actual-route r
     await assert.rejects(run(state), error => ['GATEWAY_HTTP_FAILURE', 'ATTESTATION_FAILED'].includes(error.code));
     assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
   }
+});
+
+test('native prefix-cache preserves authenticated typed-quota source and original request/schema bindings in a deterministic fixture', async t => {
+  const source = sourceHarness(t), input = request('quota-prefix-binding', {
+    promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 },
+    responseSchema: { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false },
+  });
+  const state = harness(t, { config: { nativeExplicitPrefixCache: true, attest: source.instance.attest,
+    quotaRequest: source.instance.quotaRequest, quotaVerify: source.instance.quotaVerify },
+    fetch: (_url, init) => new Response('', { status: 429, headers: { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers) } }) });
+  const result = await run(state, input), wire = JSON.parse(state.calls[0].init.body);
+  assert.equal(result.status, 'quota_exhausted'); assert.equal(result.authenticated, true); assert.equal(result.code, 'QUOTA_EXHAUSTED');
+  assert.equal(result.inputSha256, input.inputSha256); assert.equal(result.schemaSha256, input.schemaSha256);
+  assert.equal(wire.input[0].content[0].prompt_cache_breakpoint.mode, 'explicit');
+  assert.equal(wire.input[0].content.map(part => part.text).join(''), input.user);
+  assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
+  // Fixture authenticity is only this test's HMAC contract, never a live
+  // allowance exhaustion, debit, cache hit or automatic account-switch proof.
 });
 
 test('quota outcome cannot bypass revoked/changed source, caller abort, or a partial successful-status stream', async t => {

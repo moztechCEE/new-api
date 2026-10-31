@@ -301,7 +301,7 @@ export function createCodexLocalSourceAttestor(options) {
  */
 export function createCodexLocalGatewayModelTransports(options) {
   const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
-    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression'], 'INVALID_CONFIGURATION');
+    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'nativeExplicitPrefixCache'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
   if (typeof attest !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' ||
@@ -309,7 +309,8 @@ export function createCodexLocalGatewayModelTransports(options) {
   const quotaEnabled = config.quotaRequest !== undefined || config.quotaVerify !== undefined;
   if ((quotaEnabled && (typeof config.quotaRequest !== 'function' || types.isProxy(config.quotaRequest) ||
       typeof config.quotaVerify !== 'function' || types.isProxy(config.quotaVerify))) ||
-      (config.allowHistoricalRegression !== undefined && typeof config.allowHistoricalRegression !== 'boolean')) reject('INVALID_CONFIGURATION');
+      (config.allowHistoricalRegression !== undefined && typeof config.allowHistoricalRegression !== 'boolean') ||
+      (config.nativeExplicitPrefixCache !== undefined && typeof config.nativeExplicitPrefixCache !== 'boolean')) reject('INVALID_CONFIGURATION');
   const localAdmission = config.allowHistoricalRegression === true ? Object.freeze({ allowHistoricalRegression: true }) : undefined;
   const accounts = ownData(config.accounts, ['info', 'eason'], 'INVALID_CONFIGURATION'), tokens = new Map();
   for (const alias of ['info', 'eason']) {
@@ -371,7 +372,17 @@ export function createCodexLocalGatewayModelTransports(options) {
     let response, responseBody, modelDeadline, modelActive, modelFinished = false, streamConsumptionFailed = false;
     try {
       const before = await fresh('before', 'pending');
-      const { payload } = corelyPlanPayload(request, alias, localAdmission);
+      let { payload } = corelyPlanPayload(request, alias, localAdmission);
+      // Native-only, default-OFF protocol prototype. The existing request
+      // snapshot validates the exact prefix and Unicode/hash boundaries. Keep
+      // SIWC's conservative shape and every original prompt byte unchanged.
+      if (config.nativeExplicitPrefixCache === true && request.promptCache?.userPrefixChars !== undefined) {
+        const boundary = request.promptCache.userPrefixChars;
+        payload = Object.freeze({ ...payload, input: [{ role: 'user', content: [
+          { type: 'input_text', text: request.user.slice(0, boundary), prompt_cache_breakpoint: { mode: 'explicit' } },
+          { type: 'input_text', text: request.user.slice(boundary) },
+        ] }] });
+      }
       let quotaHeaders = Object.create(null);
       if (quotaEnabled) {
         try { quotaHeaders = ownData(synchronousQuotaValue(config.quotaRequest(Object.freeze({ handle, binding, signal: ownerActive }))), QUOTA_REQUEST_HEADERS, 'ATTESTATION_FAILED'); }
