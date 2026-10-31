@@ -11,12 +11,23 @@ const ERROR_CODES = new Set(['INVALID_CONFIGURATION', 'INVALID_REQUEST', 'ATTEST
   'GATEWAY_CLOSED', 'GATEWAY_EXPIRED', 'GATEWAY_ABORTED', 'GATEWAY_TIMEOUT', 'GATEWAY_REPLAY_OR_CAPACITY',
   'GATEWAY_UNAVAILABLE', 'GATEWAY_RESPONSE_INVALID', 'GATEWAY_HTTP_FAILURE', 'INVALID_OUTPUT', 'INVALID_STRUCTURED_OUTPUT']);
 const ERRORS = new WeakMap();
+const RESPONSE_DIAGNOSTICS = new WeakMap();
+const RESPONSE_FAILURE_CLASSES = new Map([
+  ['MISSING_COMPLETED_EVENT', 'TERMINAL_MISSING'], ['INFERENCE_NOT_COMPLETED', 'TERMINAL_NOT_COMPLETED'],
+  ['NON_TEXT_OUTPUT_REJECTED', 'NON_TEXT_OUTPUT'], ['INVALID_USAGE_RECEIPT', 'USAGE_INVALID'],
+  ['STREAM_INTERRUPTED', 'STREAM_INTERRUPTED'], ['INVALID_STREAM_EVENT', 'STREAM_EVENT_INVALID'],
+  ['INVALID_COMPLETION', 'COMPLETION_INVALID'], ['COMPLETED_OUTPUT_MISMATCH', 'OUTPUT_MISMATCH'],
+  ['STREAM_TOO_LARGE', 'STREAM_LIMIT'], ['OUTPUT_TOO_LARGE', 'STREAM_LIMIT'],
+]);
 export class CodexLocalGatewayError extends Error {
   constructor(code) {
     const safe = ERROR_CODES.has(code) ? code : 'GATEWAY_UNAVAILABLE';
     super(safe); this.name = 'CodexLocalGatewayError'; this.code = safe; ERRORS.set(this, safe);
   }
 }
+/** Fixed local observation only, never a quota/authentication/fallback proof.
+ * WeakMap lookup does not inspect a foreign error, its properties or causes. */
+export const codexLocalGatewayResponseDiagnostic = error => RESPONSE_DIAGNOSTICS.get(error);
 const reject = code => { throw new CodexLocalGatewayError(code); };
 
 function ownData(input, allowed, code) {
@@ -357,7 +368,7 @@ export function createCodexLocalGatewayModelTransports(options) {
       if (sourceDeadline.aborted) reject('ATTESTATION_FAILED');
       return attestationSnapshot(value, binding, clock());
     };
-    let response, responseBody, modelDeadline, modelActive, modelFinished = false;
+    let response, responseBody, modelDeadline, modelActive, modelFinished = false, streamConsumptionFailed = false;
     try {
       const before = await fresh('before', 'pending');
       const { payload } = corelyPlanPayload(request, alias, localAdmission);
@@ -408,7 +419,9 @@ export function createCodexLocalGatewayModelTransports(options) {
       }
       const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
       if (media !== 'text/event-stream') reject('GATEWAY_RESPONSE_INVALID');
-      const receipt = await whileActive(consumePlanTextStream(responseBody, modelActive), modelActive);
+      let receipt;
+      try { receipt = await whileActive(consumePlanTextStream(responseBody, modelActive), modelActive); }
+      catch (error) { streamConsumptionFailed = true; throw error; }
       activeCheck(modelActive);
       modelFinished = true;
       const result = snapshotModelResult({ accountAlias: alias, authMode: 'managed_chatgpt', accountVerified: true, model: MODEL,
@@ -435,7 +448,23 @@ export function createCodexLocalGatewayModelTransports(options) {
         }
       } catch { /* A foreign typed error cannot supply executable diagnostics. */ }
       if (contractCode) reject(contractCode);
-      if (!types.isProxy(error) && error instanceof ProbeError) reject('GATEWAY_RESPONSE_INVALID');
+      let probeFailure = false, responseFailureClass = 'UNKNOWN';
+      try {
+        if (!types.isProxy(error) && error instanceof ProbeError) {
+          probeFailure = true;
+          if (streamConsumptionFailed) {
+            const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+            if (descriptor && Object.hasOwn(descriptor, 'value')) {
+              responseFailureClass = RESPONSE_FAILURE_CLASSES.get(descriptor.value) ?? 'UNKNOWN';
+            }
+          }
+        }
+      } catch { /* Foreign accessors/prototypes never become diagnostics. */ }
+      if (probeFailure) {
+        const failure = new CodexLocalGatewayError('GATEWAY_RESPONSE_INVALID');
+        RESPONSE_DIAGNOSTICS.set(failure, Object.freeze({ responseFailureClass }));
+        throw failure;
+      }
       reject('GATEWAY_UNAVAILABLE');
     } finally {
       busy.delete(alias);

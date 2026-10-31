@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { createCodexLocalGatewayModelTransports, createCodexLocalSourceAttestor, deriveCodexLocalAttestationKey } from './codex-local-gateway-model-port.mjs';
+import * as gateway from './codex-local-gateway-model-port.mjs';
 import { ModelContractError } from './corely-model-contract.mjs';
+import { ProbeError } from './siwc-local-runtime.mjs';
 
 // Injected HTTP/SSE fixtures only: no credential, provider, DB, or listener.
 const savedFetch = globalThis.fetch;
@@ -604,4 +606,104 @@ test('optional quota callbacks are paired, synchronous and cannot leak rejection
     await assert.rejects(run(state), error => error.code === 'ATTESTATION_FAILED' && !`${error}`.includes('private-quota-secret'));
     assert.equal(state.calls.length, mode === 'verify-promise' ? 1 : 0);
   }
+});
+
+test('stream failures retain only a fixed private class while public errors, validation and single-attempt routing stay unchanged', async t => {
+  const frame = value => `data: ${JSON.stringify(value)}\n\n`;
+  const stream = text => new Response(text, { headers: { 'content-type': 'text/event-stream' } });
+  const cases = [
+    ['missing terminal', () => stream(frame({ type: 'response.created', response: { id: 'created-only' } })), 'TERMINAL_MISSING'],
+    ['failed terminal', () => stream(frame({ type: 'response.failed', response: { error: { message: 'PRIVATE_STREAM_VALUE' } } })), 'TERMINAL_NOT_COMPLETED'],
+    ['nontext output', () => sse(completion('', { output: [{ type: 'function_call', name: 'PRIVATE_STREAM_VALUE' }] })), 'NON_TEXT_OUTPUT'],
+    ['missing usage', () => sse(completion('safe text', { usage: undefined })), 'USAGE_INVALID'],
+    ['invalid usage', () => sse(completion('safe text', { usage: { input_tokens: 1, output_tokens: 2, total_tokens: 2 } })), 'USAGE_INVALID'],
+    ['interrupted stream', () => new Response(new ReadableStream({ start(controller) {
+      controller.error(new Error('PRIVATE_STREAM_VALUE'));
+    } }), { headers: { 'content-type': 'text/event-stream' } }), 'STREAM_INTERRUPTED'],
+    ['invalid UTF8', () => stream(new Uint8Array([0xff])), 'STREAM_INTERRUPTED'],
+    ['invalid event', () => stream('data: {PRIVATE_STREAM_VALUE}\n\n'), 'STREAM_EVENT_INVALID'],
+    ['invalid completion', () => sse(completion('safe text', { model: 'PRIVATE_STREAM_VALUE' })), 'COMPLETION_INVALID'],
+    ['mismatched output', () => stream(frame({ type: 'response.output_text.delta', delta: 'PRIVATE_STREAM_VALUE' }) +
+      frame({ type: 'response.completed', response: completion('different text') })), 'OUTPUT_MISMATCH'],
+    ['stream limit', () => stream('x'.repeat(1_048_577)), 'STREAM_LIMIT'],
+    ['output limit', () => stream(frame({ type: 'response.output_text.delta', delta: 'x'.repeat(65_537) })), 'STREAM_LIMIT'],
+  ];
+  for (const [name, response, responseFailureClass] of cases) await t.test(name, async child => {
+    const state = harness(child, { fetch: response });
+    await assert.rejects(run(state), error => {
+      assert.equal(error.code, 'GATEWAY_RESPONSE_INVALID');
+      const diagnostic = gateway.codexLocalGatewayResponseDiagnostic(error);
+      assert.deepEqual(diagnostic, { responseFailureClass }); assert.equal(Object.isFrozen(diagnostic), true);
+      assert.doesNotMatch(JSON.stringify({ error, diagnostic }), /PRIVATE_STREAM_VALUE|input_tokens|output_tokens|total_tokens|cause|body/);
+      return true;
+    });
+    assert.equal(state.calls.length, 1); assert.equal(state.checks.length, 1);
+    assert.equal(state.checks[0].binding.accountAlias, 'info');
+  });
+});
+
+test('response diagnostics do not inspect foreign error getters or proxies and cannot be mutated through an error', async t => {
+  let getters = 0;
+  const getter = Object.create(ProbeError.prototype);
+  Object.defineProperty(getter, 'code', { get() { getters++; throw new Error('PRIVATE_STREAM_VALUE'); } });
+  const proxy = new Proxy(new ProbeError('INVALID_USAGE_RECEIPT'), {
+    get() { getters++; throw new Error('PRIVATE_STREAM_VALUE'); },
+    getOwnPropertyDescriptor() { getters++; throw new Error('PRIVATE_STREAM_VALUE'); },
+    getPrototypeOf() { getters++; throw new Error('PRIVATE_STREAM_VALUE'); },
+  });
+  const revoked = Proxy.revocable(new ProbeError('INVALID_USAGE_RECEIPT'), {}); revoked.revoke();
+  for (const [error, expectedCode, expected] of [[getter, 'GATEWAY_RESPONSE_INVALID', { responseFailureClass: 'UNKNOWN' }],
+    [Object.assign(Object.create(ProbeError.prototype), { code: 'INVALID_USAGE_RECEIPT' }), 'GATEWAY_RESPONSE_INVALID', { responseFailureClass: 'UNKNOWN' }],
+    [proxy, 'GATEWAY_UNAVAILABLE', undefined], [revoked.proxy, 'GATEWAY_UNAVAILABLE', undefined],
+    [{ code: 'INVALID_USAGE_RECEIPT' }, 'GATEWAY_UNAVAILABLE', undefined]]) {
+    const state = harness(t, { fetch: () => { throw error; } });
+    await assert.rejects(run(state), failure => {
+      assert.equal(failure.code, expectedCode);
+      const before = gateway.codexLocalGatewayResponseDiagnostic(failure); assert.deepEqual(before, expected);
+      Object.defineProperty(failure, 'responseFailureClass', { value: 'PRIVATE_STREAM_VALUE' });
+      Object.defineProperty(failure, 'code', { get() { getters++; throw new Error('PRIVATE_STREAM_VALUE'); } });
+      assert.equal(gateway.codexLocalGatewayResponseDiagnostic(failure), before);
+      return true;
+    });
+    assert.equal(state.calls.length, 1);
+  }
+  assert.equal(getters, 0);
+  assert.equal(gateway.codexLocalGatewayResponseDiagnostic(new ProbeError('INVALID_USAGE_RECEIPT')), undefined);
+  assert.equal(gateway.codexLocalGatewayResponseDiagnostic(revoked.proxy), undefined);
+  assert.equal(gateway.codexLocalGatewayResponseDiagnostic(
+    new gateway.CodexLocalGatewayError('GATEWAY_RESPONSE_INVALID', 'TERMINAL_MISSING')), undefined);
+});
+
+test('source admission failures never borrow a stream parser classification', async t => {
+  for (const phase of ['before', 'after']) await t.test(phase, async child => {
+    const state = harness(child, { attest: (context, proof) => {
+      if (context.phase === phase) throw new ProbeError('INVALID_USAGE_RECEIPT');
+      return proof;
+    } });
+    await assert.rejects(run(state), error => {
+      assert.equal(error.code, 'ATTESTATION_FAILED');
+      assert.equal(gateway.codexLocalGatewayResponseDiagnostic(error), undefined); return true;
+    });
+    assert.equal(state.calls.length, phase === 'before' ? 0 : 1);
+  });
+});
+
+test('owner cancellation and model timeout keep priority over a simultaneous stream failure classification', async t => {
+  for (const mode of ['caller', 'owner', 'timeout']) await t.test(mode, async child => {
+    const caller = new AbortController(); let deadline;
+    child.mock.method(AbortSignal, 'timeout', milliseconds => {
+      const controller = new AbortController(); if (milliseconds === 60_000) deadline = controller;
+      return controller.signal;
+    });
+    const state = harness(child, { fetch: () => {
+      if (mode === 'caller') caller.abort(); else if (mode === 'owner') state.owner.abort(); else deadline.abort();
+      return new Response(new ReadableStream({ start(controller) { controller.error(new Error('PRIVATE_STREAM_VALUE')); } }),
+        { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    await assert.rejects(run(state, request(), 'info', caller.signal), error => {
+      assert.equal(error.code, mode === 'caller' ? 'GATEWAY_ABORTED' : mode === 'owner' ? 'GATEWAY_CLOSED' : 'GATEWAY_TIMEOUT');
+      assert.equal(gateway.codexLocalGatewayResponseDiagnostic(error), undefined); return true;
+    });
+    assert.equal(state.calls.length, 1);
+  });
 });
