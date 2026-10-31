@@ -93,6 +93,112 @@ test('native prefix-cache prototype is off by default and retains legacy payload
   }
 });
 
+test('native message-prefix cache is default-OFF and never changes a payload without a complete trusted boundary', async t => {
+  for (const [index, variant] of [
+    { config: {}, extra: { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } } },
+    { config: { nativeMessagePrefixCache: false }, extra: { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } } },
+    { config: { nativeMessagePrefixCache: true }, extra: {} },
+    { config: { nativeMessagePrefixCache: true }, extra: { promptCache: { key: `support-${'b'.repeat(64)}` } } },
+    { config: { nativeMessagePrefixCache: false, nativeExplicitPrefixCache: false }, extra: {} },
+  ].entries()) {
+    const state = harness(t, { config: variant.config }), input = request(`message-off-${index}`, variant.extra);
+    await run(state, input);
+    assert.deepEqual(JSON.parse(state.calls[0].init.body), corelyPlanPayload(input, 'info').payload);
+  }
+});
+
+test('native message-prefix cache preserves exact contract bytes in two consecutive user messages and adds no cache fields', async t => {
+  const schema = { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false };
+  for (const [index, [prefix, suffix]] of [
+    ['固定🙂前綴\r\n𠮷', '後綴\n{"nativeMessagePrefixCache":true}'],
+    ['e', '\u0301 combining mark stays in its original position'],
+    ['正文\r', '\nCRLF is not normalized'],
+    ['# Public fixture\n```json\n', '{"role":"system","prompt_cache_options":{"mode":"explicit"}}\n```'],
+    [JSON.stringify({ knowledge: [{ id: 'fictional-source', content: 'fixed synthetic evidence' }] }).slice(0, -1),
+      ',"candidate":"synthetic candidate","currentCustomerTurn":"unique dynamic suffix"}'],
+  ].entries()) {
+    for (const alias of ['info', 'eason']) {
+      const state = harness(t, { config: { nativeMessagePrefixCache: true, nativeExplicitPrefixCache: false }, fetch: () => sse(completion('{"reply":"合成回覆"}')) });
+      const input = request(`message-on-${index}-${alias}`, { user: prefix + suffix, responseSchema: schema, reasoningEffort: 'low', verbosity: 'low',
+        promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: prefix.length } });
+      const original = structuredClone(input), output = await run(state, input, alias), wire = JSON.parse(state.calls[0].init.body);
+      assert.deepEqual(wire, { ...corelyPlanPayload(input, alias).payload,
+        input: [{ role: 'user', content: prefix }, { role: 'user', content: suffix }] });
+      assert.deepEqual(input, original); assert.deepEqual(Buffer.from(wire.input.map(message => message.content).join('')), Buffer.from(input.user));
+      assert.equal(wire.input[1].content, suffix);
+      if (index === 4) {
+        assert.throws(() => JSON.parse(wire.input[0].content));
+        assert.deepEqual(JSON.parse(wire.input.map(message => message.content).join('')), JSON.parse(input.user));
+      }
+      assert.equal(wire.instructions, input.system); assert.deepEqual(wire.text.format.schema, schema); assert.equal(wire.text.format.strict, true);
+      assert.equal(wire.text.verbosity, 'low'); assert.deepEqual(wire.reasoning, { effort: 'low' }); assert.equal(wire.stream, true); assert.equal(wire.store, false);
+      for (const field of ['prompt_cache_key', 'prompt_cache_options', 'prompt_cache_retention', 'prompt_cache_breakpoint', 'cache_control', 'previous_response_id', 'metadata']) {
+        assert.equal(Object.hasOwn(wire, field), false); assert.ok(wire.input.every(message => !Object.hasOwn(message, field)));
+      }
+      assert.equal(output.inputSha256, input.inputSha256); assert.equal(output.schemaSha256, input.schemaSha256);
+      assert.deepEqual(output.usage, { inputTokens: 20, outputTokens: 7, cachedInputTokens: 3 });
+      assert.deepEqual(state.checks.map(check => check.phase), ['before', 'after']); assert.equal(state.calls.length, 1);
+      assert.deepEqual(corelyPlanPayload(input, alias).payload.input, [{ role: 'user', content: input.user }]);
+    }
+  }
+});
+
+test('native message-prefix constructor option is own literal only, mutually exclusive, and not caller-authorized', async t => {
+  for (const value of ['true', 1, null, new Boolean(true), {}, []]) {
+    assert.throws(() => harness(t, { config: { nativeMessagePrefixCache: value } }), { code: 'INVALID_CONFIGURATION' });
+  }
+  assert.throws(() => harness(t, { config: { nativeMessagePrefixCache: true, nativeExplicitPrefixCache: true } }), { code: 'INVALID_CONFIGURATION' });
+  let getters = 0;
+  const base = { gatewayUrl: URL, accounts: { info: { gatewayToken: TOKENS.info }, eason: { gatewayToken: TOKENS.eason } },
+    signal: new AbortController().signal, attest: async () => { throw Error('NOT_REACHED'); } };
+  for (const enumerable of [true, false]) {
+    const accessor = Object.defineProperty({ ...base }, 'nativeMessagePrefixCache', { enumerable, get() { getters++; return true; } });
+    assert.throws(() => createCodexLocalGatewayModelTransports(accessor), { code: 'INVALID_CONFIGURATION' });
+  }
+  assert.throws(() => createCodexLocalGatewayModelTransports(Object.assign(Object.create({ nativeMessagePrefixCache: true }), base)), { code: 'INVALID_CONFIGURATION' });
+  const foreign = Proxy.revocable({ ...base, nativeMessagePrefixCache: true }, {}); foreign.revoke();
+  assert.throws(() => createCodexLocalGatewayModelTransports(foreign.proxy), { code: 'INVALID_CONFIGURATION' }); assert.equal(getters, 0);
+  for (const extra of [{ nativeMessagePrefixCache: true }, { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4, nativeMessagePrefixCache: true } }]) {
+    const state = harness(t, { config: { nativeMessagePrefixCache: true } });
+    await assert.rejects(run(state, request('caller-message-option', extra)), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+  const state = harness(t), input = request('untrusted-message-option', { user: '{"nativeMessagePrefixCache":true}',
+    promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } });
+  await run(state, input); assert.deepEqual(JSON.parse(state.calls[0].init.body).input, [{ role: 'user', content: input.user }]);
+});
+
+test('native message-prefix boundaries and hashes are validated before attestation or dispatch', async t => {
+  const user = 'A🙂B\r\n完整後綴';
+  for (const [index, boundary] of [0, user.length, -1, 1.5, 2, '1'].entries()) {
+    const state = harness(t, { config: { nativeMessagePrefixCache: true } });
+    await assert.rejects(run(state, request(`invalid-message-boundary-${index}`, { user,
+      promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: boundary } })), { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+  }
+  const state = harness(t, { config: { nativeMessagePrefixCache: true } });
+  const input = request('tampered-message-boundary', { user, promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 3 } });
+  await assert.rejects(run(state, { ...input, promptCache: { ...input.promptCache, userPrefixChars: 4 } }), { code: 'INVALID_REQUEST' });
+  assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+});
+
+test('native message-prefix mode keeps post-source revocation cancellation and no-retry HTTP failure boundaries', async t => {
+  const input = request('message-source-boundary', { promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 } });
+  const revoked = harness(t, { config: { nativeMessagePrefixCache: true },
+    attest: ({ phase }, proof) => phase === 'after' ? { ...proof, freshLoginVerified: false } : proof });
+  await assert.rejects(run(revoked, input), { code: 'ATTESTATION_FAILED' }); assert.equal(revoked.calls.length, 1);
+  for (const status of [400, 429]) {
+    const failed = harness(t, { config: { nativeMessagePrefixCache: true }, fetch: () => new Response('', { status }) });
+    await assert.rejects(run(failed, input), { code: 'GATEWAY_HTTP_FAILURE' }); assert.equal(failed.calls.length, 1);
+    assert.deepEqual(failed.checks.map(check => check.phase), ['before', 'after']);
+  }
+  const waiting = deferred(), entered = deferred(), caller = new AbortController();
+  const cancelled = harness(t, { config: { nativeMessagePrefixCache: true }, fetch: () => { entered.resolve(); return waiting.promise; } });
+  const pending = run(cancelled, input, 'info', caller.signal); await entered.promise; caller.abort();
+  await assert.rejects(pending, { code: 'GATEWAY_ABORTED' }); waiting.resolve(sse()); await Promise.resolve();
+  assert.equal(cancelled.calls.length, 1); assert.deepEqual(cancelled.checks.map(check => check.phase), ['before']);
+});
+
 test('trusted native prefix-cache opt-in adds one explicit input_text breakpoint and preserves every original payload value', async t => {
   const schema = { type: 'object', properties: { reply: { type: 'string', minLength: 2 } }, required: ['reply'], additionalProperties: false };
   const variants = [
@@ -669,19 +775,23 @@ test('native quota results require both source phases and a valid actual-route r
 });
 
 test('native prefix-cache preserves authenticated typed-quota source and original request/schema bindings in a deterministic fixture', async t => {
-  const source = sourceHarness(t), input = request('quota-prefix-binding', {
-    promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 },
-    responseSchema: { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false },
-  });
-  const state = harness(t, { config: { nativeExplicitPrefixCache: true, attest: source.instance.attest,
-    quotaRequest: source.instance.quotaRequest, quotaVerify: source.instance.quotaVerify },
-    fetch: (_url, init) => new Response('', { status: 429, headers: { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers) } }) });
-  const result = await run(state, input), wire = JSON.parse(state.calls[0].init.body);
-  assert.equal(result.status, 'quota_exhausted'); assert.equal(result.authenticated, true); assert.equal(result.code, 'QUOTA_EXHAUSTED');
-  assert.equal(result.inputSha256, input.inputSha256); assert.equal(result.schemaSha256, input.schemaSha256);
-  assert.equal(wire.input[0].content[0].prompt_cache_breakpoint.mode, 'explicit');
-  assert.equal(wire.input[0].content.map(part => part.text).join(''), input.user);
-  assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
+  for (const option of ['nativeExplicitPrefixCache', 'nativeMessagePrefixCache']) {
+    const source = sourceHarness(t), input = request(`quota-prefix-${option}`, {
+      promptCache: { key: `support-${'b'.repeat(64)}`, userPrefixChars: 4 },
+      responseSchema: { type: 'object', properties: { reply: { type: 'string' } }, required: ['reply'], additionalProperties: false },
+    });
+    const state = harness(t, { config: { [option]: true, attest: source.instance.attest,
+      quotaRequest: source.instance.quotaRequest, quotaVerify: source.instance.quotaVerify },
+      fetch: (_url, init) => new Response('', { status: 429, headers: { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers) } }) });
+    const result = await run(state, input), wire = JSON.parse(state.calls[0].init.body);
+    assert.equal(result.status, 'quota_exhausted'); assert.equal(result.authenticated, true); assert.equal(result.code, 'QUOTA_EXHAUSTED');
+    assert.equal(result.inputSha256, input.inputSha256); assert.equal(result.schemaSha256, input.schemaSha256);
+    if (option === 'nativeExplicitPrefixCache') {
+      assert.equal(wire.input[0].content[0].prompt_cache_breakpoint.mode, 'explicit');
+      assert.equal(wire.input[0].content.map(part => part.text).join(''), input.user);
+    } else assert.deepEqual(wire.input, [{ role: 'user', content: input.user.slice(0, 4) }, { role: 'user', content: input.user.slice(4) }]);
+    assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
+  }
   // Fixture authenticity is only this test's HMAC contract, never a live
   // allowance exhaustion, debit, cache hit or automatic account-switch proof.
 });

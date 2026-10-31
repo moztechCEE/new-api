@@ -301,7 +301,7 @@ export function createCodexLocalSourceAttestor(options) {
  */
 export function createCodexLocalGatewayModelTransports(options) {
   const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
-    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'nativeExplicitPrefixCache'], 'INVALID_CONFIGURATION');
+    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
   if (typeof attest !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' ||
@@ -310,7 +310,9 @@ export function createCodexLocalGatewayModelTransports(options) {
   if ((quotaEnabled && (typeof config.quotaRequest !== 'function' || types.isProxy(config.quotaRequest) ||
       typeof config.quotaVerify !== 'function' || types.isProxy(config.quotaVerify))) ||
       (config.allowHistoricalRegression !== undefined && typeof config.allowHistoricalRegression !== 'boolean') ||
-      (config.nativeExplicitPrefixCache !== undefined && typeof config.nativeExplicitPrefixCache !== 'boolean')) reject('INVALID_CONFIGURATION');
+      (config.nativeExplicitPrefixCache !== undefined && typeof config.nativeExplicitPrefixCache !== 'boolean') ||
+      (config.nativeMessagePrefixCache !== undefined && typeof config.nativeMessagePrefixCache !== 'boolean') ||
+      (config.nativeExplicitPrefixCache === true && config.nativeMessagePrefixCache === true)) reject('INVALID_CONFIGURATION');
   const localAdmission = config.allowHistoricalRegression === true ? Object.freeze({ allowHistoricalRegression: true }) : undefined;
   const accounts = ownData(config.accounts, ['info', 'eason'], 'INVALID_CONFIGURATION'), tokens = new Map();
   for (const alias of ['info', 'eason']) {
@@ -382,6 +384,15 @@ export function createCodexLocalGatewayModelTransports(options) {
           { type: 'input_text', text: request.user.slice(0, boundary), prompt_cache_breakpoint: { mode: 'explicit' } },
           { type: 'input_text', text: request.user.slice(boundary) },
         ] }] });
+      } else if (config.nativeMessagePrefixCache === true && request.promptCache?.userPrefixChars !== undefined) {
+        // Separate same-role messages preserve an eligible message ending
+        // without forwarding any optional cache parameter. Exact concatenated
+        // user text is unchanged; cache availability/benefit is not promised.
+        const boundary = request.promptCache.userPrefixChars;
+        payload = Object.freeze({ ...payload, input: [
+          { role: 'user', content: request.user.slice(0, boundary) },
+          { role: 'user', content: request.user.slice(boundary) },
+        ] });
       }
       let quotaHeaders = Object.create(null);
       if (quotaEnabled) {
