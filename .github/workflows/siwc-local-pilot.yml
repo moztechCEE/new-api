@@ -16,6 +16,9 @@ on:
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
       - 'controller/codex_local_attestation*.go'
+      - 'controller/local_owner_source_view*.go'
+      - 'controller/option.go'
+      - 'router/api-router.go'
       - 'service/codex_local_proof.go'
       - 'relay/codex_local_quota.go'
       - 'relay/responses_handler.go'
@@ -37,6 +40,9 @@ on:
       - 'deploy/gce/siwc*'
       - 'relay/responses_websocket_test.go'
       - 'controller/codex_local_attestation*.go'
+      - 'controller/local_owner_source_view*.go'
+      - 'controller/option.go'
+      - 'router/api-router.go'
       - 'service/codex_local_proof.go'
       - 'relay/codex_local_quota.go'
       - 'relay/responses_handler.go'
@@ -67,7 +73,7 @@ jobs:
       - name: Real Go Responses passthrough, SSE and first-attempt retry contract
         run: go test ./relay -run '^Test(SIWCGatewayResponsesPassthroughAndSingleAttempt|NativeCodexQuotaDataPlaneReceipt|CodexLocalQuotaCrossLanguageFixedVector)$' -count=1
       - name: Owner-local non-secret credential attestation security contract
-        run: go test ./controller -run '^TestCodexLocalAttestation' -count=1
+        run: go test ./controller -run '^Test(CodexLocalAttestation|LocalOwnerSourceView)' -count=1
       - name: Forward caller cancellation to real upstream HTTP requests
         run: go test ./relay/channel -run '^Test(RelayRequestsInheritClientCancellation|NewTaskAPIRequestInheritsClientCancellation)$' -count=1
   local-protocol:

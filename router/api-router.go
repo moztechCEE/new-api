@@ -21,6 +21,10 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
+	const localOwnerSourceViewPath = "/local-owner/source-view"
+	middleware.DeclareAccessTokenPermissionRoute(http.MethodGet, "/api"+localOwnerSourceViewPath, authz.ChannelRead)
+	apiRouter.GET(localOwnerSourceViewPath, controller.LocalOwnerSourceViewGate, middleware.RootAuth(),
+		middleware.RequirePermission(authz.ChannelRead), middleware.RequirePermission(authz.ChannelSecretView), controller.CreateLocalOwnerSourceView)
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()
 	{
 		apiRouter.GET("/setup", controller.GetSetup)

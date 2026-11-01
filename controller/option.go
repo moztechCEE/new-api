@@ -80,7 +80,10 @@ func buildCompletionRatioMetaValue(optionValues map[string]string) string {
 	return string(jsonBytes)
 }
 
-func GetOptions(c *gin.Context) {
+// dashboardOptionSnapshot is the same redacted, effective option view used by
+// the normal dashboard. Values remain opaque; consumers must not reinterpret
+// or rewrite pricing expressions while comparing a source snapshot.
+func dashboardOptionSnapshot() ([]*model.Option, error) {
 	var options []*model.Option
 	optionValues := make(map[string]string)
 	common.OptionMapRWMutex.Lock()
@@ -114,8 +117,7 @@ func GetOptions(c *gin.Context) {
 	} {
 		encoded, err := common.Marshal(values)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": err.Error()})
-			return
+			return nil, err
 		}
 		options = append(options, &model.Option{Key: key, Value: string(encoded)})
 	}
@@ -123,6 +125,15 @@ func GetOptions(c *gin.Context) {
 		Key:   "CompletionRatioMeta",
 		Value: buildCompletionRatioMetaValue(optionValues),
 	})
+	return options, nil
+}
+
+func GetOptions(c *gin.Context) {
+	options, err := dashboardOptionSnapshot()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
