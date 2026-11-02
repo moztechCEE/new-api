@@ -171,13 +171,28 @@ export function snapshotModelRequest(input, options) {
 
 /** One receipt contract shared by the private worker and its Corely router.
  * Credentials and provider error bodies are never part of a model result. */
-export function snapshotModelResult(input, request, accountAlias, authMode) {
+export function snapshotModelResult(input, request, accountAlias, authMode, options) {
+  let providerFailure = false;
+  if (options !== undefined) {
+    if (!options || typeof options !== 'object' || types.isProxy(options) ||
+        ![Object.prototype, null].includes(Object.getPrototypeOf(options))) held('INVALID_RECEIPT');
+    const fields = Object.getOwnPropertyDescriptors(options), option = fields.allowProviderFailureFallback;
+    if (Reflect.ownKeys(fields).length !== 1 || !option?.enumerable || !Object.hasOwn(option, 'value') ||
+        typeof option.value !== 'boolean') held('INVALID_RECEIPT');
+    providerFailure = option.value;
+  }
   const result = copyCanonical(input);
   if (!['info', 'eason'].includes(accountAlias) || !['managed_chatgpt', 'siwc_plan'].includes(authMode) ||
       !result || typeof result !== 'object' || Array.isArray(result) || result.accountAlias !== accountAlias ||
       result.authMode !== authMode || result.accountVerified !== true || result.model !== MODEL ||
       result.callId !== request.callId || result.inputSha256 !== request.inputSha256 || result.schemaSha256 !== request.schemaSha256) held('INVALID_RECEIPT');
   const keys = ['accountAlias', 'authMode', 'accountVerified', 'model', 'callId', 'inputSha256', 'schemaSha256', 'status'];
+  if (result.status === 'provider_failure') {
+    if (!providerFailure || authMode !== 'managed_chatgpt' || result.code !== 'PROVIDER_UNAVAILABLE' ||
+        result.operationSettled !== true || !['AUTHENTICATION', 'RATE_LIMIT', 'NETWORK', 'UPSTREAM', 'INVALID_OUTPUT', 'TIMEOUT'].includes(result.reason) ||
+        Object.keys(result).some(key => ![...keys, 'code', 'reason', 'operationSettled'].includes(key))) held('INVALID_RECEIPT');
+    return result;
+  }
   if (result.status === 'quota_exhausted') {
     if (result.code !== 'QUOTA_EXHAUSTED' || result.authenticated !== true ||
         Object.keys(result).some(key => ![...keys, 'code', 'authenticated'].includes(key))) held('INVALID_RECEIPT');

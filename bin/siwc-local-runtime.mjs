@@ -266,7 +266,11 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
   return diagnostic;
 }
 
-async function consumeTextStream(body, expectedText, signal, onPhase) {
+const SETTLED_PLAN_OUTPUT_FAILURES = new WeakSet();
+/** A parser-local failure observation, never model/authentication authority. */
+export const isSettledPlanOutputFailure = error => SETTLED_PLAN_OUTPUT_FAILURES.has(error);
+
+async function consumeTextStream(body, expectedText, signal, onPhase, classifySettledOutputFailure = false) {
   if (!body) fail('MISSING_COMPLETED_EVENT');
   const decoder = new TextDecoder('utf8', { fatal: true });
   let buffer = '', total = 0, text = '', completed, responseId;
@@ -404,12 +408,17 @@ async function consumeTextStream(body, expectedText, signal, onPhase) {
   const itemText = allPartsClosed ? ordered.map(part => part.done).join('') : '';
   const finalText = snapshotText || itemText;
   const streamText = ordered.length ? ordered.map(part => part.delta).join('') : text;
+  let outputFailure;
   if (!finalText || (expectedText !== undefined && finalText.trim() !== expectedText) || (streamText && streamText !== finalText) ||
       (snapshotText && itemText && snapshotText !== itemText)) {
-    throw new ProbeError(expectedText === undefined ? 'COMPLETED_OUTPUT_MISMATCH' : 'SYNTHETIC_OUTPUT_MISMATCH', { completedEventVerified: true,
+    const error = new ProbeError(expectedText === undefined ? 'COMPLETED_OUTPUT_MISMATCH' : 'SYNTHETIC_OUTPUT_MISMATCH', { completedEventVerified: true,
       finalTextMatchesExpected: expectedText === undefined || finalText.trim() === expectedText, deltaMatchesFinal: streamText === finalText,
       finalTextLength: finalText.length, deltaTextLength: streamText.length,
       finalTextHash: digest(finalText), deltaTextHash: digest(streamText) });
+    // Only empty completed output can be classified after EOF AND authoritative
+    // usage validation. Nonempty inconsistent output remains a protocol hold.
+    if (classifySettledOutputFailure && expectedText === undefined && !finalText && !streamText) outputFailure = error;
+    else throw error;
   }
   if (Buffer.byteLength(finalText) > 1_048_576) fail('OUTPUT_TOO_LARGE');
   let usage, cachedInputTokens;
@@ -420,6 +429,10 @@ async function consumeTextStream(body, expectedText, signal, onPhase) {
     usage = { inputTokens: source.input_tokens, outputTokens: source.output_tokens, totalTokens: source.total_tokens };
     cachedInputTokens = source.input_tokens_details?.cached_tokens ?? 0;
     if (!Number.isSafeInteger(cachedInputTokens) || cachedInputTokens < 0 || cachedInputTokens > source.input_tokens) fail('INVALID_USAGE_RECEIPT');
+  }
+  if (outputFailure) {
+    if (!usage) fail('INVALID_USAGE_RECEIPT');
+    SETTLED_PLAN_OUTPUT_FAILURES.add(outputFailure); throw outputFailure;
   }
   if (!observed.has('first_text')) observe('final_text_only');
   return { completed: true, model: MODEL, responseIdHash: digest(completed.id), outputHash: digest(finalText),
@@ -434,8 +447,17 @@ export async function consumeProbeStream(body) {
 
 /** Internal text result for the bounded Corely adapter, never a public proxy.
  * Usage and terminal completion must both be attested by the provider. */
-export async function consumePlanTextStream(body, signal, onPhase) {
-  const receipt = await consumeTextStream(body, undefined, signal, onPhase);
+export async function consumePlanTextStream(body, signal, onPhase, options) {
+  let classifySettledOutputFailure = false;
+  if (options !== undefined) {
+    if (!options || typeof options !== 'object' || types.isProxy(options) ||
+        ![Object.prototype, null].includes(Object.getPrototypeOf(options))) fail('INVALID_STREAM_OPTIONS');
+    const fields = Object.getOwnPropertyDescriptors(options), option = fields.classifySettledOutputFailure;
+    if (Reflect.ownKeys(fields).length !== 1 || !option?.enumerable || !Object.hasOwn(option, 'value') ||
+        typeof option.value !== 'boolean') fail('INVALID_STREAM_OPTIONS');
+    classifySettledOutputFailure = option.value;
+  }
+  const receipt = await consumeTextStream(body, undefined, signal, onPhase, classifySettledOutputFailure);
   if (!receipt.usage) fail('INVALID_USAGE_RECEIPT');
   return receipt;
 }

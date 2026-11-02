@@ -5,8 +5,8 @@ import { spawnSync } from 'node:child_process';
 import { after, before, test } from 'node:test';
 import { createCodexLocalGatewayModelTransports, createCodexLocalSourceAttestor, deriveCodexLocalAttestationKey } from './codex-local-gateway-model-port.mjs';
 import * as gateway from './codex-local-gateway-model-port.mjs';
-import { ModelContractError, snapshotModelRequest } from './corely-model-contract.mjs';
-import { ProbeError, consumePlanTextStream } from './siwc-local-runtime.mjs';
+import { ModelContractError, snapshotModelRequest, snapshotModelResult } from './corely-model-contract.mjs';
+import { ProbeError, consumePlanTextStream, isSettledPlanOutputFailure } from './siwc-local-runtime.mjs';
 import { corelyPlanPayload, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 
 // Injected HTTP/SSE fixtures only: no credential, provider, DB, or listener.
@@ -63,6 +63,169 @@ function providerWorkAttempt(events, signal = new AbortController().signal) {
 }
 const runProviderWork = (state, attempt, input = request(), signal = new AbortController().signal) =>
   state.instance.ports.info.generateWithProviderWork(input, signal, attempt);
+function providerFailureHarness(t, options = {}) {
+  return harness(t, { ...options, config: { dispatchProviderOperation: context => context.operation(context.signal),
+    allowProviderFailureFallback: true, ...options.config } });
+}
+
+test('provider failures require a trusted own opt-in, preserve legacy errors and never accept request admission flags', async t => {
+  for (const config of [{ allowProviderFailureFallback: true }, { allowProviderFailureFallback: 'true' }]) {
+    assert.throws(() => harness(t, { config }), { code: 'INVALID_CONFIGURATION' });
+  }
+  let reads = 0;
+  const getterConfig = { gatewayUrl: URL, accounts: { info: { gatewayToken: TOKENS.info }, eason: { gatewayToken: TOKENS.eason } },
+    signal: new AbortController().signal, attest() {} };
+  Object.defineProperty(getterConfig, 'allowProviderFailureFallback', { enumerable: true, get() { reads++; throw Error('PRIVATE_GETTER'); } });
+  assert.throws(() => createCodexLocalGatewayModelTransports(getterConfig), { code: 'INVALID_CONFIGURATION' });
+  assert.equal(reads, 0);
+  for (const status of [401, 429, 504]) {
+    const state = providerFailureHarness(t, { fetch: () => new Response('PRIVATE_HTTP_BODY', { status }) });
+    await assert.rejects(run(state), { code: 'GATEWAY_HTTP_FAILURE' });
+  }
+  const state = providerFailureHarness(t);
+  for (const input of [request('untrusted-flag', { allowProviderFailureFallback: true }),
+    request('other-scope', { scope: { tenantId: 'other', brandId: 'other', synthetic: true, jobId: 'job' } })]) {
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt, input), { code: 'INVALID_REQUEST' });
+  }
+  assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+});
+test('completed HTTP provider failures are fixed bound receipts, not success, usage or quota claims', async t => {
+  for (const [status, reason] of [[401, 'AUTHENTICATION'], [403, 'AUTHENTICATION'], [429, 'RATE_LIMIT'],
+    [408, 'TIMEOUT'], [504, 'TIMEOUT'], [400, 'UPSTREAM'], [500, 'UPSTREAM']]) {
+    const work = providerWorkAttempt([]), input = request('provider-http-'+status), state = providerFailureHarness(t, {
+      fetch: () => new Response('PRIVATE_HTTP_BODY', { status }) });
+    const result = await runProviderWork(state, work.attempt, input);
+    assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, reason);
+    assert.equal(result.code, 'PROVIDER_UNAVAILABLE'); assert.equal(result.operationSettled, true);
+    for (const key of ['callId', 'inputSha256', 'schemaSha256']) assert.equal(result[key], input[key]);
+    assert.equal(result.accountAlias, 'info'); assert.equal(result.authMode, 'managed_chatgpt');
+    assert.equal(work.completed(), true); assert.deepEqual(work.output(), {});
+    assert.equal(Object.isFrozen(result), true); assert.equal(state.calls.length, 1);
+    assert.deepEqual(state.checks.map(value => value.phase), ['before', 'after']);
+    for (const key of ['text', 'usage', 'authenticated', 'completionStatus']) assert.equal(Object.hasOwn(result, key), false);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_HTTP_BODY|receipt|nonce|proof|Bearer/);
+  }
+});
+test('only a settled branded physical network rejection can become a provider failure', async t => {
+  const real = gateway.createCodexLocalProviderNetworkFailure(); let reads = 0;
+  assert.equal(gateway.isCodexLocalProviderNetworkFailure(real), true);
+  for (const foreign of [null, false, {}, { ...real }, new Proxy({}, { get() { reads++; throw Error('PRIVATE_PROXY'); } }),
+    Object.defineProperty({}, 'code', { get() { reads++; throw Error('PRIVATE_GETTER'); } })]) {
+    assert.equal(gateway.isCodexLocalProviderNetworkFailure(foreign), false);
+  }
+  assert.equal(reads, 0);
+  for (const branded of [true, false]) {
+    const work = providerWorkAttempt([]), entered = deferred(), release = deferred(), state = providerFailureHarness(t, {
+      fetch: () => { entered.resolve(); return release.promise; } });
+    const pending = runProviderWork(state, work.attempt); await entered.promise;
+    assert.equal(work.completed(), false); assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+    release.reject(branded ? gateway.createCodexLocalProviderNetworkFailure() : Error('PRIVATE_RAW_TRANSPORT_ERROR'));
+    if (branded) assert.equal((await pending).reason, 'NETWORK');
+    else await assert.rejects(pending, { code: 'GATEWAY_UNAVAILABLE' });
+    assert.equal(work.completed(), branded); assert.equal(state.calls.length, 1);
+    assert.deepEqual(state.checks.map(value => value.phase), branded ? ['before', 'after'] : ['before']);
+  }
+});
+test('provider-failure receipts wait for the full after-proof and source validation', async t => {
+  const reached = deferred(), release = deferred(), work = providerWorkAttempt([]), state = providerFailureHarness(t, {
+    fetch: () => new Response('', { status: 401 }), attest: async (context, proof) => {
+      if (context.phase === 'after') { reached.resolve(); await release.promise; } return proof;
+    } });
+  let settled = false; const pending = runProviderWork(state, work.attempt).finally(() => { settled = true; });
+  await reached.promise; assert.equal(work.completed(), true); assert.equal(settled, false);
+  release.resolve(); assert.equal((await pending).reason, 'AUTHENTICATION');
+  for (const mode of ['revision', 'revoked', 'expired']) {
+    const held = providerFailureHarness(t, { fetch: () => new Response('', { status: 401 }), attest: (context, proof) =>
+      context.phase === 'before' ? proof : mode === 'revision' ? { ...proof, configurationRevision: 'b'.repeat(64) } :
+        mode === 'revoked' ? { ...proof, freshLoginVerified: false } : { ...proof, expiresAt: 1000 } });
+    await assert.rejects(runProviderWork(held, providerWorkAttempt([]).attempt), {
+      code: mode === 'revision' ? 'ATTESTATION_CHANGED' : 'ATTESTATION_FAILED' });
+  }
+});
+test('provider failures cannot outlive caller cancellation or classify an unfinished stream as settled', async t => {
+  for (const stage of ['fetch', 'after']) {
+    const entered = deferred(), release = deferred(), caller = new AbortController(), state = providerFailureHarness(t, {
+      fetch: () => stage === 'fetch' ? (entered.resolve(), release.promise) : new Response('', { status: 401 }),
+      attest: async (context, proof) => { if (stage === 'after' && context.phase === 'after') { entered.resolve(); await release.promise; } return proof; },
+    });
+    const pending = runProviderWork(state, providerWorkAttempt([]).attempt, request('failure-abort-'+stage), caller.signal);
+    await entered.promise; caller.abort(false);
+    await assert.rejects(pending, error => ['GATEWAY_ABORTED', 'GATEWAY_CLOSED'].includes(error.code));
+    if (stage === 'fetch') release.reject(gateway.createCodexLocalProviderNetworkFailure()); else release.resolve();
+    await flush(); assert.equal(state.calls.length, 1);
+  }
+  let deadline, stream;
+  t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); if (ms === 60000) deadline = c; return c.signal; });
+  const work = providerWorkAttempt([]), state = providerFailureHarness(t, { fetch: () => new Response(new ReadableStream({
+    start(controller) { stream = controller; },
+  }), { headers: { 'content-type': 'text/event-stream' } }) });
+  const pending = runProviderWork(state, work.attempt); await flush(); deadline.abort();
+  await assert.rejects(pending, { code: 'GATEWAY_TIMEOUT' }); assert.equal(work.completed(), false);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  stream.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"late"}}\n\n')); await flush();
+});
+test('source and dispatch throws or a wrapper with unfinished physical work never become provider receipts', async t => {
+  for (const stage of ['before', 'dispatch']) {
+    const state = providerFailureHarness(t, { attest: stage === 'before' ? () => { throw gateway.createCodexLocalProviderNetworkFailure(); } : undefined,
+      config: stage === 'dispatch' ? { dispatchProviderOperation: () => { throw gateway.createCodexLocalProviderNetworkFailure(); } } : {} });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt), { code: stage === 'before' ? 'ATTESTATION_FAILED' : 'GATEWAY_UNAVAILABLE' });
+    assert.equal(state.calls.length, 0);
+  }
+  const entered = deferred(), release = deferred(), state = providerFailureHarness(t, {
+    fetch: () => { entered.resolve(); return release.promise; }, config: { dispatchProviderOperation: async context => {
+      void context.operation(context.signal); await entered.promise; return {};
+    } } });
+  await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt), { code: 'GATEWAY_CLOSED' });
+  release.reject(gateway.createCodexLocalProviderNetworkFailure()); await flush();
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+});
+test('full EOF with valid usage may report empty or schema-invalid output without publishing that usage', async t => {
+  for (const mode of ['empty', 'whitespace', 'schema']) {
+    const input = request('failure-output-'+mode, mode === 'schema' ? { responseSchema: { type: 'object',
+      additionalProperties: false, required: ['ok'], properties: { ok: { type: 'boolean' } } } } : {});
+    const state = providerFailureHarness(t, { fetch: () => sse(completion(mode === 'empty' ? '' : mode === 'whitespace' ? '  ' : '{"ok":"wrong"}')) });
+    const result = await runProviderWork(state, providerWorkAttempt([]).attempt, input);
+    assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'INVALID_OUTPUT');
+    assert.equal(Object.hasOwn(result, 'usage'), false); assert.equal(Object.hasOwn(result, 'text'), false);
+    assert.deepEqual(state.checks.map(value => value.phase), ['before', 'after']);
+  }
+  for (const usage of [undefined, { input_tokens: 1, output_tokens: -1, total_tokens: 0 },
+    { input_tokens: 1, output_tokens: 1, total_tokens: 3 },
+    { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 2 } },
+    { input_tokens: Number.MAX_SAFE_INTEGER + 1, output_tokens: 0, total_tokens: Number.MAX_SAFE_INTEGER + 1 }]) {
+    const state = providerFailureHarness(t, { fetch: () => sse(completion('', { usage })) });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt), { code: 'GATEWAY_RESPONSE_INVALID' });
+    assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  }
+  const inconsistent = providerFailureHarness(t, { fetch: () => new Response(
+    'data: {"type":"response.output_text.delta","delta":"different"}\n\n'+
+      `data: ${JSON.stringify({ type: 'response.completed', response: completion('final') })}\n\n`,
+    { headers: { 'content-type': 'text/event-stream' } }) });
+  await assert.rejects(runProviderWork(inconsistent, providerWorkAttempt([]).attempt), { code: 'GATEWAY_RESPONSE_INVALID' });
+});
+test('failure receipt contract is strict opt-in and parser failure brands cannot be forged by options or error fields', async () => {
+  const input = request('bound-provider-failure'), receipt = { accountAlias: 'info', authMode: 'managed_chatgpt', accountVerified: true,
+    model: MODEL, callId: input.callId, inputSha256: input.inputSha256, schemaSha256: input.schemaSha256,
+    status: 'provider_failure', code: 'PROVIDER_UNAVAILABLE', reason: 'NETWORK', operationSettled: true };
+  const option = { allowProviderFailureFallback: true };
+  assert.equal(snapshotModelResult(receipt, input, 'info', 'managed_chatgpt', option).reason, 'NETWORK');
+  for (const value of [undefined, { allowProviderFailureFallback: false }, true, new Proxy(option, {}), Object.create(option),
+    { ...option, extra: true }, Object.defineProperty({}, 'allowProviderFailureFallback', { enumerable: true, get() { throw Error('PRIVATE_GETTER'); } })]) {
+    assert.throws(() => snapshotModelResult(receipt, input, 'info', 'managed_chatgpt', value), { code: 'INVALID_RECEIPT' });
+  }
+  for (const change of [{ accountAlias: 'eason' }, { callId: 'other' }, { inputSha256: 'a'.repeat(64) }, { schemaSha256: 'b'.repeat(64) },
+    { code: 'QUOTA_EXHAUSTED' }, { reason: 'unknown' }, { operationSettled: false }, { text: 'PRIVATE_TEXT' }, { usage: {} }, { authenticated: true }]) {
+    assert.throws(() => snapshotModelResult({ ...receipt, ...change }, input, 'info', 'managed_chatgpt', option), { code: 'INVALID_RECEIPT' });
+  }
+  assert.throws(() => snapshotModelResult({ ...receipt, authMode: 'siwc_plan' }, input, 'info', 'siwc_plan', option), { code: 'INVALID_RECEIPT' });
+  for (const options of [true, {}, new Proxy({ classifySettledOutputFailure: true }, {}),
+    Object.create({ classifySettledOutputFailure: true }), { classifySettledOutputFailure: 'true' }]) {
+    await assert.rejects(consumePlanTextStream(sse(completion('')).body, new AbortController().signal, undefined, options), { code: 'INVALID_STREAM_OPTIONS' });
+  }
+  let caught; try { await consumePlanTextStream(sse(completion('')).body, new AbortController().signal, undefined,
+    { classifySettledOutputFailure: true }); } catch (error) { caught = error; }
+  assert.equal(isSettledPlanOutputFailure(caught), true); assert.equal(isSettledPlanOutputFailure({ code: caught.code }), false);
+});
 
 test('provider-work method is constructor-capability-only and legacy generate never invokes it', async t => {
   const legacy = harness(t);
@@ -1047,6 +1210,22 @@ function quotaReceipt(headers, alias = 'info', changes = {}) {
   return `v1.${values.issued}.${values.expires}.${mac.digest('hex')}`;
 }
 const quotaContext = context => Object.freeze({ handle: context.handle, binding: context.binding, signal: context.signal });
+
+test('provider failure opt-in never replaces authenticated quota verification or promotes a forged quota header', async t => {
+  for (const mode of ['valid', 'forged', 'bare']) {
+    const source = sourceHarness(t), state = providerFailureHarness(t, { config: {
+      attest: source.instance.attest, quotaRequest: source.instance.quotaRequest, quotaVerify: source.instance.quotaVerify },
+      fetch: (_url, init) => new Response('{"error":{"code":"usage_limit_reached"}}', { status: 429,
+        headers: mode === 'bare' ? {} : { [QUOTA_RECEIPT_HEADER]: mode === 'valid' ? quotaReceipt(init.headers) : 'v1.10000.130000.'+'0'.repeat(64) } }) });
+    if (mode === 'forged') await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt), { code: 'ATTESTATION_FAILED' });
+    else {
+      const result = await runProviderWork(state, providerWorkAttempt([]).attempt);
+      assert.equal(result.status, mode === 'valid' ? 'quota_exhausted' : 'provider_failure');
+      if (mode === 'valid') assert.equal(result.authenticated, true); else assert.equal(result.reason, 'RATE_LIMIT');
+    }
+    assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
+  }
+});
 
 test('quota HMAC framing matches the shared literal Go producer vector including actual upstream URL', () => {
   const headers = { [QUOTA_HEADERS[0]]: 'a'.repeat(64), [QUOTA_HEADERS[1]]: 'b'.repeat(64),
