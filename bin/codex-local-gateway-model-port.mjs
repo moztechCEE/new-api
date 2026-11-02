@@ -348,7 +348,7 @@ export function createCodexLocalSourceAttestor(options) {
  */
 export function createCodexLocalGatewayModelTransports(options) {
   const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
-    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache', 'nativeSessionAffinity', 'diagnostics'], 'INVALID_CONFIGURATION');
+    'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache', 'nativeSessionAffinity', 'diagnostics', 'dispatchProviderOperation'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
   if (typeof attest !== 'function' || typeof fetchImpl !== 'function' || typeof now !== 'function' ||
@@ -362,6 +362,7 @@ export function createCodexLocalGatewayModelTransports(options) {
       (config.nativeMessagePrefixCache !== undefined && typeof config.nativeMessagePrefixCache !== 'boolean') ||
       (config.nativeSessionAffinity !== undefined && typeof config.nativeSessionAffinity !== 'boolean') ||
       (config.diagnostics !== undefined && typeof config.diagnostics !== 'boolean') ||
+      (config.dispatchProviderOperation !== undefined && (typeof config.dispatchProviderOperation !== 'function' || types.isProxy(config.dispatchProviderOperation))) ||
       (config.nativeExplicitPrefixCache === true && config.nativeMessagePrefixCache === true)) reject('INVALID_CONFIGURATION');
   const localAdmission = config.allowHistoricalRegression === true || config.allowJointUnderstanding === true ? Object.freeze({
     ...(config.allowHistoricalRegression === true ? { allowHistoricalRegression: true } : {}),
@@ -399,7 +400,7 @@ export function createCodexLocalGatewayModelTransports(options) {
     if (clock() >= expiresAt) { close(); reject('GATEWAY_EXPIRED'); }
     if (active.aborted) reject('GATEWAY_ABORTED');
   };
-  const generate = async (alias, input, signal) => {
+  const generate = async (alias, input, signal, providerWorkAttempt) => {
     let request;
     try { request = snapshotModelRequest(input, localAdmission); } catch { reject('INVALID_REQUEST'); }
     if (request.scope.dataClass === 'historical_regression' && config.allowHistoricalRegression !== true) reject('INVALID_REQUEST');
@@ -428,6 +429,7 @@ export function createCodexLocalGatewayModelTransports(options) {
       return attestationSnapshot(value, binding, clock());
     };
     let response, responseBody, modelDeadline, modelActive, modelFinished = false, streamConsumptionFailed = false;
+    let providerOperationPending = false, providerDispatchPending = false;
     let timingStatus = 'FAILED';
     const observeOwnerAbort = () => timing?.mark('abort');
     const observeModelAbort = () => { if (!modelFinished) timing?.mark('abort'); };
@@ -474,32 +476,89 @@ export function createCodexLocalGatewayModelTransports(options) {
         if (Object.keys(quotaHeaders).length !== 4 || QUOTA_REQUEST_HEADERS.slice(0, 3).some(key => typeof quotaHeaders[key] !== 'string' || !HEX64.test(quotaHeaders[key])) ||
             (quotaHeaders[QUOTA_REQUEST_HEADERS[3]] !== '-' && (typeof quotaHeaders[QUOTA_REQUEST_HEADERS[3]] !== 'string' || !HEX64.test(quotaHeaders[QUOTA_REQUEST_HEADERS[3]])))) reject('ATTESTATION_FAILED');
       }
-      // The 60s budget starts at dispatch, not while source verification waits,
-      // and ends only after the full model stream has completed.
-      modelDeadline = AbortSignal.timeout(CALL_TTL_MS);
-      modelActive = AbortSignal.any([ownerActive, modelDeadline]);
-      if (timing) modelActive.addEventListener('abort', observeModelAbort, { once: true });
-      const fetching = Promise.resolve().then(() => {
-        activeCheck(modelActive);
-        if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
-        // This is the configured fetch invocation, not proof of upstream TCP
-        // dispatch: a trusted injected wrapper may still run local guards.
-        timing?.mark('dispatch');
-        return fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
-          headers: { Authorization: `Bearer ${tokens.get(alias)}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
-            'X-Client-Request-Id': randomUUID(), ...(sessionId === undefined ? {} : { 'session-id': sessionId }), ...quotaHeaders }, body: JSON.stringify(payload), signal: modelActive });
-      });
-      // A fetch implementation may ignore cancellation and resolve only after
-      // its owner has gone away. Observe and discard that late body as well.
-      void fetching.then(value => { if (modelActive.aborted) discardResponse(value); }, () => {});
-      response = await whileActive(fetching, modelActive);
-      activeCheck(modelActive);
-      if (!response || types.isProxy(response) || !(response instanceof Response) || response.redirected ||
-          (response.url && response.url !== endpoint)) reject('GATEWAY_RESPONSE_INVALID');
-      timing?.mark('headers');
-      responseBody = response.body;
-      if (!response.ok) {
-        modelFinished = true;
+      // The optional trusted local seam moves source dispatch guards BEFORE
+      // both clocks. Legacy generate still enters here directly, retaining its
+      // original fetch-wrapper timing and complete result/proof contract.
+      const encodedPayload = providerWorkAttempt ? JSON.stringify(payload) : undefined;
+      const httpFailure = Object.freeze({});
+      let operationStarted = false, operationFinished = false, operationInvalid = false, operationOutcome;
+      const modelOperation = async operationSignal => {
+        activeCheck(ownerActive);
+        if (operationStarted) { operationInvalid = true; reject('GATEWAY_REPLAY_OR_CAPACITY'); }
+        if (types.isProxy(operationSignal) || !(operationSignal instanceof AbortSignal)) reject('INVALID_REQUEST');
+        operationStarted = true;
+        providerOperationPending = !!providerWorkAttempt;
+        try {
+          modelDeadline = AbortSignal.timeout(CALL_TTL_MS);
+          modelActive = AbortSignal.any([ownerActive, operationSignal, modelDeadline]);
+          if (timing) modelActive.addEventListener('abort', observeModelAbort, { once: true });
+          const fetching = Promise.resolve().then(() => {
+            activeCheck(modelActive);
+            if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
+            // This configured invocation is not proof of upstream TCP dispatch.
+            timing?.mark('dispatch');
+            return fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
+              headers: { Authorization: `Bearer ${tokens.get(alias)}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
+                'X-Client-Request-Id': randomUUID(), ...(sessionId === undefined ? {} : { 'session-id': sessionId }), ...quotaHeaders }, body: encodedPayload ?? JSON.stringify(payload), signal: modelActive });
+          });
+          // Late bodies are still discarded; cancelling a race is never an
+          // assertion that an uncooperative fetch or body has really settled.
+          void fetching.then(value => { if (modelActive.aborted) discardResponse(value); }, () => {});
+          response = await whileActive(fetching, modelActive);
+          activeCheck(modelActive);
+          if (!response || types.isProxy(response) || !(response instanceof Response) || response.redirected ||
+              (response.url && response.url !== endpoint)) reject('GATEWAY_RESPONSE_INVALID');
+          timing?.mark('headers');
+          responseBody = response.body;
+          if (!response.ok) {
+            modelFinished = true; operationFinished = true; operationOutcome = httpFailure; return httpFailure;
+          }
+          const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+          if (media !== 'text/event-stream') reject('GATEWAY_RESPONSE_INVALID');
+          let receipt;
+          try { receipt = await whileActive(consumePlanTextStream(responseBody, modelActive, timing ? phase => timing.mark(phase) : undefined), modelActive); }
+          catch (error) { streamConsumptionFailed = true; throw error; }
+          activeCheck(modelActive);
+          if (!providerWorkAttempt) modelFinished = true;
+          const result = snapshotModelResult({ accountAlias: alias, authMode: 'managed_chatgpt', accountVerified: true, model: MODEL,
+            callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
+            status: 'success', completionStatus: 'completed', text: receipt.text,
+            usage: { inputTokens: receipt.usage.inputTokens, outputTokens: receipt.usage.outputTokens,
+              cachedInputTokens: receipt.cachedInputTokens } }, request, alias, 'managed_chatgpt');
+          if (providerWorkAttempt) activeCheck(modelActive);
+          modelFinished = true; operationFinished = true; operationOutcome = result; return result;
+        } finally { providerOperationPending = false; }
+      };
+      let result;
+      if (providerWorkAttempt) {
+        let dispatchStarted = false;
+        const operation = guardSignal => {
+          const pending = (async () => {
+            activeCheck(ownerActive);
+            if (dispatchStarted) { operationInvalid = true; reject('GATEWAY_REPLAY_OR_CAPACITY'); }
+            if (types.isProxy(guardSignal) || !(guardSignal instanceof AbortSignal)) reject('INVALID_REQUEST');
+            guardSignal.throwIfAborted(); dispatchStarted = true; providerDispatchPending = true;
+            try { return await providerWorkAttempt.run(workSignal => {
+              if (types.isProxy(workSignal) || !(workSignal instanceof AbortSignal)) reject('INVALID_REQUEST');
+              const work = modelOperation(AbortSignal.any([guardSignal, workSignal]));
+              void work.then(() => {}, () => {}); return work;
+            }); } finally { providerDispatchPending = false; }
+          })();
+          // A malformed trusted adapter may fail to await its real operation.
+          // Observe late rejection without declaring that operation settled.
+          void pending.then(() => {}, () => {}); return pending;
+        };
+        result = await whileActive(Promise.resolve().then(() => {
+          activeCheck(ownerActive);
+          return config.dispatchProviderOperation(Object.freeze({ accountAlias: alias, request, signal: ownerActive, operation }));
+        }), ownerActive);
+        activeCheck(ownerActive);
+        if (!dispatchStarted || !operationStarted || !operationFinished || operationInvalid || result !== operationOutcome) {
+          if (providerOperationPending || providerDispatchPending) close();
+          reject('GATEWAY_UNAVAILABLE');
+        }
+      } else result = await modelOperation(ownerActive);
+      if (result === httpFailure) {
         timing?.mark('after_start');
         const after = await fresh('after', 'http_failure');
         timing?.mark('after_end');
@@ -520,18 +579,6 @@ export function createCodexLocalGatewayModelTransports(options) {
         // generic 429 never triggers Eason or paid API fallback from this port.
         reject('GATEWAY_HTTP_FAILURE');
       }
-      const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
-      if (media !== 'text/event-stream') reject('GATEWAY_RESPONSE_INVALID');
-      let receipt;
-      try { receipt = await whileActive(consumePlanTextStream(responseBody, modelActive, timing ? phase => timing.mark(phase) : undefined), modelActive); }
-      catch (error) { streamConsumptionFailed = true; throw error; }
-      activeCheck(modelActive);
-      modelFinished = true;
-      const result = snapshotModelResult({ accountAlias: alias, authMode: 'managed_chatgpt', accountVerified: true, model: MODEL,
-        callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
-        status: 'success', completionStatus: 'completed', text: receipt.text,
-        usage: { inputTokens: receipt.usage.inputTokens, outputTokens: receipt.usage.outputTokens,
-          cachedInputTokens: receipt.cachedInputTokens } }, request, alias, 'managed_chatgpt');
       timing?.mark('after_start');
       const after = await fresh('after', 'success');
       timing?.mark('after_end');
@@ -539,6 +586,9 @@ export function createCodexLocalGatewayModelTransports(options) {
       if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
       activeCheck(ownerActive); timingStatus = 'SUCCESS'; return result;
     } catch (error) {
+      // A trusted dispatch wrapper returning/throwing before its real operation
+      // settles cannot lend this owner to another call. No settlement is inferred.
+      if (providerWorkAttempt && (providerOperationPending || providerDispatchPending)) close();
       if (ownerActive.aborted) reject(closed ? 'GATEWAY_CLOSED' : 'GATEWAY_ABORTED');
       if (!modelFinished && modelDeadline?.aborted) reject('GATEWAY_TIMEOUT');
       if (ERRORS.has(error)) throw new CodexLocalGatewayError(ERRORS.get(error));
@@ -584,7 +634,13 @@ export function createCodexLocalGatewayModelTransports(options) {
   };
   const port = alias => Object.freeze({ authMode: 'managed_chatgpt',
     capabilities: Object.freeze({ text: true, structuredJson: true, images: false }),
-    generate: (request, signal) => generate(alias, request, signal) });
+    generate: (request, signal) => generate(alias, request, signal),
+    ...(config.dispatchProviderOperation ? { async generateWithProviderWork(request, signal, attempt) {
+      const fields = ownData(attempt, ['run'], 'INVALID_REQUEST');
+      if (typeof fields.run !== 'function' || types.isProxy(fields.run)) reject('INVALID_REQUEST');
+      // Keep the original opaque capability; validation must not clone it.
+      return generate(alias, request, signal, attempt);
+    } } : {}) });
   const owner = Object.freeze({ ports: Object.freeze({ info: port('info'), eason: port('eason') }), close });
   if (config.diagnostics === true) TIMING_SNAPSHOTS.set(owner, () => Object.freeze({ records: Object.freeze([...timings]), droppedCount: droppedTimings }));
   return owner;

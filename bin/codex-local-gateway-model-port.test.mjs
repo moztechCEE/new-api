@@ -51,6 +51,171 @@ function harness(t, options = {}) {
 }
 const run = (state, input = request(), alias = 'info', signal = new AbortController().signal) => state.instance.ports[alias].generate(input, signal);
 const flush = async () => { for (let index = 0; index < 30; index++) await Promise.resolve(); };
+function providerWorkAttempt(events, signal = new AbortController().signal) {
+  let output, completed = false;
+  const attempt = Object.freeze({ async run(operation) {
+    assert.equal(this, attempt, 'the original opaque attempt is not cloned');
+    events.push('work-start');
+    try { output = await operation(signal); completed = true; return output; }
+    finally { events.push('work-end'); }
+  } });
+  return { attempt, output: () => output, completed: () => completed };
+}
+const runProviderWork = (state, attempt, input = request(), signal = new AbortController().signal) =>
+  state.instance.ports.info.generateWithProviderWork(input, signal, attempt);
+
+test('provider-work method is constructor-capability-only and legacy generate never invokes it', async t => {
+  const legacy = harness(t);
+  assert.equal(Object.hasOwn(legacy.instance.ports.info, 'generateWithProviderWork'), false);
+  for (const value of [true, {}, new Proxy(() => {}, {})]) {
+    assert.throws(() => harness(t, { config: { dispatchProviderOperation: value } }), { code: 'INVALID_CONFIGURATION' });
+  }
+  let dispatches = 0;
+  const configured = harness(t, { config: { dispatchProviderOperation: () => { dispatches++; throw Error('NOT_USED_BY_LEGACY'); } } });
+  const old = await run(configured);
+  assert.equal(dispatches, 0); assert.equal(old.status, 'success');
+  assert.deepEqual(old.usage, { inputTokens: 20, outputTokens: 7, cachedInputTokens: 3 });
+});
+test('provider-work operation includes exact full schema, validated usage and result before after-proof', async t => {
+  const events = [], work = providerWorkAttempt(events), input = request('provider-work-schema', {
+    responseSchema: { type: 'object', additionalProperties: false, required: ['ok'], properties: { ok: { type: 'boolean' } } },
+    reasoningEffort: 'low' });
+  const state = harness(t, { attest: (context, proof) => { events.push(context.phase); return proof; },
+    fetch: (_url, init) => { events.push('fetch'); assert.deepEqual(JSON.parse(init.body), corelyPlanPayload(input, 'info').payload);
+      return sse(completion('{"ok":true}')); }, config: { dispatchProviderOperation: context => {
+      assert.deepEqual(Object.keys(context).sort(), ['accountAlias', 'operation', 'request', 'signal']);
+      assert.equal(Object.isFrozen(context), true); assert.equal(Object.isFrozen(context.request), true);
+      assert.equal(context.accountAlias, 'info'); assert.equal(context.request.inputSha256, input.inputSha256);
+      events.push('source-dispatch-guard'); return context.operation(context.signal);
+    } } });
+  const result = await runProviderWork(state, work.attempt, input);
+  assert.strictEqual(result, work.output()); assert.equal(work.completed(), true);
+  assert.deepEqual(events, ['before', 'source-dispatch-guard', 'work-start', 'fetch', 'work-end', 'after']);
+  assert.deepEqual(result.usage, { inputTokens: 20, outputTokens: 7, cachedInputTokens: 3 });
+  await assert.rejects(run(state, input), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+});
+test('a completed SSE event or headers alone cannot end provider-work before EOF and final validation', async t => {
+  const events = [], work = providerWorkAttempt(events); let stream;
+  const state = harness(t, { fetch: () => new Response(new ReadableStream({ start(value) { stream = value; } }),
+    { headers: { 'content-type': 'text/event-stream' } }),
+    config: { dispatchProviderOperation: context => context.operation(context.signal) } });
+  let settled = false;
+  const pending = runProviderWork(state, work.attempt).finally(() => { settled = true; });
+  await flush(); assert.equal(settled, false); assert.equal(work.completed(), false);
+  stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'response.completed', response: completion() })}\n\n`));
+  await flush(); assert.equal(settled, false); assert.equal(work.completed(), false);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  stream.close(); assert.equal((await pending).status, 'success');
+  assert.equal(work.completed(), true); assert.deepEqual(state.checks.map(value => value.phase), ['before', 'after']);
+});
+test('Native sixty-second clock starts after the source dispatch guard, not while that guard waits', async t => {
+  const deadlines = [];
+  t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); deadlines.push({ ms, controller: c }); return c.signal; });
+  const guard = deferred(), reached = deferred(), events = [], work = providerWorkAttempt(events);
+  const state = harness(t, { config: { dispatchProviderOperation: async context => {
+    reached.resolve(); await guard.promise; return context.operation(context.signal);
+  } } });
+  const pending = runProviderWork(state, work.attempt); await reached.promise;
+  assert.equal(deadlines.filter(value => value.ms === 60_000).length, 0); assert.deepEqual(events, []);
+  state.setTime(70_000); guard.resolve(); assert.equal((await pending).status, 'success');
+  assert.equal(deadlines.filter(value => value.ms === 60_000).length, 1);
+  assert.equal(deadlines.filter(value => value.ms === 5_000).length, 2);
+});
+test('the unchanged absolute owner expiry rejects a late guard without borrowing a provider operation', async t => {
+  const guard = deferred(), reached = deferred(), events = [], work = providerWorkAttempt(events);
+  const state = harness(t, { config: { dispatchProviderOperation: async context => {
+    reached.resolve(); await guard.promise; return context.operation(context.signal);
+  } } });
+  const pending = runProviderWork(state, work.attempt); await reached.promise;
+  state.setTime(121_000); guard.resolve();
+  await assert.rejects(pending, error => ['GATEWAY_EXPIRED', 'GATEWAY_CLOSED'].includes(error.code));
+  assert.deepEqual(events, []); assert.equal(state.calls.length, 0);
+});
+test('provider-work Native timeout covers a hanging full stream and rejects its late completion', async t => {
+  let deadline, stream, cancelled = false;
+  t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); if (ms === 60_000) deadline = c; return c.signal; });
+  const events = [], work = providerWorkAttempt(events), state = harness(t, {
+    fetch: () => new Response(new ReadableStream({ start(value) { stream = value; }, cancel() { cancelled = true; } }),
+      { headers: { 'content-type': 'text/event-stream' } }),
+    config: { dispatchProviderOperation: context => context.operation(context.signal) } });
+  const pending = runProviderWork(state, work.attempt); await flush(); assert.ok(deadline); assert.ok(stream);
+  deadline.abort(); await assert.rejects(pending, { code: 'GATEWAY_TIMEOUT' }); await flush();
+  assert.equal(work.completed(), false);
+  // A public timeout is not proof an uncooperative body has settled. Release
+  // its pending read, then observe the real iterator cleanup separately.
+  stream.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"late"}}\n\n'));
+  await flush(); assert.equal(cancelled, true);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+});
+test('completed provider-work does not lend its model deadline to the bounded after-proof', async t => {
+  let deadline; const after = deferred(), reached = deferred(), events = [], work = providerWorkAttempt(events);
+  t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); if (ms === 60_000) deadline = c; return c.signal; });
+  const state = harness(t, { attest: async (context, proof) => {
+    if (context.phase === 'after') { reached.resolve(); await after.promise; } return proof;
+  }, config: { dispatchProviderOperation: context => context.operation(context.signal) } });
+  const pending = runProviderWork(state, work.attempt); await reached.promise;
+  assert.equal(work.completed(), true); deadline.abort(); after.resolve();
+  assert.equal((await pending).status, 'success');
+});
+test('provider-work keeps schema and usage validation inside the operation without changing quantities', async t => {
+  for (const mode of ['schema', 'usage']) await t.test(mode, async child => {
+    const events = [], work = providerWorkAttempt(events), input = request('provider-validation-'+mode, mode === 'schema' ? {
+      responseSchema: { type: 'object', additionalProperties: false, required: ['ok'], properties: { ok: { type: 'boolean' } } },
+    } : {});
+    const state = harness(child, { fetch: () => sse(mode === 'schema' ? completion('{"ok":"wrong"}') : completion('text', {
+      usage: { input_tokens: 20, output_tokens: -1, total_tokens: 19 },
+    })), config: { dispatchProviderOperation: context => context.operation(context.signal) } });
+    await assert.rejects(runProviderWork(state, work.attempt, input), { code: mode === 'schema' ? 'INVALID_STRUCTURED_OUTPUT' : 'GATEWAY_RESPONSE_INVALID' });
+    assert.equal(work.completed(), false); assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  });
+});
+test('a wrapper cannot omit, clone or run the provider operation twice and adopt a fabricated result', async t => {
+  for (const mode of ['omit', 'clone', 'twice', 'fake-attempt']) await t.test(mode, async child => {
+    const events = [], work = providerWorkAttempt(events);
+    const state = harness(child, { config: { dispatchProviderOperation: async context => {
+      if (mode === 'omit') return {};
+      const value = await context.operation(context.signal);
+      if (mode === 'clone') return { ...value };
+      if (mode === 'twice') try { await context.operation(context.signal); } catch { /* swallowed by hostile fixture */ }
+      return value;
+    } } });
+    const attempt = mode === 'fake-attempt' ? Object.freeze({ run: async () => ({}) }) : work.attempt;
+    await assert.rejects(runProviderWork(state, attempt), { code: 'GATEWAY_UNAVAILABLE' });
+    assert.equal(state.calls.length, ['omit', 'fake-attempt'].includes(mode) ? 0 : 1);
+    assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  });
+});
+test('provider-work validates an opaque attempt without invoking getters or copying its authority', async t => {
+  let reads = 0; const state = harness(t, { config: { dispatchProviderOperation: context => context.operation(context.signal) } });
+  const getter = Object.defineProperty({}, 'run', { enumerable: true, get() { reads++; return () => {}; } });
+  for (const attempt of [null, {}, getter, Object.create({ run() {} }), new Proxy({ run() {} }, {}), { run: new Proxy(() => {}, {}) }]) {
+    await assert.rejects(runProviderWork(state, attempt), { code: 'INVALID_REQUEST' });
+  }
+  assert.equal(reads, 0); assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
+});
+test('caller cancellation during a source guard stops before either provider clock or physical request', async t => {
+  const reached = deferred(), guard = deferred(), caller = new AbortController(), events = [], work = providerWorkAttempt(events);
+  const state = harness(t, { config: { dispatchProviderOperation: async context => { reached.resolve(); await guard.promise; return context.operation(context.signal); } } });
+  const pending = runProviderWork(state, work.attempt, request(), caller.signal); await reached.promise;
+  caller.abort(false); await assert.rejects(pending, { code: 'GATEWAY_ABORTED' }); guard.resolve(); await flush();
+  assert.deepEqual(events, []); assert.equal(state.calls.length, 0);
+});
+test('a wrapper returning before its model operation settles closes the owner and cannot publish late output', async t => {
+  for (const mode of ['return', 'throw']) await t.test(mode, async child => {
+    const fetched = deferred(), release = deferred(), events = [], work = providerWorkAttempt(events);
+    const state = harness(child, { fetch: () => { fetched.resolve(); return release.promise; },
+      config: { dispatchProviderOperation: async context => {
+        void context.operation(context.signal); await fetched.promise;
+        if (mode === 'throw') throw new Error('PRIVATE_WRAPPER_FAILURE');
+        return {};
+      } } });
+    await assert.rejects(runProviderWork(state, work.attempt), { code: 'GATEWAY_CLOSED' });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt, request('second')), { code: 'GATEWAY_CLOSED' });
+    release.resolve(sse()); await flush();
+    assert.equal(work.completed(), false); assert.equal(state.calls.length, 1);
+    assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  });
+});
 
 test('native local ports preserve full schema, prompt, hashes, usage, and per-account tokens without SIWC relabeling', async t => {
   const schema = { type: 'object', properties: { reply: { type: 'string', minLength: 2 } }, required: ['reply'], additionalProperties: false };
@@ -942,6 +1107,59 @@ test('native quota results require both source phases and a valid actual-route r
       headers: receipt === undefined ? {} : { [QUOTA_RECEIPT_HEADER]: receipt } }) });
     await assert.rejects(run(state), error => ['GATEWAY_HTTP_FAILURE', 'ATTESTATION_FAILED'].includes(error.code));
     assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
+  }
+});
+
+test('provider-work keeps HTTP quota opaque until the unchanged after-proof and actual-route HMAC verification', async t => {
+  for (const alias of ['info', 'eason']) {
+    const events = [], work = providerWorkAttempt(events), source = sourceHarness(t, { respond: (context, proof) => {
+      events.push('source-'+context.payload.phase); return proof;
+    } });
+    const state = harness(t, { config: { attest: source.instance.attest, quotaRequest: source.instance.quotaRequest,
+      quotaVerify: context => { events.push('quota-verify'); return source.instance.quotaVerify(context); },
+      dispatchProviderOperation: context => context.operation(context.signal) },
+      fetch: (_url, init) => new Response('PRIVATE_HTTP_BODY', { status: 429,
+        headers: { [QUOTA_RECEIPT_HEADER]: quotaReceipt(init.headers, alias) } }) });
+    const result = await state.instance.ports[alias].generateWithProviderWork(request('provider-quota-'+alias),
+      new AbortController().signal, work.attempt);
+    assert.equal(work.completed(), true); assert.deepEqual(work.output(), {});
+    assert.notStrictEqual(result, work.output()); assert.equal(result.status, 'quota_exhausted');
+    assert.equal(result.authenticated, true); assert.equal(result.accountAlias, alias);
+    assert.deepEqual(events, ['source-before', 'work-start', 'work-end', 'source-after', 'quota-verify']);
+    assert.equal(state.calls.length, 1); assert.doesNotMatch(JSON.stringify(result), /PRIVATE_HTTP_BODY|receipt|nonce/);
+  }
+  for (const mode of ['bare', 'forged', 'changed-source']) {
+    let verifications = 0; const work = providerWorkAttempt([]), source = sourceHarness(t, { respond: (context, proof) =>
+      mode === 'changed-source' && context.payload.phase === 'after' ? signSourceProof({ ...proof, route_revision: 'e'.repeat(64) }) : proof });
+    const state = harness(t, { config: { attest: source.instance.attest, quotaRequest: source.instance.quotaRequest,
+      quotaVerify: context => { verifications++; return source.instance.quotaVerify(context); },
+      dispatchProviderOperation: context => context.operation(context.signal) },
+      fetch: (_url, init) => new Response('', { status: 429, headers: mode === 'bare' ? {} : {
+        [QUOTA_RECEIPT_HEADER]: mode === 'forged' ? 'v1.10000.130000.'+'0'.repeat(64) : quotaReceipt(init.headers),
+      } }) });
+    await assert.rejects(runProviderWork(state, work.attempt), { code: mode === 'bare' ? 'GATEWAY_HTTP_FAILURE' : 'ATTESTATION_FAILED' });
+    assert.equal(state.calls.length, 1); assert.equal(source.calls.length, 2);
+    assert.equal(verifications, mode === 'forged' ? 1 : 0);
+  }
+});
+
+test('provider-work still requires its bounded after-proof and source revision after complete validated work', async t => {
+  for (const mode of ['after-timeout', 'changed', 'revoked']) {
+    const reached = deferred(), release = deferred(), work = providerWorkAttempt([]); let sourceDeadline;
+    const timeout = t.mock.method(AbortSignal, 'timeout', ms => {
+      const c = new AbortController(); if (ms === 5000) sourceDeadline = c; return c.signal;
+    });
+    const state = harness(t, { attest: async (context, proof) => {
+      if (context.phase !== 'after') return proof;
+      if (mode === 'after-timeout') { reached.resolve(); await release.promise; }
+      return mode === 'changed' ? { ...proof, configurationRevision: 'b'.repeat(64) } :
+        mode === 'revoked' ? { ...proof, freshLoginVerified: false } : proof;
+    }, config: { dispatchProviderOperation: context => context.operation(context.signal) } });
+    const pending = runProviderWork(state, work.attempt);
+    if (mode === 'after-timeout') { await reached.promise; sourceDeadline.abort(); }
+    await assert.rejects(pending, { code: mode === 'changed' ? 'ATTESTATION_CHANGED' : 'ATTESTATION_FAILED' });
+    assert.equal(work.completed(), true); assert.equal(state.calls.length, 1);
+    release.resolve(); await flush(); timeout.mock.restore();
   }
 });
 
