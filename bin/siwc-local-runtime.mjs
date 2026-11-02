@@ -270,7 +270,7 @@ const SETTLED_PLAN_OUTPUT_FAILURES = new WeakSet();
 /** A parser-local failure observation, never model/authentication authority. */
 export const isSettledPlanOutputFailure = error => SETTLED_PLAN_OUTPUT_FAILURES.has(error);
 
-async function consumeTextStream(body, expectedText, signal, onPhase, classifySettledOutputFailure = false) {
+async function consumeTextStream(body, expectedText, signal, onPhase, classifySettledOutputFailure = false, awaitCleanup = false) {
   if (!body) fail('MISSING_COMPLETED_EVENT');
   const decoder = new TextDecoder('utf8', { fatal: true });
   let buffer = '', total = 0, text = '', completed, responseId;
@@ -389,7 +389,11 @@ async function consumeTextStream(body, expectedText, signal, onPhase, classifySe
     fail('STREAM_INTERRUPTED');
   } finally {
     signal?.removeEventListener('abort', interrupted);
-    if (!finished && iterator?.return) void Promise.resolve(iterator.return()).catch(() => {});
+    if (!finished && iterator?.return) {
+      if (awaitCleanup) {
+        try { await iterator.return(); } catch { fail('STREAM_CLEANUP_FAILED'); }
+      } else void Promise.resolve(iterator.return()).catch(() => {});
+    }
   }
   if (!completed) fail('MISSING_COMPLETED_EVENT');
   if (!Array.isArray(completed.output)) fail('INVALID_COMPLETION');
@@ -448,16 +452,22 @@ export async function consumeProbeStream(body) {
 /** Internal text result for the bounded Corely adapter, never a public proxy.
  * Usage and terminal completion must both be attested by the provider. */
 export async function consumePlanTextStream(body, signal, onPhase, options) {
-  let classifySettledOutputFailure = false;
+  let classifySettledOutputFailure = false, awaitCleanup = false;
   if (options !== undefined) {
     if (!options || typeof options !== 'object' || types.isProxy(options) ||
         ![Object.prototype, null].includes(Object.getPrototypeOf(options))) fail('INVALID_STREAM_OPTIONS');
     const fields = Object.getOwnPropertyDescriptors(options), option = fields.classifySettledOutputFailure;
-    if (Reflect.ownKeys(fields).length !== 1 || !option?.enumerable || !Object.hasOwn(option, 'value') ||
+    if (Reflect.ownKeys(fields).some(key => !['classifySettledOutputFailure', 'awaitCleanup'].includes(key)) ||
+        !option?.enumerable || !Object.hasOwn(option, 'value') ||
         typeof option.value !== 'boolean') fail('INVALID_STREAM_OPTIONS');
     classifySettledOutputFailure = option.value;
+    if (Object.hasOwn(fields, 'awaitCleanup')) {
+      const cleanup = fields.awaitCleanup;
+      if (!cleanup.enumerable || !Object.hasOwn(cleanup, 'value') || typeof cleanup.value !== 'boolean') fail('INVALID_STREAM_OPTIONS');
+      awaitCleanup = cleanup.value;
+    }
   }
-  const receipt = await consumeTextStream(body, undefined, signal, onPhase, classifySettledOutputFailure);
+  const receipt = await consumeTextStream(body, undefined, signal, onPhase, classifySettledOutputFailure, awaitCleanup);
   if (!receipt.usage) fail('INVALID_USAGE_RECEIPT');
   return receipt;
 }

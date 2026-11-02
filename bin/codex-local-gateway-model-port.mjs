@@ -14,6 +14,8 @@ const ERROR_CODES = new Set(['INVALID_CONFIGURATION', 'INVALID_REQUEST', 'ATTEST
 const ERRORS = new WeakMap();
 const RESPONSE_DIAGNOSTICS = new WeakMap();
 const TIMING_SNAPSHOTS = new WeakMap();
+const SETTLEMENT_SNAPSHOTS = new WeakMap();
+const cancelBody = ReadableStream.prototype.cancel;
 const PROVIDER_NETWORK_FAILURES = new WeakSet();
 const MAX_TIMING_RECORDS = 32;
 const EMPTY_TIMING_SNAPSHOT = Object.freeze({ records: Object.freeze([]), droppedCount: 0 });
@@ -44,6 +46,9 @@ export const codexLocalGatewayResponseDiagnostic = error => RESPONSE_DIAGNOSTICS
 /** Owner-local observation only. No request/result fields, text, identifiers,
  * credentials or authority are added; unknown/disabled owners expose nothing. */
 export const codexLocalGatewayTimingSnapshot = owner => TIMING_SNAPSHOTS.get(owner)?.() ?? EMPTY_TIMING_SNAPSHOT;
+/** Actual local promise observations only; never an upstream cancellation ACK.
+ * Unknown, disabled and legacy-used owners cannot attest local quiescence. */
+export const codexLocalGatewaySettlementSnapshot = owner => SETTLEMENT_SNAPSHOTS.get(owner)?.() ?? null;
 const reject = code => { throw new CodexLocalGatewayError(code); };
 
 function beginLocalModelTiming(attempt, account, purpose) {
@@ -386,6 +391,19 @@ export function createCodexLocalGatewayModelTransports(options) {
     tokens.set(alias, account.gatewayToken);
   }
   if (tokens.get('info') === tokens.get('eason')) reject('INVALID_CONFIGURATION');
+  const settlement = config.diagnostics === true && config.allowProviderFailureFallback === true ? {
+    fetch: { started: 0, settled: 0 }, consumer: { started: 0, settled: 0 }, cleanup: { started: 0, settled: 0 },
+  } : undefined;
+  let legacyUsed = false;
+  const observeLocalWork = (kind, operation) => {
+    if (!settlement) return operation();
+    const row = settlement[kind]; row.started++;
+    let work;
+    try { work = operation(); } catch (error) { row.settled++; throw error; }
+    const pending = Promise.resolve(work);
+    void pending.then(() => { row.settled++; }, () => { row.settled++; });
+    return pending;
+  };
   let lastClock;
   const clock = () => {
     let value;
@@ -440,6 +458,20 @@ export function createCodexLocalGatewayModelTransports(options) {
       return attestationSnapshot(value, binding, clock());
     };
     let response, responseBody, modelDeadline, modelActive, modelFinished = false, streamConsumptionFailed = false;
+    let cancelledResponse, responseCancellation;
+    const cancelOwnedResponse = value => {
+      if (value === cancelledResponse && responseCancellation) return responseCancellation;
+      try {
+        if (types.isProxy(value) || !(value instanceof Response)) return Promise.resolve();
+        const body = value.body;
+        // An active parser owns its iterator cleanup and remains observed by
+        // the consumer promise; attempting cancel on its locked body is invalid.
+        if (!body || body.locked) return Promise.resolve();
+        cancelledResponse = value;
+        responseCancellation = Promise.resolve(observeLocalWork('cleanup', () => cancelBody.call(body)));
+      } catch { responseCancellation = Promise.reject(new CodexLocalGatewayError('GATEWAY_RESPONSE_INVALID')); }
+      return responseCancellation;
+    };
     let providerOperationPending = false, providerDispatchPending = false;
     let timingStatus = 'FAILED';
     const observeOwnerAbort = () => timing?.mark('abort');
@@ -515,13 +547,17 @@ export function createCodexLocalGatewayModelTransports(options) {
             if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
             // This configured invocation is not proof of upstream TCP dispatch.
             timing?.mark('dispatch');
-            return fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
+            return observeLocalWork('fetch', () => fetchImpl(endpoint, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
               headers: { Authorization: `Bearer ${tokens.get(alias)}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
-                'X-Client-Request-Id': randomUUID(), ...(sessionId === undefined ? {} : { 'session-id': sessionId }), ...quotaHeaders }, body: encodedPayload ?? JSON.stringify(payload), signal: modelActive });
+                'X-Client-Request-Id': randomUUID(), ...(sessionId === undefined ? {} : { 'session-id': sessionId }), ...quotaHeaders }, body: encodedPayload ?? JSON.stringify(payload), signal: modelActive }));
           });
           // Late bodies are still discarded; cancelling a race is never an
           // assertion that an uncooperative fetch or body has really settled.
-          void fetching.then(value => { fetchSettled = true; if (modelActive.aborted) discardResponse(value); }, () => { fetchSettled = true; });
+          void fetching.then(value => { fetchSettled = true;
+            if (modelActive.aborted) {
+              if (allowFailure) void cancelOwnedResponse(value).catch(() => {}); else discardResponse(value);
+            }
+          }, () => { fetchSettled = true; });
           try { response = await whileActive(fetching, modelActive); }
           catch (error) {
             if (allowFailure) {
@@ -536,14 +572,18 @@ export function createCodexLocalGatewayModelTransports(options) {
           timing?.mark('headers');
           responseBody = response.body;
           if (!response.ok) {
+            if (allowFailure) {
+              if (responseBody?.locked) reject('GATEWAY_RESPONSE_INVALID');
+              await whileActive(cancelOwnedResponse(response), modelActive); activeCheck(modelActive);
+            }
             modelFinished = true; operationFinished = true; operationOutcome = httpFailure; return httpFailure;
           }
           const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
           if (media !== 'text/event-stream') reject('GATEWAY_RESPONSE_INVALID');
           let receipt;
-          try { receipt = await whileActive(consumePlanTextStream(responseBody, modelActive,
+          try { receipt = await whileActive(observeLocalWork('consumer', () => consumePlanTextStream(responseBody, modelActive,
             timing ? phase => timing.mark(phase) : undefined,
-            allowFailure ? { classifySettledOutputFailure: true } : undefined), modelActive); }
+            allowFailure ? { classifySettledOutputFailure: true, awaitCleanup: true } : undefined)), modelActive); }
           catch (error) {
             streamConsumptionFailed = true;
             if (allowFailure) {
@@ -683,12 +723,13 @@ export function createCodexLocalGatewayModelTransports(options) {
         else droppedTimings++;
       }
       busy.delete(alias);
-      discardResponse(response);
+      if (providerWorkAttempt && config.allowProviderFailureFallback === true) void cancelOwnedResponse(response).catch(() => {});
+      else discardResponse(response);
     }
   };
   const port = alias => Object.freeze({ authMode: 'managed_chatgpt',
     capabilities: Object.freeze({ text: true, structuredJson: true, images: false }),
-    generate: (request, signal) => generate(alias, request, signal),
+    generate: (request, signal) => { legacyUsed = true; return generate(alias, request, signal); },
     ...(config.dispatchProviderOperation ? { async generateWithProviderWork(request, signal, attempt) {
       const fields = ownData(attempt, ['run'], 'INVALID_REQUEST');
       if (typeof fields.run !== 'function' || types.isProxy(fields.run)) reject('INVALID_REQUEST');
@@ -697,5 +738,13 @@ export function createCodexLocalGatewayModelTransports(options) {
     } } : {}) });
   const owner = Object.freeze({ ports: Object.freeze({ info: port('info'), eason: port('eason') }), close });
   if (config.diagnostics === true) TIMING_SNAPSHOTS.set(owner, () => Object.freeze({ records: Object.freeze([...timings]), droppedCount: droppedTimings }));
+  if (settlement) SETTLEMENT_SNAPSHOTS.set(owner, () => legacyUsed ? null : Object.freeze({
+    fetchStarted: settlement.fetch.started, fetchSettled: settlement.fetch.settled,
+    pendingFetch: settlement.fetch.started - settlement.fetch.settled,
+    consumerStarted: settlement.consumer.started, consumerSettled: settlement.consumer.settled,
+    pendingConsumers: settlement.consumer.started - settlement.consumer.settled,
+    cleanupStarted: settlement.cleanup.started, cleanupSettled: settlement.cleanup.settled,
+    pendingCleanup: settlement.cleanup.started - settlement.cleanup.settled, legacyUsed: false,
+  }));
   return owner;
 }

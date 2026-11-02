@@ -68,6 +68,114 @@ function providerFailureHarness(t, options = {}) {
     allowProviderFailureFallback: true, ...options.config } });
 }
 
+test('local settlement observations are owner-only opt-in and become unavailable after legacy work', async t => {
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot({}), null);
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(harness(t).instance), null);
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(providerFailureHarness(t).instance), null);
+  const state = providerFailureHarness(t, { config: { diagnostics: true } });
+  const initial = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.deepEqual(initial, { fetchStarted: 0, fetchSettled: 0, pendingFetch: 0,
+    consumerStarted: 0, consumerSettled: 0, pendingConsumers: 0,
+    cleanupStarted: 0, cleanupSettled: 0, pendingCleanup: 0, legacyUsed: false });
+  assert.equal(Object.isFrozen(initial), true);
+  await runProviderWork(state, providerWorkAttempt([]).attempt); await flush();
+  const completed = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(completed.fetchStarted, 1); assert.equal(completed.fetchSettled, 1);
+  assert.equal(completed.consumerStarted, 1); assert.equal(completed.consumerSettled, 1);
+  assert.equal(completed.pendingFetch + completed.pendingConsumers + completed.pendingCleanup, 0);
+  assert.equal(initial.fetchStarted, 0, 'the earlier snapshot is not a live mutable object');
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot({ ...state.instance }), null);
+  await run(state, request('legacy-settlement-unavailable'));
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance), null);
+});
+test('HTTP failure waits for its owned body cancellation inside the original provider budget before proof or receipt', async t => {
+  const entered = deferred(), release = deferred(), work = providerWorkAttempt([]), deadlines = []; let foreignCalls = 0;
+  t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); deadlines.push(ms); return c.signal; });
+  const body = new ReadableStream({
+    cancel() { entered.resolve(); return release.promise; },
+  });
+  body.cancel = () => { foreignCalls++; return Promise.resolve(); };
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(body, { status: 401 }) });
+  let published = false; const pending = runProviderWork(state, work.attempt).then(result => { published = true; return result; });
+  await entered.promise; await flush();
+  assert.equal(published, false); assert.equal(work.completed(), false);
+  assert.equal(foreignCalls, 0, 'a shadow method cannot replace the real owned cancellation promise');
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  assert.deepEqual(gateway.codexLocalGatewaySettlementSnapshot(state.instance), {
+    fetchStarted: 1, fetchSettled: 1, pendingFetch: 0, consumerStarted: 0, consumerSettled: 0, pendingConsumers: 0,
+    cleanupStarted: 1, cleanupSettled: 0, pendingCleanup: 1, legacyUsed: false,
+  });
+  assert.deepEqual(deadlines, [5000, 60000]);
+  release.resolve(); const result = await pending; await flush();
+  assert.equal(result.status, 'provider_failure'); assert.equal(result.operationSettled, true);
+  assert.equal(result.reason, 'AUTHENTICATION'); assert.deepEqual(deadlines, [5000, 60000, 5000]);
+  const final = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(final.cleanupStarted, 1); assert.equal(final.cleanupSettled, 1); assert.equal(final.pendingCleanup, 0);
+});
+test('hanging HTTP cleanup cannot become a provider receipt and remains observed after timeout and owner close', async t => {
+  let deadline; const entered = deferred(), release = deferred(), work = providerWorkAttempt([]);
+  t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); if (ms === 60000) deadline = c; return c.signal; });
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+    cancel() { entered.resolve(); return release.promise; },
+  }), { status: 503 }) });
+  const pending = runProviderWork(state, work.attempt); await entered.promise; deadline.abort();
+  await assert.rejects(pending, { code: 'GATEWAY_TIMEOUT' }); state.instance.close();
+  assert.equal(work.completed(), false); assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingCleanup, 1);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  release.resolve(); await flush();
+  const after = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(after.pendingCleanup, 0); assert.equal(after.cleanupSettled, 1);
+});
+test('original fetch and late-response cleanup stay pending independently after public cancellation', async t => {
+  const entered = deferred(), fetched = deferred(), cancelEntered = deferred(), cancelled = deferred(), caller = new AbortController();
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => { entered.resolve(); return fetched.promise; } });
+  const pending = runProviderWork(state, providerWorkAttempt([]).attempt, request('late-fetch-settlement'), caller.signal);
+  await entered.promise; caller.abort(false);
+  await assert.rejects(pending, error => ['GATEWAY_ABORTED', 'GATEWAY_CLOSED'].includes(error.code)); state.instance.close();
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingFetch, 1);
+  fetched.resolve(new Response(new ReadableStream({ cancel() { cancelEntered.resolve(); return cancelled.promise; } })));
+  await cancelEntered.promise; await flush();
+  let snapshot = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(snapshot.pendingFetch, 0); assert.equal(snapshot.fetchSettled, 1); assert.equal(snapshot.pendingCleanup, 1);
+  cancelled.resolve(); await flush(); snapshot = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(snapshot.pendingFetch + snapshot.pendingConsumers + snapshot.pendingCleanup, 0);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+});
+test('consumer observations include real iterator cleanup, not only the cancellation race', async t => {
+  let stream; const cancelEntered = deferred(), release = deferred(), caller = new AbortController();
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+    start(controller) { stream = controller; }, cancel() { cancelEntered.resolve(); return release.promise; },
+  }), { headers: { 'content-type': 'text/event-stream' } }) });
+  const pending = runProviderWork(state, providerWorkAttempt([]).attempt, request('consumer-cleanup'), caller.signal);
+  await flush(); assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingConsumers, 1);
+  caller.abort(0); await assert.rejects(pending, error => ['GATEWAY_ABORTED', 'GATEWAY_CLOSED'].includes(error.code));
+  state.instance.close(); assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingConsumers, 1);
+  stream.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"late"}}\n\n'));
+  await cancelEntered.promise;
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingConsumers, 1);
+  release.resolve(); await flush();
+  const final = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(final.pendingConsumers, 0); assert.equal(final.consumerSettled, 1);
+  assert.equal(final.pendingFetch + final.pendingCleanup, 0);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+});
+test('rejected HTTP cleanup stays fatal while its actual promise is recorded settled without raw diagnostics', async t => {
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+    cancel() { return Promise.reject(Error('PRIVATE_CLEANUP_FAILURE')); },
+  }), { status: 401 }) });
+  await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt), error =>
+    error.code === 'GATEWAY_UNAVAILABLE' && !JSON.stringify(error).includes('PRIVATE_CLEANUP_FAILURE'));
+  await flush(); const snapshot = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(snapshot.cleanupStarted, 1); assert.equal(snapshot.cleanupSettled, 1); assert.equal(snapshot.pendingCleanup, 0);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  let reads = 0;
+  const invalid = Object.defineProperty({ classifySettledOutputFailure: true }, 'awaitCleanup', {
+    enumerable: true, get() { reads++; throw Error('PRIVATE_GETTER'); },
+  });
+  await assert.rejects(consumePlanTextStream(sse().body, new AbortController().signal, undefined, invalid), { code: 'INVALID_STREAM_OPTIONS' });
+  assert.equal(reads, 0);
+});
+
 test('provider failures require a trusted own opt-in, preserve legacy errors and never accept request admission flags', async t => {
   for (const config of [{ allowProviderFailureFallback: true }, { allowProviderFailureFallback: 'true' }]) {
     assert.throws(() => harness(t, { config }), { code: 'INVALID_CONFIGURATION' });
