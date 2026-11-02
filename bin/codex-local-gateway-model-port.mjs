@@ -106,6 +106,16 @@ function ownData(input, allowed, code) {
   } catch { reject(code); }
 }
 
+function localAccountsSnapshot(config) {
+  // Constructor-only enrollment, never a request flag or an unavailable port.
+  // The default still requires both independent fresh account configurations.
+  const aliases = config.localAccountAlias === undefined ? ['info', 'eason'] : [config.localAccountAlias];
+  if (aliases.some(alias => !['info', 'eason'].includes(alias))) reject('INVALID_CONFIGURATION');
+  const accounts = ownData(config.accounts, aliases, 'INVALID_CONFIGURATION');
+  if (Object.keys(accounts).length !== aliases.length) reject('INVALID_CONFIGURATION');
+  return { accounts, aliases };
+}
+
 function localEndpoint(value) {
   try {
     if (typeof value !== 'string' || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{3,4}\/v1\/responses$/.test(value)) reject('INVALID_CONFIGURATION');
@@ -205,20 +215,20 @@ function sourceBinding(input) {
  * here. The existing raw-key endpoint retains its normal MFA protection.
  */
 export function createCodexLocalSourceAttestor(options) {
-  const config = ownData(options, ['accounts', 'requestAttestation', 'signal', 'now'], 'INVALID_CONFIGURATION');
+  const config = ownData(options, ['accounts', 'localAccountAlias', 'requestAttestation', 'signal', 'now'], 'INVALID_CONFIGURATION');
   const requestAttestation = config.requestAttestation, now = config.now ?? Date.now, parentSignal = config.signal;
   if (typeof requestAttestation !== 'function' || types.isProxy(requestAttestation) || typeof now !== 'function' || types.isProxy(now) ||
       types.isProxy(parentSignal) || !(parentSignal instanceof AbortSignal)) reject('INVALID_CONFIGURATION');
-  const accounts = ownData(config.accounts, ['info', 'eason'], 'INVALID_CONFIGURATION'), credentials = new Map();
-  for (const alias of ['info', 'eason']) {
+  const { accounts, aliases } = localAccountsSnapshot(config), credentials = new Map();
+  for (const alias of aliases) {
     const account = ownData(accounts[alias], ['channelId', 'group', 'credentialProofKey64hex', 'freshLoginVerified'], 'INVALID_CONFIGURATION');
     if (!Number.isSafeInteger(account.channelId) || account.channelId <= 0 || typeof account.group !== 'string' || account.group === '' ||
         /[\u0000-\u001f\u007f,]/u.test(account.group) || account.group.trim() !== account.group || Buffer.byteLength(account.group, 'utf8') > 64 ||
         account.freshLoginVerified !== true || typeof account.credentialProofKey64hex !== 'string' || !HEX64.test(account.credentialProofKey64hex)) reject('INVALID_CONFIGURATION');
     credentials.set(alias, { channelId: account.channelId, group: account.group, key: Buffer.from(account.credentialProofKey64hex, 'hex') });
   }
-  if (credentials.get('info').channelId === credentials.get('eason').channelId ||
-      timingSafeEqual(credentials.get('info').key, credentials.get('eason').key)) reject('INVALID_CONFIGURATION');
+  if (aliases.length === 2 && (credentials.get('info').channelId === credentials.get('eason').channelId ||
+      timingSafeEqual(credentials.get('info').key, credentials.get('eason').key))) reject('INVALID_CONFIGURATION');
   let lastClock;
   const clock = () => {
     let value;
@@ -251,7 +261,7 @@ export function createCodexLocalSourceAttestor(options) {
       if (Object.keys(ownData(context.handle, [], 'ATTESTATION_FAILED')).length !== 0) reject('ATTESTATION_FAILED');
       state = handles.get(context.handle);
       const binding = sourceBinding(context.binding);
-      if (Object.keys(context).length !== 5 || types.isProxy(context.signal) || !(context.signal instanceof AbortSignal) ||
+      if (!credentials.has(binding.accountAlias) || Object.keys(context).length !== 5 || types.isProxy(context.signal) || !(context.signal instanceof AbortSignal) ||
           !['before', 'after'].includes(context.phase) || (context.phase === 'before' ? context.outcome !== 'pending' :
             !['success', 'http_failure'].includes(context.outcome))) reject('ATTESTATION_FAILED');
       deadline = AbortSignal.timeout(SOURCE_RPC_TTL_MS);
@@ -317,7 +327,7 @@ export function createCodexLocalSourceAttestor(options) {
     const state = handles.get(context.handle), binding = sourceBinding(context.binding);
     if (types.isProxy(context.signal) || !(context.signal instanceof AbortSignal)) reject('ATTESTATION_FAILED');
     checkActive(AbortSignal.any([context.signal, lifetime.signal]));
-    if (!state || state.phase !== phase || state.signal !== context.signal || state.expiresAt <= clock() ||
+    if (!credentials.has(binding.accountAlias) || !state || state.phase !== phase || state.signal !== context.signal || state.expiresAt <= clock() ||
         Object.keys(binding).some(key => binding[key] !== state.binding[key])) reject('ATTESTATION_FAILED');
     return { context, state, binding, account: credentials.get(binding.accountAlias) };
   };
@@ -361,7 +371,7 @@ export function createCodexLocalSourceAttestor(options) {
  * There is deliberately no HTTP listener, account switching, or API fallback.
  */
 export function createCodexLocalGatewayModelTransports(options) {
-  const config = ownData(options, ['gatewayUrl', 'accounts', 'attest', 'signal', 'fetchImpl', 'now',
+  const config = ownData(options, ['gatewayUrl', 'accounts', 'localAccountAlias', 'attest', 'signal', 'fetchImpl', 'now',
     'quotaRequest', 'quotaVerify', 'allowHistoricalRegression', 'allowJointUnderstanding', 'nativeExplicitPrefixCache', 'nativeMessagePrefixCache', 'nativeSessionAffinity', 'diagnostics', 'dispatchProviderOperation', 'allowProviderFailureFallback'], 'INVALID_CONFIGURATION');
   const endpoint = localEndpoint(config.gatewayUrl), attest = config.attest;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch, now = config.now ?? Date.now;
@@ -384,13 +394,13 @@ export function createCodexLocalGatewayModelTransports(options) {
     ...(config.allowHistoricalRegression === true ? { allowHistoricalRegression: true } : {}),
     ...(config.allowJointUnderstanding === true ? { allowJointUnderstanding: true } : {}),
   }) : undefined;
-  const accounts = ownData(config.accounts, ['info', 'eason'], 'INVALID_CONFIGURATION'), tokens = new Map();
-  for (const alias of ['info', 'eason']) {
+  const { accounts, aliases } = localAccountsSnapshot(config), tokens = new Map();
+  for (const alias of aliases) {
     const account = ownData(accounts[alias], ['gatewayToken'], 'INVALID_CONFIGURATION');
     if (typeof account.gatewayToken !== 'string' || !/^[A-Za-z0-9._~-]{32,512}$/.test(account.gatewayToken)) reject('INVALID_CONFIGURATION');
     tokens.set(alias, account.gatewayToken);
   }
-  if (tokens.get('info') === tokens.get('eason')) reject('INVALID_CONFIGURATION');
+  if (aliases.length === 2 && tokens.get('info') === tokens.get('eason')) reject('INVALID_CONFIGURATION');
   const settlement = config.diagnostics === true && config.allowProviderFailureFallback === true ? {
     fetch: { started: 0, settled: 0 }, consumer: { started: 0, settled: 0 }, cleanup: { started: 0, settled: 0 },
   } : undefined;
@@ -436,6 +446,7 @@ export function createCodexLocalGatewayModelTransports(options) {
     if (types.isProxy(signal) || !(signal instanceof AbortSignal)) reject('INVALID_REQUEST');
     const ownerActive = AbortSignal.any([signal, lifetime.signal]);
     activeCheck(ownerActive);
+    if (!tokens.has(alias)) reject('INVALID_REQUEST');
     const key = `${alias}:${request.callId}`;
     if (seen.has(key) || seen.size >= MAX_CALLS || busy.has(alias)) reject('GATEWAY_REPLAY_OR_CAPACITY');
     seen.add(key); busy.add(alias);
@@ -736,7 +747,7 @@ export function createCodexLocalGatewayModelTransports(options) {
       // Keep the original opaque capability; validation must not clone it.
       return generate(alias, request, signal, attempt);
     } } : {}) });
-  const owner = Object.freeze({ ports: Object.freeze({ info: port('info'), eason: port('eason') }), close });
+  const owner = Object.freeze({ ports: Object.freeze(Object.fromEntries(aliases.map(alias => [alias, port(alias)]))), close });
   if (config.diagnostics === true) TIMING_SNAPSHOTS.set(owner, () => Object.freeze({ records: Object.freeze([...timings]), droppedCount: droppedTimings }));
   if (settlement) SETTLEMENT_SNAPSHOTS.set(owner, () => legacyUsed ? null : Object.freeze({
     fetchStarted: settlement.fetch.started, fetchSettled: settlement.fetch.settled,

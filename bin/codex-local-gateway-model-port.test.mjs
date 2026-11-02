@@ -1105,6 +1105,126 @@ function sourceHarness(t, options = {}) {
 }
 const finishContext = before => Object.freeze({ ...before, phase: 'after', outcome: 'success' });
 
+test('single-account enrollment is an exact own constructor capability while the default still requires both accounts', t => {
+  for (const alias of ['info', 'eason']) {
+    const sourceAccounts = { [alias]: SOURCE_ACCOUNTS[alias] }, accounts = { [alias]: { gatewayToken: TOKENS[alias] } };
+    assert.throws(() => sourceHarness(t, { config: { accounts: sourceAccounts } }), { code: 'INVALID_CONFIGURATION' });
+    assert.throws(() => harness(t, { config: { accounts } }), { code: 'INVALID_CONFIGURATION' });
+    for (const value of [null, false, 1, '', 'other', 'INFO', {}, ['info'], new String(alias)]) {
+      assert.throws(() => sourceHarness(t, { config: { localAccountAlias: value, accounts: sourceAccounts } }), { code: 'INVALID_CONFIGURATION' });
+      assert.throws(() => harness(t, { config: { localAccountAlias: value, accounts } }), { code: 'INVALID_CONFIGURATION' });
+    }
+    for (const value of [{}, SOURCE_ACCOUNTS, { [alias === 'info' ? 'eason' : 'info']: SOURCE_ACCOUNTS[alias] },
+      Object.assign(Object.create({ other: SOURCE_ACCOUNTS.info }), sourceAccounts), new Proxy(sourceAccounts, {})]) {
+      assert.throws(() => sourceHarness(t, { config: { localAccountAlias: alias, accounts: value } }), { code: 'INVALID_CONFIGURATION' });
+    }
+    for (const value of [{}, { info: { gatewayToken: TOKENS.info }, eason: { gatewayToken: TOKENS.eason } },
+      { [alias === 'info' ? 'eason' : 'info']: accounts[alias] },
+      Object.assign(Object.create({ other: accounts[alias] }), accounts), new Proxy(accounts, {})]) {
+      assert.throws(() => harness(t, { config: { localAccountAlias: alias, accounts: value } }), { code: 'INVALID_CONFIGURATION' });
+    }
+    assert.throws(() => sourceHarness(t, { config: { localAccountAlias: alias,
+      accounts: { [alias]: { ...SOURCE_ACCOUNTS[alias], freshLoginVerified: false } } } }), { code: 'INVALID_CONFIGURATION' });
+    assert.throws(() => harness(t, { config: { localAccountAlias: alias, accounts: { [alias]: {} } } }), { code: 'INVALID_CONFIGURATION' });
+  }
+  let reads = 0;
+  const sourceBase = { accounts: { info: SOURCE_ACCOUNTS.info }, signal: new AbortController().signal, requestAttestation() {} };
+  const modelBase = { gatewayUrl: URL, accounts: { info: { gatewayToken: TOKENS.info } }, signal: new AbortController().signal, attest() {} };
+  for (const [factory, base] of [[createCodexLocalSourceAttestor, sourceBase], [createCodexLocalGatewayModelTransports, modelBase]]) {
+    assert.throws(() => factory(Object.defineProperty({ ...base }, 'localAccountAlias', {
+      enumerable: true, get() { reads++; throw Error('PRIVATE_ALIAS'); },
+    })), { code: 'INVALID_CONFIGURATION' });
+    assert.throws(() => factory(Object.assign(Object.create({ localAccountAlias: 'info' }), base)), { code: 'INVALID_CONFIGURATION' });
+    assert.throws(() => factory({ ...base, localAccountAlias: 'info', accounts: Object.defineProperty({}, 'info', {
+      enumerable: true, get() { reads++; throw Error('PRIVATE_ACCOUNT'); },
+    }) }), { code: 'INVALID_CONFIGURATION' });
+  }
+  assert.equal(reads, 0);
+});
+
+test('an independently enrolled alias completes its own before/after HMAC proofs and full provider work without a dummy port', async t => {
+  for (const alias of ['info', 'eason']) {
+    const source = sourceHarness(t, { config: { localAccountAlias: alias, accounts: { [alias]: SOURCE_ACCOUNTS[alias] } } });
+    const state = providerFailureHarness(t, { config: { localAccountAlias: alias,
+      accounts: { [alias]: { gatewayToken: TOKENS[alias] } }, attest: source.instance.attest, diagnostics: true } });
+    assert.deepEqual(Object.keys(state.instance.ports), [alias]); assert.equal(Object.isFrozen(state.instance.ports), true);
+    const input = request('independent-'+alias), work = providerWorkAttempt([]);
+    const result = await state.instance.ports[alias].generateWithProviderWork(input, new AbortController().signal, work.attempt);
+    assert.equal(result.status, 'success'); assert.equal(result.accountAlias, alias); assert.equal(result.model, MODEL);
+    assert.equal(work.completed(), true); assert.equal(state.calls.length, 1);
+    assert.equal(state.calls[0].init.headers.Authorization, 'Bearer '+TOKENS[alias]);
+    assert.deepEqual(source.calls.map(value => [value.accountAlias, value.channelId, value.payload.phase]),
+      [[alias, SOURCE_ACCOUNTS[alias].channelId, 'before'], [alias, SOURCE_ACCOUNTS[alias].channelId, 'after']]);
+    assert.notEqual(source.calls[0].payload.nonce, source.calls[1].payload.nonce);
+    assert.deepEqual(result.usage, { inputTokens: 20, outputTokens: 7, cachedInputTokens: 3 });
+    await flush(); const settled = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+    assert.equal(settled.pendingFetch + settled.pendingConsumers + settled.pendingCleanup, 0);
+    assert.equal(gateway.codexLocalGatewayTimingSnapshot(state.instance).records[0].account, alias);
+    await assert.rejects(state.instance.ports[alias].generateWithProviderWork(input, new AbortController().signal, providerWorkAttempt([]).attempt),
+      { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+    assert.equal(state.calls.length, 1);
+  }
+});
+
+test('unregistered and unknown aliases consume no source nonce, RPC or handle capacity before an enrolled call', async t => {
+  for (const alias of ['info', 'eason']) {
+    const state = sourceHarness(t, { config: { localAccountAlias: alias, accounts: { [alias]: SOURCE_ACCOUNTS[alias] } } });
+    const before = sourceContext('before', { binding: { ...sourceContext().binding, accountAlias: alias, callId: 'independent-source-'+alias } });
+    for (const forgedAlias of [alias === 'info' ? 'eason' : 'info', 'unknown']) {
+      const forged = { ...before, binding: { ...before.binding, accountAlias: forgedAlias } };
+      await assert.rejects(state.instance.attest(forged), { code: 'ATTESTATION_FAILED' });
+      assert.throws(() => state.instance.quotaRequest(quotaContext(forged)), { code: 'ATTESTATION_FAILED' });
+    }
+    assert.equal(state.calls.length, 0);
+    assert.equal((await state.instance.attest(before)).accountAlias, alias);
+    assert.equal((await state.instance.attest(finishContext(before))).accountAlias, alias);
+    assert.equal(state.calls.length, 2);
+    await assert.rejects(state.instance.attest(before), { code: 'ATTESTATION_FAILED' });
+    assert.equal(state.calls.length, 2);
+  }
+});
+
+test('single-account after-proof forgery remains fail-closed and cannot issue another alias nonce', async t => {
+  for (const alias of ['info', 'eason']) {
+    const state = sourceHarness(t, { config: { localAccountAlias: alias, accounts: { [alias]: SOURCE_ACCOUNTS[alias] } } });
+    const before = sourceContext('before', { binding: { ...sourceContext().binding, accountAlias: alias } });
+    await state.instance.attest(before);
+    await assert.rejects(state.instance.attest({ ...finishContext(before),
+      binding: { ...before.binding, accountAlias: alias === 'info' ? 'eason' : 'info' } }), { code: 'ATTESTATION_FAILED' });
+    assert.equal(state.calls.length, 1);
+    await assert.rejects(state.instance.attest(finishContext(before)), { code: 'ATTESTATION_FAILED' });
+    assert.equal(state.calls.length, 1, 'a poisoned handle is not recovered by retrying the enrolled alias');
+  }
+});
+
+test('single-account proofs still reject foreign account signatures before or after model work', async t => {
+  for (const alias of ['info', 'eason']) for (const phase of ['before', 'after']) {
+    const other = alias === 'info' ? 'eason' : 'info';
+    const source = sourceHarness(t, { config: { localAccountAlias: alias, accounts: { [alias]: SOURCE_ACCOUNTS[alias] } },
+      respond: (context, proof) => context.payload.phase === phase
+        ? signSourceProof(proof, SOURCE_ACCOUNTS[other].credentialProofKey64hex) : proof });
+    const state = providerFailureHarness(t, { config: { localAccountAlias: alias,
+      accounts: { [alias]: { gatewayToken: TOKENS[alias] } }, attest: source.instance.attest } });
+    await assert.rejects(state.instance.ports[alias].generateWithProviderWork(request('single-proof-'+alias+'-'+phase),
+      new AbortController().signal, providerWorkAttempt([]).attempt), { code: 'ATTESTATION_FAILED' });
+    assert.equal(state.calls.length, phase === 'before' ? 0 : 1); assert.equal(source.calls.length, phase === 'before' ? 1 : 2);
+  }
+});
+
+test('single-account enrollment cannot enter request scope, redirect a bound port or bypass owner expiry', async t => {
+  const state = harness(t, { config: { localAccountAlias: 'eason', accounts: { eason: { gatewayToken: TOKENS.eason } } } });
+  for (const extra of [{ localAccountAlias: 'info' }, { accountAlias: 'info' },
+    { scope: { tenantId: 'other-tenant', brandId: 'other-brand', synthetic: true, jobId: 'job' } }]) {
+    await assert.rejects(run(state, request('single-input', extra), 'eason'), { code: 'INVALID_REQUEST' });
+  }
+  assert.equal(state.checks.length, 0); assert.equal(state.calls.length, 0);
+  const result = await state.instance.ports.eason.generate.call({ accountAlias: 'info' }, request('single-input'), new AbortController().signal);
+  assert.equal(result.accountAlias, 'eason'); assert.equal(state.checks[0].binding.accountAlias, 'eason');
+  state.setTime(121000);
+  await assert.rejects(run(state, request('single-expired'), 'eason'), { code: 'GATEWAY_EXPIRED' });
+  assert.equal(state.calls.length, 1);
+});
+
 test('source attestor uses the Go four-field framing vector and rejects credential objects with executable or extra data', () => {
   assert.equal(deriveCodexLocalAttestationKey(FRESH_TOKENS), SOURCE_KEY);
   for (const value of [{ ...FRESH_TOKENS, refresh_token: '' }, { ...FRESH_TOKENS, access_token: 'x'.repeat(65_537) },
