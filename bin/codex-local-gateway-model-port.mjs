@@ -672,8 +672,15 @@ export function createCodexLocalGatewayModelTransports(options) {
           timingStatus = 'QUOTA_EXHAUSTED'; return result;
         }
         if (allowFailure) {
-          if (result === httpFailure) providerFailureReason = [401, 403].includes(response.status) ? 'AUTHENTICATION'
-            : response.status === 429 ? 'RATE_LIMIT' : [408, 504].includes(response.status) ? 'TIMEOUT' : 'UPSTREAM';
+          if (result === httpFailure) {
+            // A client/permission/policy denial is not evidence that another
+            // account should run the same request. Only these HTTP outage
+            // classes may advance the already-settled, source-checked work.
+            providerFailureReason = response.status === 401 ? 'AUTHENTICATION'
+              : response.status === 429 ? 'RATE_LIMIT' : [408, 504].includes(response.status) ? 'TIMEOUT'
+                : response.status >= 500 && response.status <= 599 ? 'UPSTREAM' : undefined;
+            if (!providerFailureReason) reject('GATEWAY_HTTP_FAILURE');
+          }
           activeCheck(ownerActive);
           return snapshotModelResult({ accountAlias: alias, authMode: 'managed_chatgpt', accountVerified: true, model: MODEL,
             callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,

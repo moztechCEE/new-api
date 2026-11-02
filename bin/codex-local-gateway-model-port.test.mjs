@@ -198,8 +198,8 @@ test('provider failures require a trusted own opt-in, preserve legacy errors and
   assert.equal(state.calls.length, 0); assert.equal(state.checks.length, 0);
 });
 test('completed HTTP provider failures are fixed bound receipts, not success, usage or quota claims', async t => {
-  for (const [status, reason] of [[401, 'AUTHENTICATION'], [403, 'AUTHENTICATION'], [429, 'RATE_LIMIT'],
-    [408, 'TIMEOUT'], [504, 'TIMEOUT'], [400, 'UPSTREAM'], [500, 'UPSTREAM']]) {
+  for (const [status, reason] of [[401, 'AUTHENTICATION'], [429, 'RATE_LIMIT'],
+    [408, 'TIMEOUT'], [504, 'TIMEOUT'], [500, 'UPSTREAM'], [502, 'UPSTREAM'], [503, 'UPSTREAM']]) {
     const work = providerWorkAttempt([]), input = request('provider-http-'+status), state = providerFailureHarness(t, {
       fetch: () => new Response('PRIVATE_HTTP_BODY', { status }) });
     const result = await runProviderWork(state, work.attempt, input);
@@ -212,6 +212,65 @@ test('completed HTTP provider failures are fixed bound receipts, not success, us
     assert.deepEqual(state.checks.map(value => value.phase), ['before', 'after']);
     for (const key of ['text', 'usage', 'authenticated', 'completionStatus']) assert.equal(Object.hasOwn(result, key), false);
     assert.doesNotMatch(JSON.stringify(result), /PRIVATE_HTTP_BODY|receipt|nonce|proof|Bearer/);
+  }
+});
+test('client and policy denials never release a retryable receipt to an Eason fallback consumer', async t => {
+  for (const status of [400, 402, 403, 404, 405, 409, 413, 415, 422, 451]) {
+    const work = providerWorkAttempt([]), input = request('client-denial-'+status); let easonCalls = 0;
+    const state = providerFailureHarness(t, { fetch: (_url, init) => {
+      if (init.headers.Authorization === `Bearer ${TOKENS.eason}`) { easonCalls++; return sse(); }
+      return new Response(JSON.stringify({ error: { type: status === 403 ? 'permission_error' : 'invalid_request_error',
+        code: status === 400 || status === 403 ? 'content_policy_violation' : 'invalid_request', message: 'PRIVATE_DENIAL_VALUE' } }),
+      { status, headers: { 'content-type': 'application/json' } });
+    } });
+    // This continuation represents the consumer boundary: a held original call
+    // must reject before any provider-failure result can authorize the next port.
+    const pending = runProviderWork(state, work.attempt, input).then(async result => {
+      assert.equal(result.status, 'provider_failure');
+      return state.instance.ports.eason.generateWithProviderWork(input, new AbortController().signal, providerWorkAttempt([]).attempt);
+    });
+    await assert.rejects(pending, error => error.code === 'GATEWAY_HTTP_FAILURE' &&
+      !JSON.stringify(error).includes('PRIVATE_DENIAL_VALUE'));
+    assert.equal(easonCalls, 0); assert.equal(state.calls.length, 1); assert.equal(work.completed(), true);
+    assert.deepEqual(state.checks.map(value => value.phase), ['before', 'after']);
+    assert.equal(state.checks[1].outcome, 'http_failure');
+  }
+});
+test('client denial holds only after actual body cleanup and the existing after-proof without a new provider timer', async t => {
+  const cleanupEntered = deferred(), cleaned = deferred(), proofEntered = deferred(), proofDone = deferred(), deadlines = [];
+  t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); deadlines.push(ms); return c.signal; });
+  const state = providerFailureHarness(t, { config: { diagnostics: true },
+    fetch: () => new Response(new ReadableStream({ cancel() { cleanupEntered.resolve(); return cleaned.promise; } }), { status: 400 }),
+    attest: async (context, proof) => { if (context.phase === 'after') { proofEntered.resolve(); await proofDone.promise; } return proof; } });
+  let settled = false; const work = providerWorkAttempt([]);
+  const pending = runProviderWork(state, work.attempt).finally(() => { settled = true; });
+  await cleanupEntered.promise; await flush();
+  assert.equal(settled, false); assert.equal(work.completed(), false);
+  assert.deepEqual(state.checks.map(value => value.phase), ['before']);
+  cleaned.resolve(); await proofEntered.promise;
+  assert.equal(settled, false); assert.equal(work.completed(), true);
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingCleanup, 0);
+  proofDone.resolve(); await assert.rejects(pending, { code: 'GATEWAY_HTTP_FAILURE' });
+  assert.deepEqual(deadlines, [5000, 60000, 5000]); assert.equal(state.calls.length, 1);
+});
+test('explicit SSE refusal and policy-failed terminals remain fatal with provider-failure fallback enabled', async t => {
+  const events = [
+    { type: 'response.refusal.delta', delta: 'PRIVATE_REFUSAL_VALUE' },
+    { type: 'response.content_part.added', part: { type: 'refusal', refusal: 'PRIVATE_REFUSAL_VALUE' } },
+    { type: 'response.completed', response: completion('', { output: [{ type: 'message', role: 'assistant',
+      status: 'completed', content: [{ type: 'refusal', refusal: 'PRIVATE_REFUSAL_VALUE' }] }] }) },
+    ...['error', 'response.failed', 'response.incomplete'].map(type => ({ type,
+      response: { error: { code: 'content_policy_violation' } }, error: { code: 'content_policy_violation' } })),
+  ];
+  for (const [index, event] of events.entries()) {
+    let continued = false;
+    const state = providerFailureHarness(t, { fetch: () => new Response(`data: ${JSON.stringify(event)}\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } }) });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt, request('refusal-held-'+index))
+      .then(() => { continued = true; }), error => error.code === 'GATEWAY_RESPONSE_INVALID' &&
+        !JSON.stringify(error).includes('PRIVATE_REFUSAL_VALUE'));
+    assert.equal(continued, false); assert.equal(state.calls.length, 1);
+    assert.deepEqual(state.checks.map(value => value.phase), ['before']);
   }
 });
 test('only a settled branded physical network rejection can become a provider failure', async t => {

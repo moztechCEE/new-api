@@ -45,3 +45,27 @@ learning, exact GPT-6.1 Sol and API-off routing.
 
 No production acceptance or natural quota-failover acceptance is implied by
 offline contract tests.
+
+## Local provider-failure HTTP boundary — 2026-11-03
+
+The opt-in local provider-work path may advance from Info to Eason only after
+actual owned body cleanup, the original provider operation and the after-source
+proof settle. HTTP 401 remains authentication inability, 408/504 timeout, 429
+rate limitation (or independently verified quota), and other 5xx server failure.
+Other HTTP denials, including 400/403/404/409/422, now hold instead of producing
+an account-outage receipt. A bad request or permission/content-policy denial is
+not repaired by submitting the same request under another account. Explicit
+SSE refusal, failed and incomplete terminals remain fatal; genuine settled
+blank/schema-invalid output retains its existing bounded failure classification.
+No error body or message is read or logged by this status-only boundary.
+
+This distinction follows the [official error-code categories](https://developers.openai.com/api/docs/guides/error-codes),
+not natural-language error-message keywords. The former offline expectation
+that 403/400 could become retryable authentication/upstream failure was observed
+failing after this change and retained as an expected contract-change failure,
+not relabeled as a passing test. Updated Native transport and local contract
+fixtures pass 153/153 on each of Node 20 and 22 with network denied, including
+no Eason continuation after client denial, actual cleanup/after-proof ordering,
+unchanged provider-clock count, source/cancellation holds and explicit SSE
+refusal. These are pure fixture results, not model, renewal, billing, customer
+quality, browser send/learning, hosted DEV or production acceptance.
