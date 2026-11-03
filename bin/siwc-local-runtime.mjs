@@ -268,15 +268,72 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
 
 const SETTLED_PLAN_OUTPUT_FAILURES = new WeakSet();
 const SETTLED_PLAN_CANCELLATIONS = new WeakSet();
+const PLAN_TERMINAL_FAILURES = new WeakMap();
 /** A parser-local failure observation, never model/authentication authority. */
 export const isSettledPlanOutputFailure = error => SETTLED_PLAN_OUTPUT_FAILURES.has(error);
 /** Only this parser's own interruption after actual iterator/read cleanup. */
 export const isSettledPlanCancellation = error => SETTLED_PLAN_CANCELLATIONS.has(error);
+/** Fixed parser-owned facts only; foreign errors/getters cannot supply a brand.
+ * A technical reason is exposed only after this stream's actual cleanup. */
+export const planTerminalFailure = error => PLAN_TERMINAL_FAILURES.get(error);
+
+function textOnlyPlanOutputItem(item, progress = false) {
+  if (!item || typeof item !== 'object' || Array.isArray(item) || Object.hasOwn(item, 'refusal') || Object.hasOwn(item, 'misalignment')) return false;
+  const safePart = (part, type) => part?.type === type && typeof part.text === 'string' &&
+    !Object.hasOwn(part, 'refusal') && !Object.hasOwn(part, 'misalignment');
+  if (item.type === 'reasoning') return (progress && item.summary === undefined || Array.isArray(item.summary) && item.summary.every(part => safePart(part, 'summary_text'))) &&
+    (item.content === undefined || progress && Array.isArray(item.content) && item.content.every(part => safePart(part, 'reasoning_text')));
+  return item.type === 'message' && (item.role === undefined || item.role === 'assistant') &&
+    (progress && item.status === undefined || ['completed', 'incomplete', 'in_progress'].includes(item.status)) &&
+    Array.isArray(item.content) && item.content.every(part => safePart(part, 'output_text'));
+}
+
+function terminalFailureFacts(event, responseId, completed, identities) {
+  const terminalKind = event.type === 'error' ? 'ERROR' : event.type === 'response.failed' ? 'FAILED' : 'INCOMPLETE';
+  const response = event.response;
+  const incomplete = response?.incomplete_details?.reason;
+  const incompleteReasonClass = new Map([['max_output_tokens', 'MAX_OUTPUT_TOKENS'], ['max_messages', 'MAX_MESSAGES'],
+    ['content_filter', 'CONTENT_FILTER'], ['steered', 'STEERED']]).get(incomplete) ?? (incomplete == null ? 'MISSING' : 'OTHER');
+  const code = terminalKind === 'ERROR' ? event.code ?? event.error?.code : response?.error?.code;
+  const technical = new Map([['server_error', ['SERVER', 'UPSTREAM']], ['rate_limit_exceeded', ['RATE_LIMIT', 'RATE_LIMIT']],
+    ['subscription_sharing_usage_limit_exceeded', ['RATE_LIMIT', 'RATE_LIMIT']],
+    ['subscription_sharing_invalid_user', ['AUTHENTICATION', 'AUTHENTICATION']],
+    ['subscription_sharing_user_unavailable', ['ACCOUNT_UNAVAILABLE', 'UPSTREAM']],
+    ['subscription_sharing_usage_unavailable', ['USAGE_UNAVAILABLE', 'UPSTREAM']]]).get(code);
+  const denied = new Map([['invalid_prompt', 'REQUEST'], ['data_residency_mismatch', 'REQUEST'],
+    ['bio_policy', 'POLICY'], ['misalignment_policy_violation', 'POLICY'], ['content_policy_violation', 'POLICY'],
+    ['subscription_sharing_user_not_eligible', 'PERMISSION'], ['chatpass_v2_scope_not_authorized', 'PERMISSION'],
+    ['chatpass_v2_invalid_authorization_context', 'PERMISSION'], ['subscription_sharing_unsupported_capability', 'UNSUPPORTED'],
+    ['subscription_sharing_route_not_supported', 'UNSUPPORTED']]).get(code);
+  let terminalCodeClass = technical?.[0] ?? denied ?? (code == null ? 'MISSING' : typeof code === 'string' ? 'UNKNOWN' : 'MALFORMED');
+  let providerFailureReason = null;
+  const identityValid = response && typeof response === 'object' && !Array.isArray(response) &&
+    typeof response.id === 'string' && response.id.length > 0 && response.id.length <= 256 &&
+    (!responseId || response.id === responseId) && response.model === MODEL &&
+    response.status === (terminalKind === 'FAILED' ? 'failed' : 'incomplete') && Array.isArray(response.output) &&
+    response.output.every(item => textOnlyPlanOutputItem(item)) && [...identities].every(([index, id]) =>
+      response.output[index]?.id === undefined || response.output[index].id === id);
+  const errorType = terminalKind === 'ERROR' ? event.error?.type : response?.error?.type;
+  const errorObject = terminalKind === 'ERROR' ? event.error : response?.error;
+  const safetyConflict = [event, response, errorObject].some(value => value && typeof value === 'object' &&
+    (Object.hasOwn(value, 'misalignment') || Object.hasOwn(value, 'refusal')));
+  const compatibleType = errorType == null || technical && errorType ===
+    (technical[1] === 'RATE_LIMIT' ? 'rate_limit_error' : technical[1] === 'AUTHENTICATION' ? 'authentication_error' : 'server_error');
+  if (safetyConflict) terminalCodeClass = 'POLICY';
+  else if (completed || !compatibleType || terminalKind === 'ERROR' && (response !== undefined ||
+      event.error !== undefined && (!event.error || typeof event.error !== 'object' || Array.isArray(event.error) || typeof event.error.code !== 'string') ||
+      event.code !== undefined && event.error?.code !== undefined && event.code !== event.error.code) ||
+      terminalKind !== 'ERROR' && !identityValid) terminalCodeClass = 'MALFORMED';
+  else if (terminalKind === 'INCOMPLETE') {
+    if (response.error == null && ['MAX_OUTPUT_TOKENS', 'MAX_MESSAGES'].includes(incompleteReasonClass)) providerFailureReason = 'INVALID_OUTPUT';
+  } else if (technical && (terminalKind === 'ERROR' || response.incomplete_details == null)) providerFailureReason = technical[1];
+  return { diagnostic: Object.freeze({ terminalKind, terminalCodeClass, incompleteReasonClass }), providerFailureReason };
+}
 
 async function consumeTextStream(body, expectedText, signal, onPhase, classifySettledOutputFailure = false, awaitCleanup = false) {
   if (!body) fail('MISSING_COMPLETED_EVENT');
   const decoder = new TextDecoder('utf8', { fatal: true });
-  let buffer = '', total = 0, text = '', completed, responseId;
+  let buffer = '', total = 0, text = '', completed, responseId, terminalFailure, terminalFacts;
   const observed = new Set();
   // Observation receives fixed phase codes only, never an event or text. It
   // cannot replace the original parser result/error or make a receipt valid.
@@ -291,12 +348,15 @@ async function consumeTextStream(body, expectedText, signal, onPhase, classifySe
     catch { /* Diagnostic failures never become provider/parser failures. */ }
   };
   const parts = new Map(), identities = new Map();
-  function partFor(outputIndex, contentIndex, itemId) {
+  function observeIdentity(outputIndex, itemId) {
     if (!Number.isSafeInteger(outputIndex) || outputIndex < 0 || outputIndex > 63 ||
-        !Number.isSafeInteger(contentIndex) || contentIndex < 0 || contentIndex > 63 ||
         typeof itemId !== 'string' || !itemId || itemId.length > 256) fail('INVALID_STREAM_EVENT');
     if (identities.has(outputIndex) && identities.get(outputIndex) !== itemId) fail('INVALID_STREAM_EVENT');
     identities.set(outputIndex, itemId);
+  }
+  function partFor(outputIndex, contentIndex, itemId) {
+    observeIdentity(outputIndex, itemId);
+    if (!Number.isSafeInteger(contentIndex) || contentIndex < 0 || contentIndex > 63) fail('INVALID_STREAM_EVENT');
     const key = `${outputIndex}:${contentIndex}`;
     if (!parts.has(key)) {
       if (parts.size >= 64) fail('OUTPUT_TOO_LARGE');
@@ -321,17 +381,28 @@ async function consumeTextStream(body, expectedText, signal, onPhase, classifySe
           (responseId && responseId !== event.response.id) ||
           (event.response.model !== undefined && event.response.model !== MODEL)) fail('INVALID_COMPLETION');
       responseId = event.response.id;
+      if (event.response.output !== undefined) {
+        if (!Array.isArray(event.response.output)) fail('INVALID_COMPLETION');
+        for (const [index, item] of event.response.output.entries()) {
+          if (!textOnlyPlanOutputItem(item, true)) fail('NON_TEXT_OUTPUT_REJECTED');
+          if (item.id !== undefined) observeIdentity(index, item.id);
+        }
+      }
     }
     if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) {
-      throw new ProbeError('INFERENCE_NOT_COMPLETED', { errorCode: event.response?.error?.code ?? event.error?.code ?? event.code });
+      terminalFacts = terminalFailureFacts(event, responseId, completed, identities);
+      terminalFailure = new ProbeError('INFERENCE_NOT_COMPLETED', { errorCode: event.response?.error?.code ?? event.error?.code ?? event.code });
+      PLAN_TERMINAL_FAILURES.set(terminalFailure, Object.freeze({ ...terminalFacts.diagnostic, settled: false, providerFailureReason: null }));
+      throw terminalFailure;
     }
     // No tools are provided on this text-only port. Never turn a refusal or
     // an action/tool item into a completed customer-service text receipt.
-    if (event.type.startsWith('response.refusal.') ||
+    if (Object.hasOwn(event, 'refusal') || Object.hasOwn(event, 'misalignment') || event.type.startsWith('response.refusal.') ||
         (['response.output_item.added', 'response.output_item.done'].includes(event.type) &&
-          !['message', 'reasoning'].includes(event.item?.type)) ||
+          !textOnlyPlanOutputItem(event.item, true)) ||
         (['response.content_part.added', 'response.content_part.done'].includes(event.type) &&
-          event.part?.type !== 'output_text')) fail('NON_TEXT_OUTPUT_REJECTED');
+          (event.part?.type !== 'output_text' || Object.hasOwn(event.part, 'refusal') || Object.hasOwn(event.part, 'misalignment')))) fail('NON_TEXT_OUTPUT_REJECTED');
+    if (['response.output_item.added', 'response.output_item.done'].includes(event.type)) observeIdentity(event.output_index, event.item.id);
     if (event.type === 'response.output_text.delta') {
       if (completed || typeof event.delta !== 'string') fail('INVALID_STREAM_EVENT');
       text += event.delta;
@@ -397,6 +468,7 @@ async function consumeTextStream(body, expectedText, signal, onPhase, classifySe
     fail('STREAM_INTERRUPTED');
   } finally {
     signal?.removeEventListener('abort', interrupted);
+    let cleanupSettled = finished;
     if (!finished && iterator?.return) {
       if (awaitCleanup) {
         let cleanupFailed = false;
@@ -409,8 +481,13 @@ async function consumeTextStream(body, expectedText, signal, onPhase, classifySe
         // A resolving return() alone cannot attest an outstanding read.
         if (pendingRead) try { await pendingRead; } catch { /* observed settled */ }
         if (cleanupFailed) fail('STREAM_CLEANUP_FAILED');
+        cleanupSettled = true;
         if (streamFailure === interruptionError && interruptionError) SETTLED_PLAN_CANCELLATIONS.add(interruptionError);
       } else void Promise.resolve(iterator.return()).catch(() => {});
+    }
+    if (awaitCleanup && cleanupSettled && terminalFailure && streamFailure === terminalFailure) {
+      PLAN_TERMINAL_FAILURES.set(terminalFailure, Object.freeze({ ...terminalFacts.diagnostic, settled: true,
+        providerFailureReason: terminalFacts.providerFailureReason }));
     }
   }
   if (!completed) fail('MISSING_COMPLETED_EVENT');

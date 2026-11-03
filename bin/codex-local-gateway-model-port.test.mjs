@@ -273,6 +273,150 @@ test('explicit SSE refusal and policy-failed terminals remain fatal with provide
     assert.deepEqual(state.checks.map(value => value.phase), ['before']);
   }
 });
+test('typed SSE technical terminals use the existing settled failure and after-proof path without quota claims', async t => {
+  const deadlines = []; t.mock.method(AbortSignal, 'timeout', ms => { deadlines.push(ms); return new AbortController().signal; });
+  const cases = [['server_error', 'UPSTREAM'], ['rate_limit_exceeded', 'RATE_LIMIT'],
+    ['subscription_sharing_invalid_user', 'AUTHENTICATION'], ['subscription_sharing_user_unavailable', 'UPSTREAM'],
+    ['subscription_sharing_usage_unavailable', 'UPSTREAM'], ['subscription_sharing_usage_limit_exceeded', 'RATE_LIMIT']]
+    .map(([code, reason]) => [{ type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code } }) }, reason]);
+  for (const reason of ['max_output_tokens', 'max_messages']) cases.push([{ type: 'response.incomplete', response:
+    completion('PRIVATE_PARTIAL_OUTPUT', { status: 'incomplete', error: null, incomplete_details: { reason } }) }, 'INVALID_OUTPUT']);
+  for (const code of ['server_error', 'rate_limit_exceeded']) cases.push([{ type: 'error', code, message: 'PRIVATE_ERROR_MESSAGE' }, code === 'server_error' ? 'UPSTREAM' : 'RATE_LIMIT']);
+  for (const [index, [event, reason]] of cases.entries()) {
+    const timerStart = deadlines.length;
+    const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(`data: ${JSON.stringify(event)}\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } }) });
+    const result = await runProviderWork(state, providerWorkAttempt([]).attempt, request('typed-terminal-'+index));
+    assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, reason); assert.equal(result.operationSettled, true);
+    assert.equal(result.code, 'PROVIDER_UNAVAILABLE'); assert.equal(result.authenticated, undefined); assert.equal(result.text, undefined);
+    assert.deepEqual(state.checks.map(row => row.phase), ['before', 'after']); assert.equal(state.calls.length, 1);
+    assert.deepEqual(deadlines.slice(timerStart), [5000, 60000, 5000]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|quota_exhausted/);
+    const final = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+    assert.equal(final.pendingFetch + final.pendingConsumers + final.pendingCleanup, 0);
+  }
+});
+test('technical terminal waits actual body cleanup and after proof; source changes or caller abort cannot become fallback', async t => {
+  const event = { type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code: 'server_error' } }) };
+  const entered = deferred(), cleaned = deferred(), after = deferred(), proven = deferred();
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+    start(c) { c.enqueue(Buffer.from(`data: ${JSON.stringify(event)}\n\n`)); }, cancel() { entered.resolve(); return cleaned.promise; } }),
+    { headers: { 'content-type': 'text/event-stream' } }), attest: async (context, proof) => {
+      if (context.phase === 'after') { after.resolve(); await proven.promise; } return proof;
+    } });
+  let returned = false; const pending = runProviderWork(state, providerWorkAttempt([]).attempt).then(value => { returned = true; return value; });
+  await entered.promise; await flush(); assert.equal(returned, false); assert.deepEqual(state.checks.map(row => row.phase), ['before']);
+  cleaned.resolve(); await after.promise; assert.equal(returned, false); proven.resolve(); assert.equal((await pending).reason, 'UPSTREAM');
+  const drift = providerFailureHarness(t, { fetch: () => new Response(`data: ${JSON.stringify(event)}\n\n`, { headers: { 'content-type': 'text/event-stream' } }),
+    attest: (context, proof) => ({ ...proof, configurationRevision: context.phase === 'after' ? 'b'.repeat(64) : proof.configurationRevision }) });
+  await assert.rejects(runProviderWork(drift, providerWorkAttempt([]).attempt), { code: 'ATTESTATION_CHANGED' });
+  const caller = new AbortController(), cancelEntered = deferred(), cancelDone = deferred();
+  const aborted = providerFailureHarness(t, { fetch: () => new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(`data: ${JSON.stringify(event)}\n\n`)); },
+    cancel() { cancelEntered.resolve(); return cancelDone.promise; } }), { headers: { 'content-type': 'text/event-stream' } }) });
+  const cancelled = runProviderWork(aborted, providerWorkAttempt([]).attempt, request('terminal-caller-abort'), caller.signal); cancelled.catch(() => {});
+  await cancelEntered.promise; caller.abort(0); cancelDone.resolve(); await assert.rejects(cancelled, { code: 'GATEWAY_CLOSED' });
+  assert.equal(caller.signal.reason, 0); assert.deepEqual(aborted.checks.map(row => row.phase), ['before']);
+});
+test('terminal safety, unknowns and inconsistent identities remain HOLD with fixed diagnostics', async t => {
+  const events = [
+    ...['invalid_prompt', 'data_residency_mismatch', 'bio_policy', 'misalignment_policy_violation', 'content_policy_violation',
+      'subscription_sharing_user_not_eligible', 'PRIVATE_UNKNOWN_CODE'].map(code => ({ type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code } }) })),
+    ...['content_filter', 'steered', 'PRIVATE_UNKNOWN_REASON'].map(reason => ({ type: 'response.incomplete', response: completion('',
+      { status: 'incomplete', error: null, output: [], incomplete_details: { reason } }) })),
+    { type: 'error' }, { type: 'error', code: 'PRIVATE_UNKNOWN_CODE' },
+    { type: 'error', code: 'server_error', error: { code: 'content_policy_violation' } },
+    { type: 'error', code: 'server_error', error: { code: 'server_error', type: 'permission_error' } },
+    { type: 'error', code: 'server_error', error: 'PRIVATE_MALFORMED_ERROR' },
+    { type: 'error', code: 'server_error', misalignment: { private: 'PRIVATE_SAFETY_FIELD' } },
+    { type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code: 'server_error', misalignment: { private: 'PRIVATE_SAFETY_FIELD' } } }) },
+    ...['content_filter', 'steered'].map(reason => ({ type: 'response.failed', response: completion('',
+      { status: 'failed', output: [], error: { code: 'server_error' }, incomplete_details: { reason } }) })),
+    { type: 'response.failed', response: completion('', { status: 'failed', id: '', error: { code: 'server_error' } }) },
+    { type: 'response.failed', response: completion('', { status: 'failed', model: 'PRIVATE_OTHER_MODEL', error: { code: 'server_error' } }) },
+    { type: 'response.incomplete', response: completion('', { status: 'incomplete', incomplete_details: { reason: 'max_messages' }, error: { code: 'PRIVATE_UNKNOWN_CODE' } }) },
+    { type: 'response.failed', response: completion('', { status: 'failed', error: { code: 'server_error' },
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'refusal', refusal: 'PRIVATE_REFUSAL' }] }] }) },
+    { type: 'response.failed', response: completion('', { status: 'failed', error: { code: 'server_error' }, output: [{ type: 'function_call', name: 'PRIVATE_TOOL' }] }) },
+    { type: 'response.failed', response: completion('', { status: 'failed', error: { code: 'server_error' },
+      output: [{ type: 'reasoning', summary: [{ type: 'refusal', text: 'PRIVATE_REFUSAL' }] }] }) },
+    { type: 'response.failed', response: completion('', { status: 'failed', error: { code: 'server_error' },
+      output: [{ type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_text', text: '', refusal: 'PRIVATE_REFUSAL' }] }] }) },
+  ];
+  for (const [index, event] of events.entries()) {
+    const state = providerFailureHarness(t, { fetch: () => new Response(`data: ${JSON.stringify(event)}\n\n`, { headers: { 'content-type': 'text/event-stream' } }) });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt, request('terminal-held-'+index)), error => {
+      const diagnostic = gateway.codexLocalGatewayResponseDiagnostic(error); assert.equal(diagnostic.responseFailureClass, 'TERMINAL_NOT_COMPLETED');
+      assert.ok(['ERROR', 'FAILED', 'INCOMPLETE'].includes(diagnostic.terminalKind)); assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_/); return error.code === 'GATEWAY_RESPONSE_INVALID';
+    });
+    assert.equal(state.calls.length, 1); assert.deepEqual(state.checks.map(row => row.phase), ['before']);
+  }
+});
+test('mismatched response identity or a later terminal cannot reclassify already observed output', async t => {
+  const failed = { type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code: 'server_error' } }) };
+  for (const first of [{ type: 'response.created', response: { id: 'other-response', model: MODEL } }, { type: 'response.completed', response: completion() }]) {
+    const state = providerFailureHarness(t, { fetch: () => new Response([first, failed].map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } }) });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt), error => {
+      assert.equal(gateway.codexLocalGatewayResponseDiagnostic(error).terminalCodeClass, 'MALFORMED'); return error.code === 'GATEWAY_RESPONSE_INVALID';
+    });
+    assert.deepEqual(state.checks.map(row => row.phase), ['before']);
+  }
+});
+test('prior added refusal and terminal summary own-refusal cannot mint an UPSTREAM receipt', async t => {
+  const failed = { type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code: 'server_error' } }) };
+  const cases = [
+    [{ type: 'response.output_item.added', output_index: 0, item: { id: 'msg-a', type: 'message', role: 'assistant', status: 'in_progress',
+      content: [{ type: 'refusal', refusal: 'PRIVATE_ADDED_REFUSAL' }] } }, failed],
+    [{ type: 'response.in_progress', response: { id: failed.response.id, model: MODEL, output: [{ id: 'msg-a', type: 'message', role: 'assistant', status: 'in_progress',
+      content: [{ type: 'refusal', refusal: 'PRIVATE_PROGRESS_REFUSAL' }] }] } }, failed],
+    [{ type: 'response.output_text.delta', delta: '', refusal: 'PRIVATE_DELTA_REFUSAL' }, failed],
+    [{ ...failed, response: { ...failed.response, output: [{ id: 'reason-a', type: 'reasoning', summary: [{ type: 'summary_text', text: '', refusal: 'PRIVATE_SUMMARY_REFUSAL' }] }] } }],
+  ];
+  for (const [index, events] of cases.entries()) {
+    const state = providerFailureHarness(t, { fetch: () => new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } }) });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt, request('prior-safety-'+index)), error => {
+      assert.equal(error.code, 'GATEWAY_RESPONSE_INVALID'); assert.doesNotMatch(JSON.stringify(gateway.codexLocalGatewayResponseDiagnostic(error)), /PRIVATE_/); return true;
+    });
+    assert.equal(state.calls.length, 1); assert.deepEqual(state.checks.map(row => row.phase), ['before']);
+  }
+});
+test('terminal item snapshot must agree with already observed delta/added identity before failover proof', async t => {
+  const item = { id: 'msg-a', type: 'message', role: 'assistant', status: 'in_progress', content: [] };
+  const delta = { type: 'response.output_text.delta', output_index: 0, content_index: 0, item_id: 'msg-a', delta: 'partial' };
+  const failed = { type: 'response.failed', response: completion('', { status: 'failed', error: { code: 'server_error' },
+    output: [{ ...item, id: 'msg-b', status: 'incomplete', content: [{ type: 'output_text', text: 'partial' }] }] }) };
+  for (const [index, first] of [delta, { type: 'response.output_item.added', output_index: 0, item }].entries()) {
+    const state = providerFailureHarness(t, { fetch: () => new Response([first, failed].map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } }) });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt, request('item-mismatch-'+index)), error => {
+      assert.equal(gateway.codexLocalGatewayResponseDiagnostic(error).terminalCodeClass, 'MALFORMED'); return error.code === 'GATEWAY_RESPONSE_INVALID';
+    });
+    assert.deepEqual(state.checks.map(row => row.phase), ['before']); assert.equal(state.calls.length, 1);
+  }
+  const events = [{ type: 'response.output_item.added', output_index: 0, item },
+    { type: 'response.output_item.added', output_index: 1, item: { id: 'reason-a', type: 'reasoning', summary: [] } }, delta,
+    { ...failed, response: { ...failed.response, output: [] } }];
+  const available = providerFailureHarness(t, { fetch: () => new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''),
+    { headers: { 'content-type': 'text/event-stream' } }) });
+  const result = await runProviderWork(available, providerWorkAttempt([]).attempt, request('safe-progress-empty-failed'));
+  assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'UPSTREAM'); assert.equal(result.text, undefined);
+  assert.equal(result.usage, undefined); assert.deepEqual(available.checks.map(row => row.phase), ['before', 'after']);
+});
+test('terminal cleanup rejection or an unfinished cleanup at timeout never mints a technical receipt', async t => {
+  const event = { type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code: 'server_error' } }) };
+  const response = cancel => new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(`data: ${JSON.stringify(event)}\n\n`)); }, cancel }),
+    { headers: { 'content-type': 'text/event-stream' } });
+  const rejected = providerFailureHarness(t, { fetch: () => response(() => Promise.reject(Error('PRIVATE_CLEANUP_ERROR'))) });
+  await assert.rejects(runProviderWork(rejected, providerWorkAttempt([]).attempt), error => error.code === 'GATEWAY_RESPONSE_INVALID' && !JSON.stringify(error).includes('PRIVATE_'));
+  assert.deepEqual(rejected.checks.map(row => row.phase), ['before']);
+  let deadline; t.mock.method(AbortSignal, 'timeout', ms => { const c = new AbortController(); if (ms === 60000) deadline = c; return c.signal; });
+  const entered = deferred(), release = deferred(), state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => response(() => { entered.resolve(); return release.promise; }) });
+  const pending = runProviderWork(state, providerWorkAttempt([]).attempt); pending.catch(() => {}); await entered.promise; deadline.abort();
+  await assert.rejects(pending, { code: 'GATEWAY_TIMEOUT' }); assert.deepEqual(state.checks.map(row => row.phase), ['before']);
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingConsumers, 1); release.resolve(); await flush();
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingConsumers, 0);
+});
 test('only a settled branded physical network rejection can become a provider failure', async t => {
   const real = gateway.createCodexLocalProviderNetworkFailure(); let reads = 0;
   assert.equal(gateway.isCodexLocalProviderNetworkFailure(real), true);
@@ -1869,7 +2013,8 @@ test('stream failures retain only a fixed private class while public errors, val
     await assert.rejects(run(state), error => {
       assert.equal(error.code, 'GATEWAY_RESPONSE_INVALID');
       const diagnostic = gateway.codexLocalGatewayResponseDiagnostic(error);
-      assert.deepEqual(diagnostic, { responseFailureClass }); assert.equal(Object.isFrozen(diagnostic), true);
+      assert.deepEqual(diagnostic, { responseFailureClass, ...(name === 'failed terminal' ? {
+        terminalKind: 'FAILED', terminalCodeClass: 'MALFORMED', incompleteReasonClass: 'MISSING' } : {}) }); assert.equal(Object.isFrozen(diagnostic), true);
       assert.doesNotMatch(JSON.stringify({ error, diagnostic }), /PRIVATE_STREAM_VALUE|input_tokens|output_tokens|total_tokens|cause|body/);
       return true;
     });

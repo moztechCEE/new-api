@@ -4,7 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { types } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import { corelyPlanPayload } from './siwc-local-model-port.mjs';
-import { consumePlanTextStream, isSettledPlanOutputFailure, isSettledPlanCancellation, MODEL, ProbeError } from './siwc-local-runtime.mjs';
+import { consumePlanTextStream, isSettledPlanOutputFailure, isSettledPlanCancellation, planTerminalFailure, MODEL, ProbeError } from './siwc-local-runtime.mjs';
 import { ModelContractError, snapshotModelRequest, snapshotModelResult } from './corely-model-contract.mjs';
 
 const OWNER_TTL_MS = 120_000, CALL_TTL_MS = 60_000, MAX_CALLS = 100;
@@ -629,6 +629,12 @@ export function createCodexLocalGatewayModelTransports(options) {
             streamConsumptionFailed = true;
             if (allowFailure) {
               activeCheck(modelActive);
+              const terminal = planTerminalFailure(error);
+              if (terminal?.settled === true && terminal.providerFailureReason) {
+                if (responseBody?.locked) reject('GATEWAY_RESPONSE_INVALID');
+                await whileActive(cancelOwnedResponse(response), modelActive); activeCheck(modelActive);
+                return settledFailure(terminal.providerFailureReason);
+              }
               if (isSettledPlanOutputFailure(error)) return settledFailure('INVALID_OUTPUT');
             }
             throw error;
@@ -790,7 +796,10 @@ export function createCodexLocalGatewayModelTransports(options) {
       } catch { /* Foreign accessors/prototypes never become diagnostics. */ }
       if (probeFailure) {
         const failure = new CodexLocalGatewayError('GATEWAY_RESPONSE_INVALID');
-        RESPONSE_DIAGNOSTICS.set(failure, Object.freeze({ responseFailureClass }));
+        const terminal = planTerminalFailure(error);
+        RESPONSE_DIAGNOSTICS.set(failure, Object.freeze({ responseFailureClass,
+          ...(terminal ? { terminalKind: terminal.terminalKind, terminalCodeClass: terminal.terminalCodeClass,
+            incompleteReasonClass: terminal.incompleteReasonClass } : {}) }));
         throw failure;
       }
       reject('GATEWAY_UNAVAILABLE');

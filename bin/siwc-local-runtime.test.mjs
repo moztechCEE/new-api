@@ -11,7 +11,7 @@ import {
   ISSUER, RESOURCE, MODEL, PROBE_INPUT, PROBE_OUTPUT, SCOPES, ProbeError,
   createAttempt, consumeCallback, validateSession, publicJson, selectExactModel,
   syntheticRequest, consumeProbeStream, runSyntheticProbe, inferenceFailureDiagnostic, inferenceErrorClasses, digest,
-  consumePlanTextStream, isSettledPlanCancellation,
+  consumePlanTextStream, isSettledPlanCancellation, planTerminalFailure,
 } from './siwc-local-runtime.mjs';
 import { loadRegistration, saveRegistration, startLocalPilot } from './siwc-local-pilot.mjs';
 
@@ -69,6 +69,86 @@ function eventFrame(event, newline = '\n') {
 function streamBody(events, suffix = '') {
   return Readable.from([Buffer.from(events.map(event => eventFrame(event)).join('') + suffix)]);
 }
+
+test('typed terminal classifications are parser-owned, fixed and require actual cleanup', async () => {
+  const cases = [['server_error', 'UPSTREAM'], ['rate_limit_exceeded', 'RATE_LIMIT'],
+    ['subscription_sharing_invalid_user', 'AUTHENTICATION'], ['subscription_sharing_user_unavailable', 'UPSTREAM'],
+    ['subscription_sharing_usage_unavailable', 'UPSTREAM'], ['subscription_sharing_usage_limit_exceeded', 'RATE_LIMIT']];
+  for (const [code, reason] of cases) {
+    let release, entered, finished = false;
+    const started = new Promise(resolve => { entered = resolve; }), cleanup = new Promise(resolve => { release = resolve; });
+    const event = { type: 'response.failed', response: { id: 'terminal-fixture', model: MODEL, status: 'failed', output: [],
+      error: { code, message: 'PRIVATE_TERMINAL_MESSAGE' } } };
+    const body = new ReadableStream({ start(c) { c.enqueue(Buffer.from(eventFrame(event))); }, cancel() { entered(); return cleanup; } });
+    const pending = consumePlanTextStream(body, new AbortController().signal, undefined,
+      { classifySettledOutputFailure: true, awaitCleanup: true }).finally(() => { finished = true; });
+    pending.catch(() => {}); await started; await Promise.resolve(); assert.equal(finished, false); release();
+    await assert.rejects(pending, error => {
+      assert.equal(error.code, 'INFERENCE_NOT_COMPLETED'); const facts = planTerminalFailure(error);
+      assert.equal(facts.terminalKind, 'FAILED'); assert.equal(facts.providerFailureReason, reason); assert.equal(facts.settled, true);
+      assert.equal(Object.isFrozen(facts), true); assert.doesNotMatch(JSON.stringify(facts), /PRIVATE_TERMINAL|terminal-fixture/); return true;
+    });
+  }
+  let touched = 0;
+  for (const error of [{}, new ProbeError('INFERENCE_NOT_COMPLETED'), new Proxy({}, { get() { touched++; } }),
+    Object.defineProperty(Object.create(ProbeError.prototype), 'code', { get() { touched++; } })]) assert.equal(planTerminalFailure(error), undefined);
+  assert.equal(touched, 0);
+});
+test('only coherent length-limited incompletes are technical; safety, malformed and legacy observations never grant fallback', async () => {
+  const base = { id: 'terminal-fixture', model: MODEL, status: 'incomplete', error: null, output: [] };
+  for (const reason of ['max_output_tokens', 'max_messages', 'content_filter', 'steered', 'PRIVATE_UNKNOWN_REASON']) {
+    const event = { type: 'response.incomplete', response: { ...base, incomplete_details: { reason } } };
+    await assert.rejects(consumePlanTextStream(streamBody([event]), new AbortController().signal, undefined,
+      { classifySettledOutputFailure: true, awaitCleanup: true }), error => {
+      const facts = planTerminalFailure(error); assert.equal(facts.settled, true);
+      assert.equal(facts.providerFailureReason, ['max_output_tokens', 'max_messages'].includes(reason) ? 'INVALID_OUTPUT' : null);
+      assert.doesNotMatch(JSON.stringify(facts), /PRIVATE_UNKNOWN_REASON/); return true;
+    });
+  }
+  const event = { type: 'response.failed', response: { ...base, status: 'failed', error: { code: 'server_error' } } };
+  await assert.rejects(consumePlanTextStream(streamBody([event]), new AbortController().signal), error => {
+    assert.equal(planTerminalFailure(error).settled, false); assert.equal(planTerminalFailure(error).providerFailureReason, null); return true;
+  });
+});
+test('observed added-message and reasoning-summary refusals cannot be erased by a later technical terminal', async () => {
+  const failed = { type: 'response.failed', response: { id: 'terminal-fixture', model: MODEL, status: 'failed', output: [], error: { code: 'server_error' } } };
+  const cases = [
+    [{ type: 'response.output_item.added', output_index: 0, item: { id: 'msg-a', type: 'message', role: 'assistant', status: 'in_progress',
+      content: [{ type: 'refusal', refusal: 'PRIVATE_PRIOR_REFUSAL' }] } }, failed],
+    [{ type: 'response.output_item.added', output_index: 0, item: { id: 'reason-a', type: 'reasoning', summary: [{ type: 'summary_text', text: '', refusal: 'PRIVATE_SUMMARY_REFUSAL' }] } }, failed],
+    [{ type: 'response.in_progress', response: { id: 'terminal-fixture', model: MODEL, output: [{ id: 'msg-a', type: 'message', role: 'assistant', status: 'in_progress',
+      content: [{ type: 'refusal', refusal: 'PRIVATE_PROGRESS_REFUSAL' }] }] } }, failed],
+    [{ type: 'response.output_text.delta', delta: '', refusal: 'PRIVATE_DELTA_REFUSAL' }, failed],
+    [{ ...failed, response: { ...failed.response, output: [{ id: 'reason-a', type: 'reasoning', summary: [{ type: 'summary_text', text: '', refusal: 'PRIVATE_SUMMARY_REFUSAL' }] }] } }],
+  ];
+  for (const events of cases) await assert.rejects(consumePlanTextStream(streamBody(events), new AbortController().signal, undefined,
+    { classifySettledOutputFailure: true, awaitCleanup: true }), error => {
+    assert.ok(['NON_TEXT_OUTPUT_REJECTED', 'INFERENCE_NOT_COMPLETED'].includes(error.code));
+    assert.equal(planTerminalFailure(error)?.providerFailureReason ?? null, null); assert.doesNotMatch(JSON.stringify(error), /PRIVATE_/); return true;
+  });
+});
+test('terminal item identities include earlier deltas and added items; matching normal progress remains compatible', async () => {
+  const message = { id: 'msg-a', type: 'message', role: 'assistant', status: 'in_progress', content: [] };
+  const added = { type: 'response.output_item.added', output_index: 0, item: message };
+  const delta = { type: 'response.output_text.delta', output_index: 0, content_index: 0, item_id: 'msg-a', delta: 'partial' };
+  const failed = { type: 'response.failed', response: { id: 'terminal-fixture', model: MODEL, status: 'failed', error: { code: 'server_error' },
+    output: [{ ...message, status: 'incomplete', content: [{ type: 'output_text', text: 'partial' }] }] } };
+  for (const prefix of [[delta], [added]]) {
+    const wrong = { ...failed, response: { ...failed.response, output: [{ ...failed.response.output[0], id: 'msg-b' }] } };
+    await assert.rejects(consumePlanTextStream(streamBody([...prefix, wrong]), new AbortController().signal, undefined,
+      { classifySettledOutputFailure: true, awaitCleanup: true }), error => {
+      assert.equal(planTerminalFailure(error).providerFailureReason, null); assert.equal(planTerminalFailure(error).terminalCodeClass, 'MALFORMED'); return true;
+    });
+  }
+  const reasoning = { id: 'reason-a', type: 'reasoning', summary: [] };
+  const matching = { ...failed, response: { ...failed.response, output: [...failed.response.output, reasoning] } };
+  for (const terminal of [matching, { ...matching, response: { ...matching.response, output: [] } }]) {
+    await assert.rejects(consumePlanTextStream(streamBody([added, { type: 'response.output_item.added', output_index: 1, item: reasoning }, delta, terminal]),
+      new AbortController().signal, undefined, { classifySettledOutputFailure: true, awaitCleanup: true }), error => {
+      assert.equal(planTerminalFailure(error).providerFailureReason, 'UPSTREAM'); assert.equal(planTerminalFailure(error).settled, true); return true;
+    });
+  }
+});
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
