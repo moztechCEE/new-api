@@ -279,6 +279,7 @@ export const planTerminalFailure = error => PLAN_TERMINAL_FAILURES.get(error);
 
 function textOnlyPlanOutputItem(item, progress = false) {
   if (!item || typeof item !== 'object' || Array.isArray(item) || Object.hasOwn(item, 'refusal') || Object.hasOwn(item, 'misalignment')) return false;
+  if (Object.hasOwn(item, 'id') && (typeof item.id !== 'string' || !item.id || item.id.length > 256)) return false;
   const safePart = (part, type) => part?.type === type && typeof part.text === 'string' &&
     !Object.hasOwn(part, 'refusal') && !Object.hasOwn(part, 'misalignment');
   if (item.type === 'reasoning') return (progress && item.summary === undefined || Array.isArray(item.summary) && item.summary.every(part => safePart(part, 'summary_text'))) &&

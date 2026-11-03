@@ -150,6 +150,25 @@ test('terminal item identities include earlier deltas and added items; matching 
   }
 });
 
+test('a provided terminal item ID must be valid even before an item index was observed', async () => {
+  const item = { type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_text', text: 'partial' }] };
+  const failed = output => ({ type: 'response.failed', response: { id: 'terminal-fixture', model: MODEL, status: 'failed',
+    error: { code: 'server_error' }, output } });
+  for (const id of ['', null, 7, 'x'.repeat(257)]) {
+    await assert.rejects(consumePlanTextStream(streamBody([failed([{ ...item, id }])]), new AbortController().signal, undefined,
+      { classifySettledOutputFailure: true, awaitCleanup: true }), error => {
+      assert.equal(planTerminalFailure(error).terminalCodeClass, 'MALFORMED');
+      assert.equal(planTerminalFailure(error).providerFailureReason, null); return true;
+    });
+  }
+  for (const output of [[item], [{ ...item, id: 'valid-terminal-item' }], []]) {
+    await assert.rejects(consumePlanTextStream(streamBody([failed(output)]), new AbortController().signal, undefined,
+      { classifySettledOutputFailure: true, awaitCleanup: true }), error => {
+      assert.equal(planTerminalFailure(error).providerFailureReason, 'UPSTREAM'); return true;
+    });
+  }
+});
+
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }

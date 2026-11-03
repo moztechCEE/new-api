@@ -403,6 +403,25 @@ test('terminal item snapshot must agree with already observed delta/added identi
   assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'UPSTREAM'); assert.equal(result.text, undefined);
   assert.equal(result.usage, undefined); assert.deepEqual(available.checks.map(row => row.phase), ['before', 'after']);
 });
+test('invalid provided IDs on unobserved terminal items cannot reach a fallback after-proof', async t => {
+  const item = { type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_text', text: 'partial' }] };
+  const body = output => new Response(`data: ${JSON.stringify({ type: 'response.failed', response:
+    completion('', { status: 'failed', error: { code: 'server_error' }, output }) })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  for (const [index, id] of ['', null, 7, 'x'.repeat(257)].entries()) {
+    const state = providerFailureHarness(t, { fetch: () => body([{ ...item, id }]) });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([]).attempt, request('invalid-provided-item-'+index)), error => {
+      assert.equal(gateway.codexLocalGatewayResponseDiagnostic(error).terminalCodeClass, 'MALFORMED');
+      return error.code === 'GATEWAY_RESPONSE_INVALID';
+    });
+    assert.deepEqual(state.checks.map(row => row.phase), ['before']); assert.equal(state.calls.length, 1);
+  }
+  for (const [index, output] of [[item], [{ ...item, id: 'valid-terminal-item' }], []].entries()) {
+    const state = providerFailureHarness(t, { fetch: () => body(output) });
+    const result = await runProviderWork(state, providerWorkAttempt([]).attempt, request('valid-or-omitted-item-'+index));
+    assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'UPSTREAM');
+    assert.equal(result.text, undefined); assert.deepEqual(state.checks.map(row => row.phase), ['before', 'after']);
+  }
+});
 test('terminal cleanup rejection or an unfinished cleanup at timeout never mints a technical receipt', async t => {
   const event = { type: 'response.failed', response: completion('', { status: 'failed', output: [], error: { code: 'server_error' } }) };
   const response = cancel => new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(`data: ${JSON.stringify(event)}\n\n`)); }, cancel }),
