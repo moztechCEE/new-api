@@ -267,8 +267,11 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
 }
 
 const SETTLED_PLAN_OUTPUT_FAILURES = new WeakSet();
+const SETTLED_PLAN_CANCELLATIONS = new WeakSet();
 /** A parser-local failure observation, never model/authentication authority. */
 export const isSettledPlanOutputFailure = error => SETTLED_PLAN_OUTPUT_FAILURES.has(error);
+/** Only this parser's own interruption after actual iterator/read cleanup. */
+export const isSettledPlanCancellation = error => SETTLED_PLAN_CANCELLATIONS.has(error);
 
 async function consumeTextStream(body, expectedText, signal, onPhase, classifySettledOutputFailure = false, awaitCleanup = false) {
   if (!body) fail('MISSING_COMPLETED_EVENT');
@@ -359,17 +362,21 @@ async function consumeTextStream(body, expectedText, signal, onPhase, classifySe
       observe('terminal');
     }
   }
-  let iterator, finished = false;
+  let iterator, finished = false, pendingRead, streamFailure, interruptionError;
   let interrupted;
-  const interruption = new Promise((_, reject) => { interrupted = () => reject(new ProbeError('SESSION_OPERATION_ABORTED')); });
+  const interruption = new Promise((_, reject) => { interrupted = () => {
+    interruptionError ??= new ProbeError('SESSION_OPERATION_ABORTED'); reject(interruptionError);
+  }; });
   void interruption.catch(() => {});
   signal?.addEventListener('abort', interrupted, { once: true });
   if (signal?.aborted) interrupted();
   try {
     iterator = body[Symbol.asyncIterator]();
     for (;;) {
-      if (signal?.aborted) fail('SESSION_OPERATION_ABORTED');
-      const part = await Promise.race([iterator.next(), interruption]);
+      if (signal?.aborted) { interrupted(); throw interruptionError; }
+      const reading = iterator.next();
+      if (awaitCleanup) { pendingRead = Promise.resolve(reading); void pendingRead.catch(() => {}); }
+      const part = await Promise.race([awaitCleanup ? pendingRead : reading, interruption]);
       if (part.done) { finished = true; break; }
       const chunk = part.value;
       total += chunk.length;
@@ -385,13 +392,24 @@ async function consumeTextStream(body, expectedText, signal, onPhase, classifySe
     if (buffer.trim()) consume(buffer);
     observe('stream_end');
   } catch (error) {
+    streamFailure = error;
     if (error instanceof ProbeError) throw error;
     fail('STREAM_INTERRUPTED');
   } finally {
     signal?.removeEventListener('abort', interrupted);
     if (!finished && iterator?.return) {
       if (awaitCleanup) {
-        try { await iterator.return(); } catch { fail('STREAM_CLEANUP_FAILED'); }
+        let cleanupFailed = false;
+        try { await iterator.return(); } catch (error) {
+          // Native fetch may error its owned body with the very same abort
+          // object. This is settled cancellation, not an independent cleanup
+          // failure. Similar codes/names and prior parser errors do not count.
+          cleanupFailed = !(streamFailure === interruptionError && interruptionError && error === signal?.reason);
+        }
+        // A resolving return() alone cannot attest an outstanding read.
+        if (pendingRead) try { await pendingRead; } catch { /* observed settled */ }
+        if (cleanupFailed) fail('STREAM_CLEANUP_FAILED');
+        if (streamFailure === interruptionError && interruptionError) SETTLED_PLAN_CANCELLATIONS.add(interruptionError);
       } else void Promise.resolve(iterator.return()).catch(() => {});
     }
   }

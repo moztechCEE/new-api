@@ -4,7 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { types } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import { corelyPlanPayload } from './siwc-local-model-port.mjs';
-import { consumePlanTextStream, isSettledPlanOutputFailure, MODEL, ProbeError } from './siwc-local-runtime.mjs';
+import { consumePlanTextStream, isSettledPlanOutputFailure, isSettledPlanCancellation, MODEL, ProbeError } from './siwc-local-runtime.mjs';
 import { ModelContractError, snapshotModelRequest, snapshotModelResult } from './corely-model-contract.mjs';
 
 const OWNER_TTL_MS = 120_000, CALL_TTL_MS = 60_000, MAX_CALLS = 100;
@@ -104,6 +104,21 @@ function ownData(input, allowed, code) {
     }
     return result;
   } catch { reject(code); }
+}
+
+/** Trusted attempt callback context only, never a request/wire option. */
+function localPurposeAllowance(value, alias) {
+  if (value === undefined) return undefined;
+  const keys = ['version', 'accountAlias', 'providerWorkLimitMs', 'cancellationDrainLimitMs', 'beginTimeoutDrain'];
+  const data = ownData(value, keys, 'INVALID_REQUEST');
+  if (!Object.isFrozen(value) || Object.keys(data).length !== keys.length || data.version !== 1 || data.accountAlias !== alias ||
+      typeof data.providerWorkLimitMs !== 'number' || !Number.isFinite(data.providerWorkLimitMs) || data.providerWorkLimitMs <= 0 || data.providerWorkLimitMs > CALL_TTL_MS ||
+      data.cancellationDrainLimitMs !== 5000 || typeof data.beginTimeoutDrain !== 'function' || types.isProxy(data.beginTimeoutDrain)) reject('INVALID_REQUEST');
+  return Object.freeze({ providerWorkLimitMs: data.providerWorkLimitMs, beginTimeoutDrain() {
+    const result = Reflect.apply(data.beginTimeoutDrain, value, []);
+    if (types.isPromise(result)) void Promise.prototype.then.call(result, undefined, () => {});
+    if (result !== undefined) reject('INVALID_REQUEST');
+  } });
 }
 
 function localAccountsSnapshot(config) {
@@ -542,18 +557,33 @@ export function createCodexLocalGatewayModelTransports(options) {
         modelFinished = true; operationFinished = true; operationOutcome = providerFailure;
         providerFailureReason = reason; return providerFailure;
       };
-      const modelOperation = async operationSignal => {
+      const modelOperation = async (operationSignal, allowanceValue) => {
         activeCheck(ownerActive);
         if (operationStarted) { operationInvalid = true; reject('GATEWAY_REPLAY_OR_CAPACITY'); }
         if (types.isProxy(operationSignal) || !(operationSignal instanceof AbortSignal)) reject('INVALID_REQUEST');
+        const allowance = localPurposeAllowance(allowanceValue, alias);
+        if (allowance && !allowFailure) reject('INVALID_REQUEST');
         operationStarted = true;
         providerOperationPending = !!providerWorkAttempt;
+        let softTimer, softTimedOut = false, drainHookRejected = false, ownedFetch, ownedConsumer, drainActive;
+        const timeoutReason = Object.freeze(new CodexLocalGatewayError('GATEWAY_TIMEOUT'));
+        const parserSoft = allowance ? new AbortController() : undefined, fetchSoft = allowance ? new AbortController() : undefined;
         try {
           modelDeadline = AbortSignal.timeout(CALL_TTL_MS);
-          modelActive = AbortSignal.any([ownerActive, operationSignal, modelDeadline]);
+          drainActive = AbortSignal.any([ownerActive, operationSignal, modelDeadline]);
+          modelActive = allowance ? AbortSignal.any([drainActive, fetchSoft.signal]) : drainActive;
+          const consumerActive = allowance ? AbortSignal.any([drainActive, parserSoft.signal]) : modelActive;
+          if (allowance) softTimer = setTimeout(() => {
+            if (operationFinished || modelFinished) return;
+            softTimedOut = true;
+            try { activeCheck(drainActive); allowance.beginTimeoutDrain(); } catch { drainHookRejected = true; }
+            // Give the parser its own attributable interruption before the
+            // physical body reports the transport abort. Both remain owned.
+            parserSoft.abort(timeoutReason); fetchSoft.abort(timeoutReason);
+          }, Math.ceil(allowance.providerWorkLimitMs));
           if (timing) modelActive.addEventListener('abort', observeModelAbort, { once: true });
           let fetchSettled = false;
-          const fetching = Promise.resolve().then(() => {
+          const fetching = ownedFetch = Promise.resolve().then(() => {
             activeCheck(modelActive);
             if (before.expiresAt <= clock()) reject('ATTESTATION_FAILED');
             // This configured invocation is not proof of upstream TCP dispatch.
@@ -592,7 +622,7 @@ export function createCodexLocalGatewayModelTransports(options) {
           const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
           if (media !== 'text/event-stream') reject('GATEWAY_RESPONSE_INVALID');
           let receipt;
-          try { receipt = await whileActive(observeLocalWork('consumer', () => consumePlanTextStream(responseBody, modelActive,
+          try { receipt = await whileActive(ownedConsumer = observeLocalWork('consumer', () => consumePlanTextStream(responseBody, consumerActive,
             timing ? phase => timing.mark(phase) : undefined,
             allowFailure ? { classifySettledOutputFailure: true, awaitCleanup: true } : undefined)), modelActive); }
           catch (error) {
@@ -621,7 +651,38 @@ export function createCodexLocalGatewayModelTransports(options) {
           }
           if (providerWorkAttempt) activeCheck(modelActive);
           modelFinished = true; operationFinished = true; operationOutcome = result; return result;
-        } finally { providerOperationPending = false; }
+        } catch (error) {
+          if (!allowance || !softTimedOut) throw error;
+          // The original hard work/caller/owner limits bound this drain. A
+          // timeout race, headers or cancel invocation are not settlement.
+          try {
+            activeCheck(drainActive);
+            const fetched = ownedFetch ? await whileActive(ownedFetch.then(value => ({ value }), error => ({ error, failed: true })), drainActive) : null;
+            activeCheck(drainActive);
+            if (!fetched) reject('GATEWAY_UNAVAILABLE');
+            if (fetched.failed) {
+              if (fetched.error !== timeoutReason && !isCodexLocalProviderNetworkFailure(fetched.error)) throw fetched.error;
+            } else {
+              const value = fetched.value;
+              if (!value || types.isProxy(value) || !(value instanceof Response) || value.redirected || (value.url && value.url !== endpoint)) reject('GATEWAY_RESPONSE_INVALID');
+              if (!value.ok && ![401, 408, 429, 504].includes(value.status) && !(value.status >= 500 && value.status <= 599)) reject('GATEWAY_HTTP_FAILURE');
+              if (ownedConsumer) {
+                const consumed = await whileActive(Promise.resolve(ownedConsumer).then(value => ({ value }), error => ({ error, failed: true })), drainActive);
+                activeCheck(drainActive);
+                if (consumed.failed && !isSettledPlanCancellation(consumed.error)) throw consumed.error;
+              }
+              try { await whileActive(cancelOwnedResponse(value), drainActive); }
+              catch (cancelError) {
+                // An already errored native body rejects cancel with the exact
+                // owned abort object. Its real cleanup promise still settled.
+                if (cancelError !== timeoutReason) throw cancelError;
+              }
+              activeCheck(drainActive);
+            }
+            if (drainHookRejected) reject('GATEWAY_UNAVAILABLE');
+            return settledFailure('TIMEOUT');
+          } catch (drainError) { close(); throw drainError; }
+        } finally { clearTimeout(softTimer); providerOperationPending = false; }
       };
       let result;
       if (providerWorkAttempt) {
@@ -632,9 +693,9 @@ export function createCodexLocalGatewayModelTransports(options) {
             if (dispatchStarted) { operationInvalid = true; reject('GATEWAY_REPLAY_OR_CAPACITY'); }
             if (types.isProxy(guardSignal) || !(guardSignal instanceof AbortSignal)) reject('INVALID_REQUEST');
             guardSignal.throwIfAborted(); dispatchStarted = true; providerDispatchPending = true;
-            try { return await providerWorkAttempt.run(workSignal => {
+            try { return await providerWorkAttempt.run((workSignal, allowance) => {
               if (types.isProxy(workSignal) || !(workSignal instanceof AbortSignal)) reject('INVALID_REQUEST');
-              const work = modelOperation(AbortSignal.any([guardSignal, workSignal]));
+              const work = modelOperation(AbortSignal.any([guardSignal, workSignal]), allowance);
               void work.then(() => {}, () => {}); return work;
             }); } finally { providerDispatchPending = false; }
           })();

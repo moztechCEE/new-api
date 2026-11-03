@@ -11,6 +11,7 @@ import {
   ISSUER, RESOURCE, MODEL, PROBE_INPUT, PROBE_OUTPUT, SCOPES, ProbeError,
   createAttempt, consumeCallback, validateSession, publicJson, selectExactModel,
   syntheticRequest, consumeProbeStream, runSyntheticProbe, inferenceFailureDiagnostic, inferenceErrorClasses, digest,
+  consumePlanTextStream, isSettledPlanCancellation,
 } from './siwc-local-runtime.mjs';
 import { loadRegistration, saveRegistration, startLocalPilot } from './siwc-local-pilot.mjs';
 
@@ -124,6 +125,38 @@ test('normal Info OAuth can run bounded Corely model work without exposing or pe
   assert.equal(providerCalls, 1); assert.equal(revoked, true);
   const disk = await readFile(registrationPath, 'utf8'); assert.doesNotMatch(disk, /synthetic-access-token|synthetic-refresh-token|id_token/);
   await assert.rejects(retainedPort.generate({}, new AbortController().signal), { code: 'SESSION_OPERATION_ABORTED' });
+});
+
+test('parser cancellation waits for both iterator return and its real outstanding read before private settlement branding', async () => {
+  let releaseRead, enteredReturn; const next = new Promise(resolve => { releaseRead = resolve; });
+  const returned = new Promise(resolve => { enteredReturn = resolve; });
+  const controller = new AbortController();
+  const body = { [Symbol.asyncIterator]() { return { next: () => next, return: async () => { enteredReturn(); return { done: true }; } }; } };
+  let settled = false;
+  const pending = consumePlanTextStream(body, controller.signal, undefined, { classifySettledOutputFailure: true, awaitCleanup: true })
+    .catch(error => { settled = true; return error; });
+  controller.abort(Object.freeze({ privateOwnedAbort: true })); await returned;
+  for (let index = 0; index < 10; index++) await Promise.resolve();
+  assert.equal(settled, false, 'return() alone cannot account for the still pending next()');
+  releaseRead({ done: true }); const error = await pending;
+  assert.equal(error.code, 'SESSION_OPERATION_ABORTED'); assert.equal(isSettledPlanCancellation(error), true);
+  assert.equal(isSettledPlanCancellation(new ProbeError('SESSION_OPERATION_ABORTED')), false);
+});
+test('only the exact owned abort can settle an errored iterator; prior parser and foreign cleanup failures stay fatal', async () => {
+  for (const mode of ['owned', 'foreign', 'parser']) {
+    const controller = new AbortController(), owned = Object.freeze({ owned: true }); let nextReject, didReturn;
+    const next = new Promise((_resolve, reject) => { nextReject = reject; });
+    void next.catch(() => {});
+    const body = { [Symbol.asyncIterator]() { let first = true; return {
+      next() { if (mode === 'parser' && first) { first = false; return Promise.resolve({ done: false, value: new TextEncoder().encode('data: not-json\n\n') }); } return next; },
+      async return() { didReturn = true; throw mode === 'foreign' ? new Error('foreign') : owned; },
+    }; } };
+    const pending = consumePlanTextStream(body, controller.signal, undefined, { classifySettledOutputFailure: true, awaitCleanup: true }).catch(error => error);
+    if (mode === 'parser') { for (let index = 0; index < 10; index++) await Promise.resolve(); }
+    controller.abort(owned); nextReject(owned); const error = await pending;
+    assert.equal(didReturn, true); assert.equal(isSettledPlanCancellation(error), mode === 'owned');
+    assert.equal(error.code, mode === 'owned' ? 'SESSION_OPERATION_ABORTED' : 'STREAM_CLEANUP_FAILED');
+  }
 });
 
 test('owner pilot rejects invalid options before opening a listener or registration', async () => {

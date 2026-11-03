@@ -51,12 +51,12 @@ function harness(t, options = {}) {
 }
 const run = (state, input = request(), alias = 'info', signal = new AbortController().signal) => state.instance.ports[alias].generate(input, signal);
 const flush = async () => { for (let index = 0; index < 30; index++) await Promise.resolve(); };
-function providerWorkAttempt(events, signal = new AbortController().signal) {
+function providerWorkAttempt(events, signal = new AbortController().signal, allowance) {
   let output, completed = false;
   const attempt = Object.freeze({ async run(operation) {
     assert.equal(this, attempt, 'the original opaque attempt is not cloned');
     events.push('work-start');
-    try { output = await operation(signal); completed = true; return output; }
+    try { output = await (allowance === undefined ? operation(signal) : operation(signal, allowance)); completed = true; return output; }
     finally { events.push('work-end'); }
   } });
   return { attempt, output: () => output, completed: () => completed };
@@ -2135,4 +2135,207 @@ test('bounded timing history reports dropped observations without changing subse
   assert.equal(snapshot.records.length, 32); assert.equal(snapshot.droppedCount, 2);
   assert.equal(snapshot.records[0].attempt, 1); assert.equal(snapshot.records.at(-1).attempt, 32);
   assert.equal(state.calls.length, 34); assert.equal(state.checks.length, 68);
+});
+
+function purposeBudget(t, { alias = 'info', limit = 12.5, onDrain } = {}) {
+  const timers = [], cleared = [], deadlines = [];
+  t.mock.method(globalThis, 'setTimeout', (callback, milliseconds) => {
+    const handle = { callback, milliseconds, unref() {} }; timers.push(handle); return handle;
+  });
+  t.mock.method(globalThis, 'clearTimeout', handle => { cleared.push(handle); });
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    const controller = new AbortController(); deadlines.push({ milliseconds, controller }); return controller.signal;
+  });
+  let drains = 0;
+  const allowance = Object.freeze({ version: 1, accountAlias: alias, providerWorkLimitMs: limit,
+    cancellationDrainLimitMs: 5000, beginTimeoutDrain() { assert.equal(this, allowance); drains++; return onDrain?.(); } });
+  return { allowance, timers, cleared, deadlines, drains: () => drains,
+    fire() { const candidates = timers.filter(timer => timer.milliseconds === Math.ceil(limit));
+      assert.equal(candidates.length, 1); candidates[0].callback(); } };
+}
+function assertLocallySettled(state) {
+  const snapshot = gateway.codexLocalGatewaySettlementSnapshot(state.instance);
+  assert.equal(snapshot.pendingFetch + snapshot.pendingConsumers + snapshot.pendingCleanup, 0);
+  assert.equal(snapshot.fetchStarted, snapshot.fetchSettled);
+  assert.equal(snapshot.consumerStarted, snapshot.consumerSettled);
+  assert.equal(snapshot.cleanupStarted, snapshot.cleanupSettled);
+}
+
+test('local fractional purpose allowance leaves successful payload, usage, proof and legacy deadlines unchanged', async t => {
+  const budget = purposeBudget(t), state = providerFailureHarness(t, { config: { diagnostics: true } });
+  const result = await runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt);
+  assert.equal(result.status, 'success'); assert.deepEqual(result.usage, { inputTokens: 20, outputTokens: 7, cachedInputTokens: 3 });
+  assert.equal(budget.drains(), 0); assert.deepEqual(state.checks.map(check => check.phase), ['before', 'after']);
+  assert.deepEqual(budget.deadlines.map(row => row.milliseconds), [5000, 60000, 5000]);
+  assert.ok(budget.cleared.includes(budget.timers.find(timer => timer.milliseconds === 13)));
+  assert.equal(JSON.stringify(JSON.parse(state.calls[0].init.body)).includes('providerWorkLimitMs'), false);
+  assertLocallySettled(state);
+});
+test('soft purpose timeout waits for the actual owned fetch rejection and after-proof before TIMEOUT receipt', async t => {
+  const budget = purposeBudget(t), entered = deferred(), rejected = deferred(), after = deferred(); let modelSignal;
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: (_url, init) => {
+    modelSignal = init.signal; entered.resolve(); return rejected.promise;
+  }, attest: async (context, proof) => { if (context.phase === 'after') await after.promise; return proof; } });
+  const work = providerWorkAttempt([], undefined, budget.allowance); let returned = false;
+  const pending = runProviderWork(state, work.attempt).then(value => { returned = true; return value; });
+  await entered.promise; budget.fire(); await flush();
+  assert.equal(budget.drains(), 1); assert.equal(modelSignal.aborted, true); assert.equal(returned, false);
+  assert.equal(work.completed(), false); assert.equal(state.checks.length, 1);
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingFetch, 1);
+  rejected.reject(modelSignal.reason); await flush();
+  assert.equal(returned, false); assert.equal(work.completed(), true); assert.equal(state.checks.length, 2);
+  assertLocallySettled(state); after.resolve();
+  const result = await pending;
+  assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'TIMEOUT');
+  assert.equal(result.operationSettled, true); assert.equal(Object.hasOwn(result, 'usage'), false);
+  assert.equal(result.accountAlias, 'info'); assert.equal(result.callId, request().callId);
+});
+test('soft purpose timeout waits for real SSE read and cancellation settlement, including the exact owned abort reason', async t => {
+  const budget = purposeBudget(t), started = deferred(); let stream, fetchSignal;
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: (_url, init) => {
+    fetchSignal = init.signal;
+    return new Response(new ReadableStream({ start(controller) { stream = controller; started.resolve(); } }),
+      { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const work = providerWorkAttempt([], undefined, budget.allowance); let returned = false;
+  const pending = runProviderWork(state, work.attempt).then(value => { returned = true; return value; });
+  await started.promise; await flush(); budget.fire(); await flush();
+  assert.equal(returned, false); assert.equal(work.completed(), false); assert.equal(state.checks.length, 1);
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingConsumers, 1);
+  stream.error(fetchSignal.reason);
+  const result = await pending; assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'TIMEOUT');
+  assert.equal(result.operationSettled, true); assertLocallySettled(state);
+  assert.deepEqual(state.checks.map(check => check.phase), ['before', 'after']);
+});
+test('soft purpose timeout does not publish while HTTP body cancellation is still pending', async t => {
+  const budget = purposeBudget(t), cancelling = deferred(), release = deferred();
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+    cancel() { cancelling.resolve(); return release.promise; },
+  }), { status: 503 }) });
+  const work = providerWorkAttempt([], undefined, budget.allowance); let returned = false;
+  const pending = runProviderWork(state, work.attempt).then(value => { returned = true; return value; });
+  await cancelling.promise; budget.fire(); await flush();
+  assert.equal(returned, false); assert.equal(work.completed(), false); assert.equal(state.checks.length, 1);
+  assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingCleanup, 1);
+  release.resolve(); const result = await pending;
+  assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'TIMEOUT'); assertLocallySettled(state);
+});
+test('prior refusal and malformed SSE are never laundered by a later purpose timeout', async t => {
+  for (const [name, frame] of [
+    ['refusal', 'data: {"type":"response.refusal.delta","delta":"PRIVATE_REFUSAL"}\n\n'],
+    ['parser', 'data: not-json\n\n'],
+  ]) {
+    await t.test(name, async child => {
+      const budget = purposeBudget(child), cancelling = deferred(), release = deferred();
+      const state = providerFailureHarness(child, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode(frame)); },
+        cancel() { cancelling.resolve(); return release.promise; },
+      }), { headers: { 'content-type': 'text/event-stream' } }) });
+      const pending = runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt);
+      const rejected = assert.rejects(pending, error => ['GATEWAY_CLOSED', 'GATEWAY_RESPONSE_INVALID'].includes(error.code));
+      await cancelling.promise; budget.fire(); await flush(); release.resolve(); await rejected;
+      assert.equal(state.checks.length, 1); assertLocallySettled(state);
+    });
+  }
+});
+test('invalid usage stays a fatal parser failure with a local purpose allowance', async t => {
+  const budget = purposeBudget(t), state = providerFailureHarness(t, { fetch: () => sse(completion('合成回覆。', { usage: null })) });
+  await assert.rejects(runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt), { code: 'GATEWAY_RESPONSE_INVALID' });
+  assert.equal(budget.drains(), 0); assert.equal(state.checks.length, 1);
+});
+test('uncooperative fetch remains HOLD after the hard caller cap and late settlement cannot resurrect the owner', async t => {
+  const budget = purposeBudget(t), hard = new AbortController(), entered = deferred(), response = deferred();
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => { entered.resolve(); return response.promise; } });
+  const pending = runProviderWork(state, providerWorkAttempt([], hard.signal, budget.allowance).attempt);
+  const rejected = assert.rejects(pending, error => ['GATEWAY_CLOSED', 'GATEWAY_ABORTED'].includes(error.code));
+  await entered.promise; budget.fire(); await flush(); hard.abort(0); await rejected;
+  assert.equal(state.checks.length, 1); assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingFetch, 1);
+  response.resolve(sse()); await flush(); assertLocallySettled(state);
+  await assert.rejects(run(state, request('late-owner-reuse')), { code: 'GATEWAY_CLOSED' });
+});
+test('a cooperative timeout cannot bypass caller cancellation or a changed source after-proof', async t => {
+  for (const mode of ['caller', 'source']) await t.test(mode, async child => {
+    const budget = purposeBudget(child), caller = new AbortController(), entered = deferred(), fetched = deferred(); let fetchSignal;
+    const state = providerFailureHarness(child, { config: { diagnostics: true }, fetch: (_url, init) => {
+      fetchSignal = init.signal; entered.resolve(); return fetched.promise;
+    }, attest: (context, proof) => context.phase === 'after' && mode === 'source' ? { ...proof, configurationRevision: 'b'.repeat(64) } : proof });
+    const pending = runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt, request(), caller.signal);
+    const rejected = assert.rejects(pending, error => mode === 'source' ? error.code === 'ATTESTATION_CHANGED'
+      : ['GATEWAY_CLOSED', 'GATEWAY_ABORTED'].includes(error.code));
+    await entered.promise; budget.fire(); if (mode === 'caller') caller.abort(false);
+    fetched.reject(fetchSignal.reason); await rejected; await flush(); assertLocallySettled(state);
+    assert.equal(state.checks.length, mode === 'source' ? 2 : 1);
+  });
+});
+test('only an exact frozen alias-bound allowance is accepted and hostile fields do not execute', async t => {
+  const valid = { version: 1, accountAlias: 'info', providerWorkLimitMs: 12.5, cancellationDrainLimitMs: 5000, beginTimeoutDrain() {} };
+  let traps = 0;
+  const getter = Object.freeze(Object.defineProperty({ ...valid }, 'providerWorkLimitMs', { get() { traps++; return 12.5; }, enumerable: true }));
+  const proxy = new Proxy(Object.freeze({ ...valid }), { ownKeys() { traps++; return []; } });
+  const cases = [valid, Object.freeze({ ...valid, accountAlias: 'eason' }), Object.freeze({ ...valid, providerWorkLimitMs: 0 }),
+    Object.freeze({ ...valid, providerWorkLimitMs: Infinity }), Object.freeze({ ...valid, cancellationDrainLimitMs: 5001 }),
+    Object.freeze({ ...valid, extra: true }), Object.freeze({ ...valid, beginTimeoutDrain: new Proxy(() => {}, { apply() { traps++; } }) }), getter, proxy];
+  for (let index = 0; index < cases.length; index++) {
+    const state = providerFailureHarness(t, { config: { diagnostics: true } });
+    await assert.rejects(runProviderWork(state, providerWorkAttempt([], undefined, cases[index]).attempt, request(`allowance-${index}`)),
+      { code: 'INVALID_REQUEST' });
+    assert.equal(state.calls.length, 0); assertLocallySettled(state);
+    assert.equal((await runProviderWork(state, providerWorkAttempt([]).attempt, request(`valid-after-allowance-${index}`))).status, 'success');
+  }
+  assert.equal(traps, 0);
+});
+test('a rejected drain hook remains HOLD and a cap bind getter is never invoked', async t => {
+  const budget = purposeBudget(t, { onDrain: () => { throw 0; } }), entered = deferred(), fetched = deferred(); let fetchSignal;
+  const state = providerFailureHarness(t, { fetch: (_url, init) => { fetchSignal = init.signal; entered.resolve(); return fetched.promise; } });
+  const pending = runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt);
+  const rejected = assert.rejects(pending, { code: 'GATEWAY_CLOSED' });
+  await entered.promise; budget.fire(); fetched.reject(fetchSignal.reason); await rejected; assert.equal(state.checks.length, 1);
+  let traps = 0;
+  const hook = Object.defineProperty(() => {}, 'bind', { get() { traps++; throw new Error('PRIVATE_BIND_GETTER'); } });
+  const safe = Object.freeze({ ...budget.allowance, beginTimeoutDrain: hook });
+  const next = providerFailureHarness(t); assert.equal((await runProviderWork(next, providerWorkAttempt([], undefined, safe).attempt)).status, 'success');
+  assert.equal(traps, 0);
+});
+test('an asynchronous drain hook is rejected without adopting a returned promise or publishing a receipt', async t => {
+  const budget = purposeBudget(t, { onDrain: () => Promise.reject(new Error('PRIVATE_ASYNC_DRAIN')) });
+  const entered = deferred(), fetched = deferred(); let fetchSignal;
+  const state = providerFailureHarness(t, { fetch: (_url, init) => { fetchSignal = init.signal; entered.resolve(); return fetched.promise; } });
+  const pending = runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt);
+  const rejected = assert.rejects(pending, { code: 'GATEWAY_CLOSED' });
+  await entered.promise; budget.fire(); fetched.reject(fetchSignal.reason); await rejected; await flush();
+  assert.equal(state.checks.length, 1);
+});
+test('a policy-denied response never becomes TIMEOUT fallback even when its body cleanup crosses the soft deadline', async t => {
+  const budget = purposeBudget(t), cancelling = deferred(), release = deferred();
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+    cancel() { cancelling.resolve(); return release.promise; },
+  }), { status: 403 }) });
+  const pending = runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt);
+  const rejected = assert.rejects(pending, { code: 'GATEWAY_CLOSED' });
+  await cancelling.promise; budget.fire(); await rejected;
+  assert.equal(state.checks.length, 1); assert.equal(gateway.codexLocalGatewaySettlementSnapshot(state.instance).pendingCleanup, 1);
+  release.resolve(); await flush(); assertLocallySettled(state);
+});
+test('foreign stream cleanup failure remains HOLD even if its name resembles an abort', async t => {
+  const budget = purposeBudget(t); let stream;
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: () => new Response(new ReadableStream({
+    start(controller) { stream = controller; },
+  }), { headers: { 'content-type': 'text/event-stream' } }) });
+  const pending = runProviderWork(state, providerWorkAttempt([], undefined, budget.allowance).attempt);
+  const rejected = assert.rejects(pending, { code: 'GATEWAY_CLOSED' });
+  await flush(); budget.fire(); await flush(); stream.error(new DOMException('PRIVATE_FOREIGN', 'AbortError')); await rejected;
+  assert.equal(state.checks.length, 1); assertLocallySettled(state);
+});
+test('the same bounded purpose contract applies to the original Eason port without an Info dispatch', async t => {
+  const budget = purposeBudget(t, { alias: 'eason', limit: 1 }), entered = deferred(), fetched = deferred(); let fetchSignal;
+  const state = providerFailureHarness(t, { config: { diagnostics: true }, fetch: (_url, init) => {
+    fetchSignal = init.signal; entered.resolve(); return fetched.promise;
+  } });
+  const work = providerWorkAttempt([], undefined, budget.allowance), input = request('eason-allowance');
+  const pending = state.instance.ports.eason.generateWithProviderWork(input, new AbortController().signal, work.attempt);
+  await entered.promise; budget.fire(); fetched.reject(fetchSignal.reason);
+  const result = await pending;
+  assert.equal(result.status, 'provider_failure'); assert.equal(result.reason, 'TIMEOUT'); assert.equal(result.accountAlias, 'eason');
+  assert.equal(state.calls.length, 1); assert.equal(state.calls[0].init.headers.Authorization, `Bearer ${TOKENS.eason}`);
+  assert.deepEqual(state.checks.map(check => check.binding.accountAlias), ['eason', 'eason']); assertLocallySettled(state);
 });
