@@ -86,6 +86,8 @@ async function privateWrite(root, filename, value, { exclusive = false } = {}) {
 }
 
 const LOCK_KIND = 'NEW_API_SIWC_PROCESS_LOCK';
+const LOCK_NONCE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MAX_LOCK_PREDECESSORS = 8;
 const sameInode = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const privateLockFile = stat => stat.isFile() && stat.nlink === 1 && (stat.mode & 0o777) === 0o600 &&
   stat.size <= 4096 && (!process.getuid || stat.uid === process.getuid());
@@ -112,10 +114,14 @@ async function processWitness() {
 }
 
 function validLockRecord(record) {
-  if (!sameKeys(record, ['kind', 'version', 'nonce', 'owner']) || Object.keys(record).length !== 4 ||
-    record.kind !== LOCK_KIND || record.version !== 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.nonce ?? '') ||
+  const keys = record?.version === 1 ? ['kind', 'version', 'nonce', 'owner'] : ['kind', 'version', 'nonce', 'owner', 'predecessorNonces'];
+  if (!sameKeys(record, keys) || Object.keys(record).length !== keys.length ||
+    record.kind !== LOCK_KIND || ![1, 2].includes(record.version) || !LOCK_NONCE.test(record.nonce ?? '') ||
     !sameKeys(record.owner, ['pid', 'bootId', 'pidNamespace', 'startTicks']) || Object.keys(record.owner).length !== 4 ||
     !Number.isSafeInteger(record.owner.pid) || record.owner.pid < 1) return false;
+  if (record.version === 2 && (!Array.isArray(record.predecessorNonces) || record.predecessorNonces.length > MAX_LOCK_PREDECESSORS ||
+    new Set(record.predecessorNonces).size !== record.predecessorNonces.length ||
+    record.predecessorNonces.some(nonce => !LOCK_NONCE.test(nonce) || nonce === record.nonce))) return false;
   const { bootId, pidNamespace, startTicks } = record.owner;
   return (bootId === null && pidNamespace === null && startTicks === null) ||
     (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(bootId ?? '') &&
@@ -183,12 +189,12 @@ export async function acquireSessionProcessLock(root, filename) {
       try { await lstat(recoveryPath); return true; }
       catch (error) { if (error.code === 'ENOENT') return false; throw error; }
     };
-    const createLock = async path => {
+    const createLock = async (path, predecessorNonces = []) => {
       let handle;
       try {
         await checkDirectory();
         handle = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-        const record = { kind: LOCK_KIND, version: 1, nonce: randomUUID(), owner: witness };
+        const record = { kind: LOCK_KIND, version: 2, nonce: randomUUID(), owner: witness, predecessorNonces: [...predecessorNonces] };
         await handle.writeFile(JSON.stringify(record)); await handle.sync();
         const stat = await handle.stat(), current = await readLock(path);
         if (!sameInode(stat, current.stat) || current.record.nonce !== record.nonce) fail('SESSION_BUSY_OR_LOCKED');
@@ -221,11 +227,16 @@ export async function acquireSessionProcessLock(root, filename) {
         if (!await ownerProvenDead(stale.record.owner, witness)) fail('SESSION_BUSY_OR_LOCKED');
         recovery = await createLock(recoveryPath);
         const current = await readLock(lockPath), sentinel = await readLock(recoveryPath);
-        if (!sameInode(stale.stat, current.stat) || stale.record.nonce !== current.record.nonce ||
+        if (!sameInode(stale.stat, current.stat) || JSON.stringify(stale.record) !== JSON.stringify(current.record) ||
           !sameInode(recovery.stat, sentinel.stat) || recovery.record.nonce !== sentinel.record.nonce ||
           !await ownerProvenDead(current.record.owner, witness)) fail('SESSION_BUSY_OR_LOCKED');
+        // Retain bounded, private predecessor evidence before replacing the
+        // owner. A second crash must not orphan an older bound consent prompt.
+        // This is lock provenance only, never reusable authorization or a grant.
+        const predecessors = [...(current.record.predecessorNonces ?? []), current.record.nonce];
+        if (predecessors.length > MAX_LOCK_PREDECESSORS) fail('SESSION_BUSY_OR_LOCKED');
         await unlink(lockPath); await directory.sync();
-        lock = await createLock(lockPath);
+        lock = await createLock(lockPath, predecessors);
         recoveredOwnerNonce = current.record.nonce;
       }
       if (!recovery && await sentinelPresent()) fail('SESSION_BUSY_OR_LOCKED');
@@ -236,7 +247,8 @@ export async function acquireSessionProcessLock(root, filename) {
       // Lifecycle records may bind to this non-secret process lease. Only the
       // proven-dead, exact reclaimed owner is exposed, never a guessed owner.
       Object.defineProperties(release, { ownerNonce: { value: lock.record.nonce, enumerable: true },
-        recoveredOwnerNonce: { value: recoveredOwnerNonce, enumerable: true } });
+        recoveredOwnerNonce: { value: recoveredOwnerNonce, enumerable: true },
+        recoveredOwnerNonces: { value: Object.freeze([...lock.record.predecessorNonces]), enumerable: true } });
       return Object.freeze(release);
     } catch (error) {
       await cleanup();
@@ -542,15 +554,26 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
         accounts, accountOrder: ['info', 'eason'], apiFallbackEnabled: false, corelyRelayConnected: false,
         sendingCapability: false, learningCapability: false });
     },
-    async maintain(signal) {
+    async maintain(signal, options) {
+      if (options !== undefined && (!sameKeys(options, ['refresh']) || Object.keys(options).length !== 1 ||
+        typeof options.refresh !== 'boolean')) fail('SESSION_MANAGER_INVALID');
+      const refresh = options?.refresh ?? true;
       const results = [];
       for (const alias of ['info', 'eason']) {
         checkAbort(signal);
         const record = await store.read(alias);
-        clock(record);
+        const time = clock(record);
         if (!record) { results.push({ alias, state: 'not_connected' }); continue; }
         if (record.state !== 'active') {
           results.push({ alias, state: 'held', code: record.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED' });
+          continue;
+        }
+        if (!refresh) {
+          const metadata = sessionMetadata(record);
+          // Readiness inspection never renews the standby or claims that a due
+          // token is usable. The selected generate call re-reads under its own
+          // alias lock and refreshes within that call's original lease/deadline.
+          results.push(record.expiresAt <= time + 60000 ? Object.freeze({ ...metadata, state: 'renewal_due' }) : metadata);
           continue;
         }
         try { results.push(await withFreshRecord(alias, record => sessionMetadata(record), signal)); }

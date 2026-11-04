@@ -470,6 +470,9 @@ test('a proven exited same-namespace owner releases the alias without restoring 
   const stale = JSON.parse(await readFile(join(vm.root, 'info.lock'), 'utf8'));
   const recovered = await acquireSessionProcessLock(vm.root, 'info.lock');
   assert.equal(recovered.recoveredOwnerNonce, stale.nonce); assert.notEqual(recovered.ownerNonce, stale.nonce);
+  assert.deepEqual(recovered.recoveredOwnerNonces, [stale.nonce]);
+  assert.equal(Object.isFrozen(recovered.recoveredOwnerNonces), true);
+  assert.throws(() => recovered.recoveredOwnerNonces.push('not-a-verified-owner'), TypeError);
   assert.equal(Object.isFrozen(recovered), true);
   assert.throws(() => { recovered.recoveredOwnerNonce = 'not-a-verified-owner'; }, TypeError);
   assert.throws(() => Object.defineProperty(recovered, 'ownerNonce', { value: stale.nonce }), TypeError);
@@ -488,6 +491,52 @@ test('a proven exited same-namespace owner releases the alias without restoring 
   assert.equal((await vm.read('info')).refreshToken, 'synthetic-newest-disk-refresh');
   assert.equal((await vm.read('eason')).refreshToken, 'synthetic-eason-refresh');
   assert.deepEqual((await readdir(vm.root)).filter(name => name.includes('.lock')), []);
+});
+
+test('two successive exited owners retain bounded provenance for the original owner-bound prompt', { skip: process.platform !== 'linux' }, async t => {
+  const { vm } = await transferred(t), path = join(vm.root, 'info.lock');
+  leaveExitedOwnerLock(vm.root);
+  const first = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(first.version, 2); assert.deepEqual(first.predecessorNonces, []);
+  leaveExitedOwnerLock(vm.root);
+  const second = JSON.parse(await readFile(path, 'utf8'));
+  assert.deepEqual(second.predecessorNonces, [first.nonce]);
+  assert.notEqual(second.nonce, first.nonce);
+  const recovered = await acquireSessionProcessLock(vm.root, 'info.lock');
+  assert.equal(recovered.recoveredOwnerNonce, second.nonce);
+  assert.deepEqual(recovered.recoveredOwnerNonces, [first.nonce, second.nonce]);
+  const durable = JSON.parse(await readFile(path, 'utf8'));
+  assert.deepEqual(durable.predecessorNonces, recovered.recoveredOwnerNonces);
+  assert.equal(durable.nonce, recovered.ownerNonce);
+  assert.equal(Object.isFrozen(recovered.recoveredOwnerNonces), true);
+  assert.throws(() => { recovered.recoveredOwnerNonces[0] = recovered.ownerNonce; }, TypeError);
+  await recovered();
+  assert.equal((await vm.read('info')).state, 'active');
+});
+
+test('unknown, malformed or exhausted predecessor evidence holds without deleting the old owner', { skip: process.platform !== 'linux' }, async t => {
+  const predecessors = Array.from({ length: 9 }, (_, i) => `00000000-0000-4000-8000-${String(i + 1).padStart(12, '0')}`);
+  for (const kind of ['unknown version', 'missing lineage', 'unknown lineage field', 'non-array lineage', 'invalid nonce',
+    'duplicate nonce', 'self nonce', 'over capacity', 'capacity exhausted']) await t.test(kind, async t => {
+    const { vm } = await transferred(t), path = join(vm.root, 'info.lock');
+    leaveExitedOwnerLock(vm.root);
+    const stale = JSON.parse(await readFile(path, 'utf8'));
+    if (kind === 'unknown version') stale.version = 3;
+    if (kind === 'missing lineage') delete stale.predecessorNonces;
+    if (kind === 'unknown lineage field') stale.recoveredOwnerNonces = [predecessors[0]];
+    if (kind === 'non-array lineage') stale.predecessorNonces = 'unverified-predecessor';
+    if (kind === 'invalid nonce') stale.predecessorNonces = ['not-a-process-owner'];
+    if (kind === 'duplicate nonce') stale.predecessorNonces = [predecessors[0], predecessors[0]];
+    if (kind === 'self nonce') stale.predecessorNonces = [stale.nonce];
+    if (kind === 'over capacity') stale.predecessorNonces = predecessors;
+    if (kind === 'capacity exhausted') stale.predecessorNonces = predecessors.slice(0, 8);
+    const saved = JSON.stringify(stale);
+    await writeFile(path, saved, { mode: 0o600 });
+    await assert.rejects(acquireSessionProcessLock(vm.root, 'info.lock'), code('SESSION_BUSY_OR_LOCKED'));
+    assert.equal(await readFile(path, 'utf8'), saved);
+    assert.deepEqual((await readdir(vm.root)).filter(name => name.endsWith('.recovery')), []);
+    assert.equal((await vm.read('info')).state, 'active');
+  });
 });
 
 test('dead-owner recovery never replays an uncertain rotating refresh', { skip: process.platform !== 'linux' }, async t => {
@@ -527,6 +576,7 @@ test('a live alias owner is not stolen and cleanup never unlinks a replacement',
   const other = await openSessionStore(vm.root), path = join(vm.root, 'info.lock');
   const fresh = await acquireSessionProcessLock(vm.root, 'info.lock');
   assert.equal(fresh.recoveredOwnerNonce, null);
+  assert.deepEqual(fresh.recoveredOwnerNonces, []); assert.equal(Object.isFrozen(fresh.recoveredOwnerNonces), true);
   assert.match(fresh.ownerNonce, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.equal(Object.getOwnPropertyDescriptor(fresh, 'ownerNonce').writable, false); await fresh();
   await vm.locked('info', async () => {
@@ -553,6 +603,65 @@ test('maintenance keeps both account states visible and never renews uncertain o
     assert.equal(calls, 0); assert.equal(result.apiFallbackUsed, false);
     await assert.rejects(createPersistentPlanSessions(vm, { now: () => NOW }).maintain(), code('SESSION_CLOCK_INVALID'));
   });
+});
+
+test('preclaim inspection reads both accounts without network, locks or writes when standby renewal is due', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']), info = await vm.read('info');
+  await vm.write('info', { ...info, expiresAt: NOW + 3600000, updatedAt: NOW + 2000, revision: info.revision + 1 });
+  const before = { info: await readFile(join(vm.root, 'info.json'), 'utf8'), eason: await readFile(join(vm.root, 'eason.json'), 'utf8') };
+  const reads = []; let writes = 0, locks = 0, network = 0;
+  const store = { ...vm, read: async alias => { reads.push(alias); return vm.read(alias); },
+    write: async () => { writes++; throw new Error('INSPECTION_MUST_NOT_WRITE'); },
+    locked: async () => { locks++; throw new Error('INSPECTION_MUST_NOT_REFRESH'); } };
+  const sessions = createPersistentPlanSessions(store, { now: () => NOW + 250000,
+    fetchImpl: async () => { network++; throw new Error('STANDBY_PROVIDER_MUST_NOT_BE_CONTACTED'); } });
+  const result = await sessions.maintain(undefined, { refresh: false });
+  assert.deepEqual(reads, ['info', 'eason']); assert.equal(result.accounts[0].state, 'active');
+  assert.equal(result.accounts[1].alias, 'eason'); assert.equal(result.accounts[1].state, 'renewal_due');
+  assert.equal(result.accounts[1].expiresAt, (await vm.read('eason')).expiresAt);
+  assert.equal(Object.isFrozen(result.accounts[1]), true);
+  assert.deepEqual({ network, writes, locks }, { network: 0, writes: 0, locks: 0 });
+  assert.equal(await readFile(join(vm.root, 'info.json'), 'utf8'), before.info);
+  assert.equal(await readFile(join(vm.root, 'eason.json'), 'utf8'), before.eason);
+  assert.equal(result.apiFallbackUsed, false);
+  assert.doesNotMatch(JSON.stringify(result), /accessToken|refreshToken|idToken|nonce|synthetic-(?:info|eason)-(?:access|refresh)/);
+  const expired = await createPersistentPlanSessions(vm, { now: () => NOW + 350000,
+    fetchImpl: async () => { network++; throw new Error('EXPIRED_STANDBY_MUST_NOT_REFRESH_DURING_INSPECTION'); } }).maintain(undefined, { refresh: false });
+  assert.equal(expired.accounts[0].state, 'active'); assert.equal(expired.accounts[1].state, 'renewal_due');
+  assert.equal(network, 0); assert.equal((await vm.read('eason')).state, 'active');
+});
+
+test('selected generation still renews only its own due session after read-only preclaim inspection', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']), easonBefore = await readFile(join(vm.root, 'eason.json'), 'utf8');
+  const calls = [];
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async (url, init) => {
+    calls.push(url);
+    if (url === `${ISSUER}/api/accounts/oauth/token`) {
+      assert.equal(init.body.get('refresh_token'), 'synthetic-info-refresh');
+      return Response.json({ access_token: 'synthetic-selected-info-access', refresh_token: 'synthetic-selected-info-refresh', token_type: 'Bearer', expires_in: 3600 });
+    }
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-selected-info-access');
+    return url === `${RESOURCE}/models` ? catalog() : modelCompletion('Synthetic selected account reply.');
+  } });
+  const inspection = await sessions.maintain(undefined, { refresh: false });
+  assert.deepEqual(inspection.accounts.map(account => account.state), ['renewal_due', 'renewal_due']); assert.deepEqual(calls, []);
+  assert.equal((await sessions.generate('info', modelRequest(), new AbortController().signal)).status, 'success');
+  assert.deepEqual(calls, [`${ISSUER}/api/accounts/oauth/token`, `${RESOURCE}/models`, `${RESOURCE}/responses`]);
+  assert.equal((await vm.read('info')).refreshToken, 'synthetic-selected-info-refresh');
+  assert.equal(await readFile(join(vm.root, 'eason.json'), 'utf8'), easonBefore);
+});
+
+test('inspection rejects malformed mode options and still validates standby storage, clocks and cancellation', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']); let network = 0;
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000,
+    fetchImpl: async () => { network++; throw new Error('INSPECTION_MUST_NOT_CONTACT_PROVIDER'); } });
+  for (const options of [null, true, [], {}, { refresh: undefined }, { refresh: 0 }, { refresh: false, unknown: true },
+    Object.create({ refresh: false })]) await assert.rejects(sessions.maintain(undefined, options), code('SESSION_MANAGER_INVALID'));
+  await assert.rejects(createPersistentPlanSessions(vm, { now: () => NOW }).maintain(undefined, { refresh: false }), code('SESSION_CLOCK_INVALID'));
+  await assert.rejects(sessions.maintain(AbortSignal.abort(), { refresh: false }), code('SESSION_OPERATION_ABORTED'));
+  const path = join(vm.root, 'eason.json'); await chmod(path, 0o640);
+  await assert.rejects(sessions.maintain(undefined, { refresh: false }), code('SESSION_STORAGE_NOT_PRIVATE'));
+  assert.equal(network, 0);
 });
 
 test('only retained signed reauth state creates a bound predispatch account-unavailable witness', async t => {
@@ -631,7 +740,7 @@ test('post-dispatch failures and cancellation cannot be relabeled as predispatch
   await assert.rejects(sessions.generate('info', modelRequest(), new AbortController().signal), code('SESSION_REAUTH_REQUIRED'));
   assert.equal(modelCalls, 1); assert.equal((await vm.read('info')).state, 'active');
   const controller = new AbortController(); controller.abort();
-  await assert.rejects(sessions.generate('info', modelRequest({ callId: 'synthetic-aborted-call' }), controller.signal), code('SESSION_OPERATION_ABORTED'));
+  assert.throws(() => sessions.generate('info', modelRequest({ callId: 'synthetic-aborted-call' }), controller.signal), code('SESSION_OPERATION_ABORTED'));
 });
 
 test('uncertain refreshes, scope expansion and identity changes hold durably without replay or fallback', async t => {

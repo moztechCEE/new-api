@@ -13,7 +13,8 @@ import { openCorelyVmModelIdentity, openCorelyVmModelWorkerLifecycle, openCorely
 import { CORELY_VM_MODEL_JOB_SCOPE as SCOPE, CORELY_VM_MODEL_JOB_RESOURCE as RESOURCE,
   CORELY_VM_HOST_ID_HASH as HOST, CORELY_VM_VERIFICATION_URI as VERIFICATION } from './corely-vm-model-job-client.mjs';
 import { createSiwcModelTransports, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
-import { digest, MODEL } from './siwc-local-runtime.mjs';
+import { openSessionStore, createPersistentPlanSessions, SESSION_ACCOUNTS } from './siwc-local-sessions.mjs';
+import { digest, MODEL, ISSUER, SCOPES } from './siwc-local-runtime.mjs';
 
 const realFetch = globalThis.fetch;
 before(() => { globalThis.fetch = () => { throw new Error('EXTERNAL_NETWORK_DISABLED'); }; });
@@ -239,6 +240,48 @@ test('Linux lifecycle restart retires only its proven-dead owner prompt and requ
     assert.equal(await readFile(path, 'utf8'), legacy);
   });
 
+test('bounded proven-dead lineage survives another crash before pending consent retirement',
+  { skip: process.platform !== 'linux' }, async t => {
+    const workerUrl = import.meta.url.replace(/\.test\.mjs$/, '.mjs');
+    const sessionsUrl = new URL('./siwc-local-sessions.mjs', import.meta.url).href;
+    const exitWithPrompt = f => {
+      const source = `import { openCorelyVmModelWorkerLifecycle } from ${JSON.stringify(workerUrl)};
+        const lifecycle = await openCorelyVmModelWorkerLifecycle(${JSON.stringify(f.root)}, ${JSON.stringify(f.thumbprint)});
+        await lifecycle.presentConsent(${JSON.stringify(approval(f.thumbprint))}); process.exit(0);`;
+      assert.equal(spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', timeout: 10000 }).status, 0);
+    };
+    const exitAfterLockReclaim = f => {
+      // Stop at the exact intermediate state: the shared helper owns the new
+      // lock, but lifecycle code has not read or retired any prior prompt.
+      const source = `import { acquireSessionProcessLock } from ${JSON.stringify(sessionsUrl)};
+        await acquireSessionProcessLock(${JSON.stringify(f.root)}, ${JSON.stringify(LOCK_FILE)}); process.exit(0);`;
+      assert.equal(spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', timeout: 10000 }).status, 0);
+    };
+    await t.test('A prompt survives B crash and is retired only after C proves the bounded lineage', async t => {
+      const f = await identity(t); exitWithPrompt(f);
+      const path = join(f.root, PROMPT_FILE), previous = await readFile(path, 'utf8');
+      exitAfterLockReclaim(f);
+      assert.equal(await readFile(path, 'utf8'), previous, 'Reclaiming a lock alone does not activate or delete consent');
+      const next = await openCorelyVmModelWorkerLifecycle(f.root, f.thumbprint);
+      await assert.rejects(readFile(path), { code: 'ENOENT' });
+      const fresh = { ...approval(f.thumbprint), verificationUriComplete: `${VERIFICATION}?requestId=vm_models_${'t'.repeat(43)}` };
+      await next.presentConsent(fresh);
+      assert.equal(JSON.parse(await readFile(path)).verificationUriComplete, fresh.verificationUriComplete);
+      assert.notEqual(JSON.parse(await readFile(path)).ownerNonce, JSON.parse(previous).ownerNonce);
+      await next.close();
+    });
+    await t.test('a ninth predecessor cannot extend recovery or erase the pending prompt', async t => {
+      const f = await identity(t); exitWithPrompt(f);
+      const path = join(f.root, PROMPT_FILE), previous = await readFile(path, 'utf8');
+      // Eight is the protocol bound, not a stress test or age-based retry loop.
+      for (let predecessor = 0; predecessor < 8; predecessor++) exitAfterLockReclaim(f);
+      const lock = await readFile(join(f.root, LOCK_FILE), 'utf8');
+      await assert.rejects(openCorelyVmModelWorkerLifecycle(f.root, f.thumbprint), code('WORKER_ALREADY_RUNNING'));
+      assert.equal(await readFile(path, 'utf8'), previous);
+      assert.equal(await readFile(join(f.root, LOCK_FILE), 'utf8'), lock);
+    });
+  });
+
 test('restart cannot retire legacy, foreign, malformed or changed pending consent references',
   { skip: process.platform !== 'linux' }, async t => {
     const workerUrl = import.meta.url.replace(/\.test\.mjs$/, '.mjs');
@@ -460,6 +503,10 @@ test('account-local standby maintenance failure does not stop healthy Info or au
       assert.equal(f.completions.length, 1); assert.equal(f.failures.length, 0);
     });
   }
+  for (const expiresAt of [now + 30000, now - 1]) await t.test(`selected renewal remains required ${expiresAt > now ? 'near expiry' : 'expired'}`, async () => {
+    assert.doesNotThrow(() => assertCorelyVmModelSessionMaintenance(report({ ...active('info'), state: 'renewal_due', expiresAt },
+      { alias: 'eason', state: 'not_connected' }), now));
+  });
   await t.test('unavailable Info is not silently replaced without a producer-bound receipt', async () => {
     const f = workerFixture({ purposes: ['reply_generation'], maintainChange: async () => {
       assertCorelyVmModelSessionMaintenance(report({ alias: 'info', state: 'held', code: 'SESSION_REAUTH_REQUIRED' }, active('eason')), now);
@@ -477,6 +524,8 @@ test('account-local standby maintenance failure does not stop healthy Info or au
     ['cancelled', report(active('info'), { alias: 'eason', state: 'held', code: 'SESSION_OPERATION_ABORTED' })],
     ['duplicate alias', report(active('info'), active('info'))],
     ['expired primary', report({ ...active('info'), expiresAt: now }, active('eason'))],
+    ['renewal metadata too early', report({ ...active('info'), state: 'renewal_due', expiresAt: now + 60001 }, active('eason'))],
+    ['renewal missing identity', report({ ...active('info'), state: 'renewal_due', expiresAt: now - 1, identityVerified: false }, active('eason'))],
     ['API flag', { ...report(active('info'), active('eason')), apiFallbackUsed: true }],
     ['missing account', { ...report(active('info'), active('eason')), accounts: [active('info')] }],
   ]) await t.test(name, async () => {
@@ -484,6 +533,46 @@ test('account-local standby maintenance failure does not stop healthy Info or au
     await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_SESSION_HELD'));
     assert.equal(f.claims.length, 0); assert.equal(f.generated.length, 0); assert.equal(f.completions.length, 0);
   });
+});
+
+test('preclaim inspection never waits for a slow standby refresh while selected Info still uses the real session port', { timeout: 5000 }, async t => {
+  const storageFixture = await storage(t), store = await openSessionStore(storageFixture.root), now = Date.now();
+  // These are literal private fixture records, not native credentials or a
+  // new login. Signed callback/refresh admission has its own session tests.
+  for (const alias of ['info', 'eason']) await store.write(alias, {
+    kind: 'NEW_API_SIWC_DEV_SESSION', version: 1, alias, email: SESSION_ACCOUNTS[alias], issuer: ISSUER,
+    hostId: store.host.hostId, authorizationHostId: store.host.hostId, state: 'active', clientId: `synthetic_${alias}_client`,
+    subjectHash: digest(`synthetic-${alias}-subject`), accessToken: `synthetic-${alias}-access`, refreshToken: `synthetic-${alias}-refresh`,
+    idToken: `synthetic-${alias}-id`, nonce: `synthetic-${alias}-nonce`, scopes: SCOPES.split(' '),
+    expiresAt: now + (alias === 'info' ? 120000 : 10000), createdAt: now - 1000, updatedAt: now - 1000, revision: 3,
+  });
+  let refreshCalls = 0; const modelRoutes = [];
+  const sessions = createPersistentPlanSessions(store, { fetchImpl: async (url, init) => {
+    if (url === `${ISSUER}/api/accounts/oauth/token`) {
+      refreshCalls++;
+      return new Promise(() => {}); // A selected renewal would deliberately remain unresolved in this fixture.
+    }
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-info-access'); modelRoutes.push(url);
+    if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+    assert.equal(url, 'https://api.openai.com/v1/responses');
+    return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: {
+      id: 'synthetic-inspection-response', status: 'completed', model: MODEL,
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'SYNTHETIC_PRIVATE_REPLY' }] }],
+      usage: { input_tokens: 21, output_tokens: 8, total_tokens: 29 },
+    } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+  } });
+  const inspected = await sessions.maintain(new AbortController().signal, { refresh: false });
+  assert.deepEqual(inspected.accounts.map(value => [value.alias, value.state]), [['info', 'active'], ['eason', 'renewal_due']]);
+  assert.equal(refreshCalls, 0); assert.deepEqual(modelRoutes, []);
+  const f = workerFixture({ purposes: ['reply_generation'], maintainChange: async signal => {
+    assertCorelyVmModelSessionMaintenance(await sessions.maintain(signal, { refresh: false }));
+  } });
+  t.after(() => f.controller.abort()); f.options.ports = createSiwcModelTransports(sessions);
+  assert.equal((await runCorelyVmModelWorker(f.options)).completed, 1);
+  assert.deepEqual(f.claims, ['info']); assert.equal(f.completions.length, 1);
+  assert.equal(f.completions[0].result.accountAlias, 'info'); assert.equal(refreshCalls, 0);
+  assert.deepEqual(modelRoutes, ['https://api.openai.com/v1/models', 'https://api.openai.com/v1/responses']);
+  assert.doesNotMatch(JSON.stringify(f.events), /synthetic-info-access|synthetic-eason-refresh|SYNTHETIC_PRIVATE_REPLY/);
 });
 
 test('producer readiness may be awaited but is never invented or activated by the consumer', async () => {

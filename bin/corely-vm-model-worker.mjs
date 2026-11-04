@@ -287,16 +287,18 @@ export async function openCorelyVmModelWorkerLifecycle(stateDir, keyThumbprint) 
     };
     await directory.check();
     ownerNonce = releaseLock.ownerNonce;
-    const recoveredOwnerNonce = releaseLock.recoveredOwnerNonce;
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(ownerNonce ?? '') ||
-        recoveredOwnerNonce !== null && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(recoveredOwnerNonce ?? '') ||
-        recoveredOwnerNonce === ownerNonce) fail('WORKER_AUTHORITY_HELD');
+    const recoveredOwnerNonce = releaseLock.recoveredOwnerNonce, recoveredOwnerNonces = releaseLock.recoveredOwnerNonces;
+    const ownerPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    if (!ownerPattern.test(ownerNonce ?? '') || !Array.isArray(recoveredOwnerNonces) || !Object.isFrozen(recoveredOwnerNonces) ||
+        recoveredOwnerNonces.length > 8 || new Set(recoveredOwnerNonces).size !== recoveredOwnerNonces.length ||
+        Array.from(recoveredOwnerNonces).some(nonce => !ownerPattern.test(nonce ?? '') || nonce === ownerNonce) ||
+        (recoveredOwnerNonce === null ? recoveredOwnerNonces.length !== 0 : recoveredOwnerNonces.at(-1) !== recoveredOwnerNonce)) fail('WORKER_AUTHORITY_HELD');
     const priorPrompt = await directory.readForRetirement(PROMPT_FILE);
     if (priorPrompt) {
       const previous = priorPrompt.value;
-      if (!recoveredOwnerNonce || !exact(previous, ['kind', 'version', 'ownerNonce', 'scope', 'vmHostIdHash',
+      if (!exact(previous, ['kind', 'version', 'ownerNonce', 'scope', 'vmHostIdHash',
         'verificationUriComplete', 'userCode', 'expiresIn', 'keyThumbprint', 'syntheticOnly', 'apiFallbackEnabled']) ||
-          previous.kind !== 'CORELY_DEV_VM_MODEL_CONSENT' || previous.version !== 2 || previous.ownerNonce !== recoveredOwnerNonce ||
+          previous.kind !== 'CORELY_DEV_VM_MODEL_CONSENT' || previous.version !== 2 || !recoveredOwnerNonces.includes(previous.ownerNonce) ||
           previous.scope !== CORELY_VM_MODEL_JOB_SCOPE || previous.vmHostIdHash !== CORELY_VM_HOST_ID_HASH ||
           previous.keyThumbprint !== keyThumbprint || previous.syntheticOnly !== true || previous.apiFallbackEnabled !== false ||
           typeof previous.verificationUriComplete !== 'string' ||
@@ -351,8 +353,9 @@ const readyStatus = status => status?.status === 'SYNTHETIC_VM_MODEL_TRANSPORT_V
 
 /** Session maintenance is not a model receipt or permission to rotate accounts.
  * A failed standby must not block a healthy primary, but unknown store/identity
- * failures and an entirely unavailable account set still stop the worker. The
- * producer continues to own account selection; generation rechecks its session. */
+ * failures and an entirely unavailable account set still stop the worker.
+ * renewal_due is only a renewable enrollment, never usable-token proof. The
+ * producer owns account selection; generation renews/rechecks that account. */
 export function assertCorelyVmModelSessionMaintenance(maintenance, now = Date.now()) {
   if (!exact(maintenance, ['status', 'accounts', 'apiFallbackUsed']) || maintenance.status !== 'SESSION_MAINTENANCE_COMPLETED' ||
       maintenance.apiFallbackUsed !== false || !Array.isArray(maintenance.accounts) || maintenance.accounts.length !== 2 ||
@@ -361,10 +364,11 @@ export function assertCorelyVmModelSessionMaintenance(maintenance, now = Date.no
   for (const [index, alias] of ['info', 'eason'].entries()) {
     const account = maintenance.accounts[index];
     if (!object(account) || account.alias !== alias) fail('WORKER_SESSION_HELD');
-    if (account.state === 'active') {
+    if (account.state === 'active' || account.state === 'renewal_due') {
       if (account.identityVerified !== true || account.registrationRetained !== true ||
           account.authorizationSource !== 'APP_OWNED_SIWC' || account.apiFallbackEnabled !== false || account.syntheticOnly !== true ||
-          !Number.isSafeInteger(account.expiresAt) || account.expiresAt <= now) fail('WORKER_SESSION_HELD');
+          !Number.isSafeInteger(account.expiresAt) || account.expiresAt < 0 ||
+          (account.state === 'active' ? account.expiresAt <= now : account.expiresAt > now + 60000)) fail('WORKER_SESSION_HELD');
       available = true;
     } else if (account.state === 'held') {
       if (!['SESSION_REAUTH_REQUIRED', 'REFRESH_OUTCOME_UNCERTAIN', 'REFRESH_CLIENT_INVALID'].includes(account.code)) fail('WORKER_SESSION_HELD');
@@ -499,7 +503,10 @@ export async function runVmModelWorkerCommand(argv) {
     safe(await runCorelyVmModelWorker({ client, ports: gateway?.ports ?? createSiwcModelTransports(sessions), signal: active,
       onReceipt: value => safe(gateway && value.status === 'CORELY_SYNTHETIC_MODEL_JOB_COMPLETED'
         ? { ...value, modelTransport: 'new_api_gateway_siwc' } : value), maintainSessions: async active => {
-        assertCorelyVmModelSessionMaintenance(await sessions.maintain(active));
+        // Inspect both current private records without refreshing a standby on
+        // the claim path. generate() still refreshes the selected account under
+        // its own lock and the original model/lease deadline; no background race.
+        assertCorelyVmModelSessionMaintenance(await sessions.maintain(active, { refresh: false }));
       } }));
   } finally {
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); controller.abort();
