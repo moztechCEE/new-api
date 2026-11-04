@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { after, before, test } from 'node:test';
 import { ISSUER, RESOURCE, MODEL, PROBE_OUTPUT, SCOPES, ProbeError, digest } from './siwc-local-runtime.mjs';
 import { openSessionStore, persistValidatedAuthorization, retainIssuedRegistration, writeEnrollment, importEnrollment,
-  forgetTransferredEnrollment, createPersistentPlanSessions, SESSION_ACCOUNTS } from './siwc-local-sessions.mjs';
+  forgetTransferredEnrollment, createPersistentPlanSessions, acquireSessionProcessLock, SESSION_ACCOUNTS } from './siwc-local-sessions.mjs';
 import { startPersistentEnrollment, assertIsolatedSessionEnvironment, parseSessionCommand } from './siwc-local-vm.mjs';
 import { corelyPlanPayload, createSiwcModelTransports, createTransientSiwcModelPort, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 
@@ -51,6 +51,16 @@ async function transferred(t, aliases = ['info']) {
   }
   return fixture;
 }
+function leaveExitedOwnerLock(root, alias = 'info') {
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `const { openSessionStore } = await import(process.argv[1]);
+     const store = await openSessionStore(process.argv[2]);
+     await store.locked(process.argv[3], async () => process.exit(0));`,
+    new URL('./siwc-local-sessions.mjs', import.meta.url).href, root, alias], { env: {}, timeout: 10000 });
+  assert.equal(child.status, 0, child.error?.code ?? 'Synthetic lock owner must exit before recovery.');
+}
+const retainedWithoutTokens = (record, state) => Object.fromEntries(Object.entries({ ...record, state, revision: record.revision + 1 })
+  .filter(([key]) => !['accessToken', 'refreshToken', 'idToken', 'nonce', 'expiresAt', 'scopes'].includes(key)));
 const catalog = () => Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
 function completion() {
   return new Response(Buffer.from(`data: ${JSON.stringify({ type: 'response.completed', response: {
@@ -452,6 +462,176 @@ test('rotating refresh is serialized, atomically persisted, uses the issued clie
   const restarted = createPersistentPlanSessions(await openSessionStore(vm.root), { now: () => NOW + 251000,
     fetchImpl: () => { throw new Error('Refresh must not repeat.'); } });
   assert.equal((await restarted.maintain()).accounts[0].state, 'active');
+});
+
+test('a proven exited same-namespace owner releases the alias without restoring stale tokens', { skip: process.platform !== 'linux' }, async t => {
+  const { vm } = await transferred(t, ['info', 'eason']);
+  leaveExitedOwnerLock(vm.root);
+  const stale = JSON.parse(await readFile(join(vm.root, 'info.lock'), 'utf8'));
+  const recovered = await acquireSessionProcessLock(vm.root, 'info.lock');
+  assert.equal(recovered.recoveredOwnerNonce, stale.nonce); assert.notEqual(recovered.ownerNonce, stale.nonce);
+  assert.equal(Object.isFrozen(recovered), true);
+  assert.throws(() => { recovered.recoveredOwnerNonce = 'not-a-verified-owner'; }, TypeError);
+  assert.throws(() => Object.defineProperty(recovered, 'ownerNonce', { value: stale.nonce }), TypeError);
+  await recovered(); await recovered();
+  const old = await vm.read('info');
+  await vm.write('info', { ...old, accessToken: 'synthetic-newest-disk-access', refreshToken: 'synthetic-newest-disk-refresh',
+    expiresAt: NOW + 3600000, updatedAt: NOW + 2000, revision: old.revision + 1 });
+  const calls = [];
+  const sessions = createPersistentPlanSessions(await openSessionStore(vm.root), { now: () => NOW + 3000,
+    fetchImpl: async (url, init) => {
+      calls.push(url); assert.equal(init.headers.Authorization, 'Bearer synthetic-newest-disk-access');
+      return url === `${RESOURCE}/models` ? catalog() : completion();
+    } });
+  assert.equal((await sessions.probe('info')).completed, true);
+  assert.deepEqual(calls, [`${RESOURCE}/models`, `${RESOURCE}/responses`]);
+  assert.equal((await vm.read('info')).refreshToken, 'synthetic-newest-disk-refresh');
+  assert.equal((await vm.read('eason')).refreshToken, 'synthetic-eason-refresh');
+  assert.deepEqual((await readdir(vm.root)).filter(name => name.includes('.lock')), []);
+});
+
+test('dead-owner recovery never replays an uncertain rotating refresh', { skip: process.platform !== 'linux' }, async t => {
+  const { vm } = await transferred(t);
+  await vm.write('info', { ...await vm.read('info'), state: 'refresh_pending', refreshToken: 'synthetic-newest-pending-renewal' });
+  leaveExitedOwnerLock(vm.root);
+  let calls = 0;
+  const sessions = createPersistentPlanSessions(await openSessionStore(vm.root), { fetchImpl: async () => { calls++; throw new Error('NO_PROVIDER_DISPATCH'); } });
+  await assert.rejects(sessions.probe('info'), code('REFRESH_OUTCOME_UNCERTAIN'));
+  assert.equal(calls, 0);
+  assert.equal((await vm.read('info')).refreshToken, 'synthetic-newest-pending-renewal');
+  assert.equal((await vm.read('info')).state, 'refresh_pending');
+  assert.deepEqual((await readdir(vm.root)).filter(name => name.includes('.lock')), []);
+});
+
+test('recovery holds legacy, unknown-domain and interrupted-recovery locks instead of guessing by age', { skip: process.platform !== 'linux' }, async t => {
+  for (const kind of ['legacy', 'foreign boot', 'foreign namespace', 'interrupted recovery']) await t.test(kind, async t => {
+    const { vm } = await transferred(t);
+    leaveExitedOwnerLock(vm.root);
+    const path = join(vm.root, 'info.lock'), original = await readFile(path, 'utf8');
+    const lock = JSON.parse(original);
+    if (kind === 'foreign boot') lock.owner.bootId = '00000000-0000-0000-0000-000000000000';
+    if (kind === 'foreign namespace') lock.owner.pidNamespace = 'pid:[0]';
+    if (kind === 'interrupted recovery') await writeFile(`${path}.recovery`, original, { mode: 0o600 });
+    else await writeFile(path, kind === 'legacy' ? 'synthetic-interrupted-legacy-lock' : JSON.stringify(lock), { mode: 0o600 });
+    const before = await readFile(path, 'utf8');
+    let calls = 0;
+    const sessions = createPersistentPlanSessions(vm, { fetchImpl: async () => { calls++; throw new Error('NO_PROVIDER_DISPATCH'); } });
+    await assert.rejects(sessions.probe('info'), code('SESSION_BUSY_OR_LOCKED'));
+    assert.equal(await readFile(path, 'utf8'), before); assert.equal(calls, 0);
+    assert.equal((await vm.read('info')).state, 'active');
+  });
+});
+
+test('a live alias owner is not stolen and cleanup never unlinks a replacement', async t => {
+  const { vm } = await transferred(t);
+  const other = await openSessionStore(vm.root), path = join(vm.root, 'info.lock');
+  const fresh = await acquireSessionProcessLock(vm.root, 'info.lock');
+  assert.equal(fresh.recoveredOwnerNonce, null);
+  assert.match(fresh.ownerNonce, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(Object.getOwnPropertyDescriptor(fresh, 'ownerNonce').writable, false); await fresh();
+  await vm.locked('info', async () => {
+    await assert.rejects(other.locked('info', () => assert.fail('A second owner must not enter.')), code('SESSION_BUSY_OR_LOCKED'));
+  });
+  await assert.rejects(vm.locked('info', async () => {
+    const record = JSON.parse(await readFile(path, 'utf8'));
+    await rm(path); await writeFile(path, JSON.stringify(record), { mode: 0o600 });
+  }), code('SESSION_LOCK_CLEANUP_UNCONFIRMED'));
+  assert.equal((await lstat(path)).isFile(), true);
+});
+
+test('maintenance keeps both account states visible and never renews uncertain or revoked sessions', async t => {
+  for (const state of ['refresh_pending', 'reauth_required', 'disconnected', 'missing']) await t.test(state, async t => {
+    const { vm } = await transferred(t, ['info', 'eason']), record = await vm.read('info');
+    if (state === 'missing') await rm(join(vm.root, 'info.json'));
+    else await vm.write('info', state === 'refresh_pending' ? { ...record, state } : retainedWithoutTokens(record, state));
+    let calls = 0;
+    const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async () => { calls++; throw new Error('NO_PROVIDER_DISPATCH'); } });
+    const result = await sessions.maintain();
+    assert.deepEqual(result.accounts[0], state === 'missing' ? { alias: 'info', state: 'not_connected' } :
+      { alias: 'info', state: 'held', code: state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED' });
+    assert.equal(result.accounts[1].alias, 'eason'); assert.equal(result.accounts[1].state, 'active');
+    assert.equal(calls, 0); assert.equal(result.apiFallbackUsed, false);
+    await assert.rejects(createPersistentPlanSessions(vm, { now: () => NOW }).maintain(), code('SESSION_CLOCK_INVALID'));
+  });
+});
+
+test('only retained signed reauth state creates a bound predispatch account-unavailable witness', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']);
+  const retained = retainedWithoutTokens(await vm.read('info'), 'reauth_required');
+  await vm.write('info', retained);
+  let calls = 0;
+  const sessions = createPersistentPlanSessions(await openSessionStore(vm.root), { fetchImpl: async () => { calls++; throw new Error('NO_PROVIDER_DISPATCH'); } });
+  const request = modelRequest();
+  const result = await sessions.generate('info', request, new AbortController().signal);
+  assert.deepEqual(result, { accountAlias: 'info', authMode: 'siwc_plan', accountVerified: true, model: MODEL,
+    callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
+    status: 'account_unavailable', code: 'ACCOUNT_UNAVAILABLE', reason: 'REAUTH_REQUIRED', noModelMade: true,
+    probeSettled: true, accountEnrollmentRevision: retained.revision });
+  assert.equal(Object.isFrozen(result), true); assert.equal(calls, 0);
+  await assert.rejects(sessions.probe('info'), code('SESSION_REAUTH_REQUIRED'));
+  await assert.rejects(sessions.generate('info', request, new AbortController().signal), code('MODEL_CALL_REPLAY_OR_CAPACITY'));
+  assert.equal((await vm.read('eason')).state, 'active');
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-info|accessToken|refreshToken|subjectHash|clientId/);
+  const rolledBackClock = createPersistentPlanSessions(await openSessionStore(vm.root), { now: () => NOW,
+    fetchImpl: async () => { calls++; throw new Error('NO_PROVIDER_DISPATCH'); } });
+  await assert.rejects(rolledBackClock.generate('info', modelRequest({ callId: 'synthetic-clock-rollback' }), new AbortController().signal), code('SESSION_CLOCK_INVALID'));
+  assert.equal(calls, 0);
+});
+
+test('an exact terminal refresh is persisted before the generate-only unavailable witness', async t => {
+  const { vm } = await transferred(t);
+  const calls = [];
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async url => {
+    calls.push(url); return Response.json({ error: 'invalid_grant' }, { status: 400 });
+  } });
+  const request = modelRequest(), result = await sessions.generate('info', request, new AbortController().signal);
+  assert.equal(result.status, 'account_unavailable'); assert.equal(result.noModelMade, true);
+  const saved = await vm.read('info');
+  assert.equal(saved.state, 'reauth_required'); assert.equal(saved.revision, result.accountEnrollmentRevision);
+  assert.doesNotMatch(JSON.stringify(saved), /accessToken|refreshToken|idToken|nonce/);
+  assert.deepEqual(calls, [`${ISSUER}/api/accounts/oauth/token`]);
+  assert.equal((await sessions.generate('info', modelRequest({ callId: 'synthetic-next-call' }), new AbortController().signal)).status, 'account_unavailable');
+  assert.equal(calls.length, 1);
+});
+
+test('unknown, unsigned, disconnected and ambiguous states never create an unavailable witness', async t => {
+  for (const state of ['missing', 'disconnected', 'unsigned reauth', 'refresh_pending', 'invalid client', 'network ambiguity', 'invalid scope', 'invalid identity']) await t.test(state, async t => {
+    const { vm } = await transferred(t), record = await vm.read('info');
+    if (state === 'missing') await rm(join(vm.root, 'info.json'));
+    if (state === 'disconnected') await vm.write('info', retainedWithoutTokens(record, 'disconnected'));
+    if (state === 'unsigned reauth') {
+      const retained = retainedWithoutTokens(record, 'reauth_required'); delete retained.subjectHash;
+      await vm.write('info', retained);
+    }
+    if (state === 'refresh_pending') await vm.write('info', { ...record, state });
+    let modelCalls = 0;
+    const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async url => {
+      if (url === `${RESOURCE}/responses` || url === `${RESOURCE}/models`) { modelCalls++; throw new Error('NO_MODEL_DISPATCH'); }
+      if (url.endsWith('/jwks.json')) return Response.json(JWKS);
+      if (state === 'network ambiguity') throw new Error('SYNTHETIC_UNKNOWN_REFRESH_OUTCOME');
+      if (state === 'invalid scope') return Response.json({ ...fixtureToken(), scope: 'openid email' });
+      if (state === 'invalid identity') return Response.json(fixtureToken('info', { claims: { sub: 'different-subject' } }));
+      return Response.json({ error: 'invalid_client' }, { status: 400 });
+    } });
+    await assert.rejects(sessions.generate('info', modelRequest(), new AbortController().signal), error =>
+      error instanceof ProbeError && ['SESSION_REAUTH_REQUIRED', 'REFRESH_OUTCOME_UNCERTAIN', 'REFRESH_CLIENT_INVALID',
+        'REFRESH_SCOPE_INVALID', 'REFRESH_IDENTITY_INVALID'].includes(error.code));
+    assert.equal(modelCalls, 0);
+  });
+});
+
+test('post-dispatch failures and cancellation cannot be relabeled as predispatch unavailability', async t => {
+  const { vm } = await transferred(t);
+  let modelCalls = 0;
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async url => {
+    if (url.endsWith('/oauth/token')) return Response.json({ access_token: 'synthetic-refreshed-access', refresh_token: 'synthetic-refreshed-renewal', token_type: 'Bearer', expires_in: 3600 });
+    if (url === `${RESOURCE}/models`) return catalog();
+    modelCalls++; throw new ProbeError('SESSION_REAUTH_REQUIRED');
+  } });
+  await assert.rejects(sessions.generate('info', modelRequest(), new AbortController().signal), code('SESSION_REAUTH_REQUIRED'));
+  assert.equal(modelCalls, 1); assert.equal((await vm.read('info')).state, 'active');
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(sessions.generate('info', modelRequest({ callId: 'synthetic-aborted-call' }), controller.signal), code('SESSION_OPERATION_ABORTED'));
 });
 
 test('uncertain refreshes, scope expansion and identity changes hold durably without replay or fallback', async t => {

@@ -710,6 +710,8 @@ test('only coherent HTTP technical errors read through EOF carry a private settl
     [500, 'server_error', 'server_error', 'UPSTREAM'],
     [503, 'server_error', 'service_unavailable', 'UPSTREAM'],
     [503, 'server_error', 'server_is_overloaded', 'UPSTREAM'],
+    [503, 'server_error', 'subscription_sharing_usage_unavailable', 'UPSTREAM'],
+    [503, 'server_error', 'subscription_sharing_user_unavailable', 'UPSTREAM'],
   ]) await t.test(`${status}-${code}`, async () => {
     const response = jsonResponse({ error: { type, code, param: null, message: 'PRIVATE_PROVIDER_MESSAGE' } }, status);
     const diagnostic = await inferenceFailureDiagnostic(response);
@@ -732,6 +734,13 @@ test('only coherent HTTP technical errors read through EOF carry a private settl
     ['global slow down', 429, { error: { ...rate, code: 'slow_down' } }],
     ['permission type', 500, { error: { ...server, type: 'permission_error' } }],
     ['eligibility code', 500, { error: { ...server, code: 'subscription_sharing_user_not_eligible' } }],
+    ...['subscription_sharing_usage_unavailable', 'subscription_sharing_user_unavailable'].flatMap(code => [
+      [`unavailable wrong status ${code}`, 500, { error: { ...server, code } }],
+      [`unavailable permission type ${code}`, 503, { error: { type: 'permission_error', code } }],
+      [`unavailable missing type ${code}`, 503, { error: { code } }],
+    ]),
+    ...['subscription_sharing_user_not_eligible', 'subscription_sharing_route_not_supported',
+      'chatpass_v2_scope_not_authorized'].map(code => [`permission 503 ${code}`, 503, { error: { ...server, code } }]),
     ['invalid user code', 429, { error: { ...rate, code: 'subscription_sharing_invalid_user' } }],
     ['plan quota code', 429, { error: { ...rate, code: 'subscription_sharing_usage_limit_exceeded' } }],
     ['parameter conflict', 429, { error: { ...rate, param: 'reasoning.effort' } }],
@@ -790,6 +799,20 @@ test('inference diagnostic terminates unreadable, interrupted or stalled bodies 
     assert.equal(settledInferenceFailureReason(diagnostic), undefined);
     assert.equal(canceled, true);
     assert.equal(JSON.stringify(diagnostic).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
+  }
+  for (const code of ['subscription_sharing_usage_unavailable', 'subscription_sharing_user_unavailable']) {
+    let canceled = false;
+    // A coherent error prefix is not settlement until EOF. Neither a stalled
+    // body nor a broken stream can authorize a second account's model call.
+    const incomplete = new ReadableStream({
+      start(controller) { controller.enqueue(Buffer.from(JSON.stringify({ error: { type: 'server_error', code } }))); },
+      cancel() { canceled = true; },
+    });
+    const diagnostic = await inferenceFailureDiagnostic(new Response(incomplete, {
+      status: 503, headers: { 'content-type': 'application/json' },
+    }), 5);
+    assert.equal(settledInferenceFailureReason(diagnostic), undefined);
+    assert.equal(canceled, true);
   }
 });
 

@@ -280,8 +280,10 @@ test('only bound authenticated quota receipt returns quota; generic/fabricated G
 
 test('settled SIWC HTTP failures cross only their original account/call/nonce record with fixed Gateway409', async t => {
   for (const [status, type, code, reason] of [[429, 'rate_limit_error', 'rate_limit_exceeded', 'RATE_LIMIT'],
-    [500, 'server_error', 'server_error', 'UPSTREAM'], [503, 'server_error', 'service_unavailable', 'UPSTREAM']]) {
-    await t.test(`${status}-${reason}`, async t => {
+    [500, 'server_error', 'server_error', 'UPSTREAM'], [503, 'server_error', 'service_unavailable', 'UPSTREAM'],
+    [503, 'server_error', 'subscription_sharing_usage_unavailable', 'UPSTREAM'],
+    [503, 'server_error', 'subscription_sharing_user_unavailable', 'UPSTREAM']]) {
+    await t.test(`${status}-${code}-${reason}`, async t => {
       const providerCalls = [], state = harness(t, { generate: publicPlanProvider(() =>
         Response.json({ error: { type, code, message: 'PRIVATE_PROVIDER_MESSAGE' } }, { status }), providerCalls),
       gateway: async (instance, init) => {
@@ -306,6 +308,31 @@ test('settled SIWC HTTP failures cross only their original account/call/nonce re
       assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE/);
     });
   }
+});
+
+test('predispatch reauth witness crosses only its original nonce, account and complete request', async t => {
+  const request = jointRequestFixture('account-readiness');
+  const unavailable = { accountAlias: 'info', authMode: 'siwc_plan', accountVerified: true, model: MODEL,
+    callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
+    status: 'account_unavailable', code: 'ACCOUNT_UNAVAILABLE', reason: 'REAUTH_REQUIRED',
+    noModelMade: true, probeSettled: true, accountEnrollmentRevision: 3 };
+  await t.test('retained session witness is distinct from quota and generated tokens', async t => {
+    const state = harness(t, { generate: () => unavailable });
+    assert.deepEqual(await state.instance.ports.info.generate(request, new AbortController().signal), unavailable);
+    assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1);
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+  });
+  for (const changes of [{ noModelMade: false }, { probeSettled: false }, { reason: 'AUTH_UNAVAILABLE' },
+    { reason: 'NETWORK' }, { accountEnrollmentRevision: 0 }, { accountEnrollmentRevision: 1.5 },
+    { accountAlias: 'eason' }, { callId: 'foreign-call' }, { inputSha256: '0'.repeat(64) },
+    { authMode: 'managed_chatgpt' }, { text: 'invented output' }, { operationSettled: true }]) {
+    assert.throws(() => snapshotModelResult({ ...unavailable, ...changes }, request, 'info', 'siwc_plan'), { code: 'INVALID_RECEIPT' });
+  }
+  await t.test('a fabricated Go409 is never a readiness witness', async t => {
+    const state = harness(t, { gateway: () => Response.json(unavailable, { status: 409 }) });
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_RESPONSE_INVALID' });
+    assert.equal(state.calls.length, 0);
+  });
 });
 
 test('Go status/body and foreign failure fields cannot create or transfer settled authority', async t => {

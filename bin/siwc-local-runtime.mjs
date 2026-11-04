@@ -232,7 +232,8 @@ function technicalHttpFailureReason(response, media, body, text) {
   if (response.status === 429 && error.type === 'rate_limit_error' && error.code === 'rate_limit_exceeded') return 'RATE_LIMIT';
   if (response.status >= 500 && response.status <= 599 && error.type === 'server_error' &&
       (error.code === 'server_error' || response.status === 503 &&
-        ['service_unavailable', 'server_is_overloaded'].includes(error.code))) return 'UPSTREAM';
+        ['service_unavailable', 'server_is_overloaded', 'subscription_sharing_usage_unavailable',
+          'subscription_sharing_user_unavailable'].includes(error.code))) return 'UPSTREAM';
 }
 
 // Fixed enums and hashes only: never retain raw headers, bodies, messages or credentials.

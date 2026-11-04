@@ -9,7 +9,7 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { after, before, test } from 'node:test';
 import { openCorelyVmModelIdentity, openCorelyVmModelWorkerLifecycle, openCorelyVmModelGateway, runCorelyVmModelWorker,
-  parseVmModelWorkerCommand, VmModelWorkerError } from './corely-vm-model-worker.mjs';
+  assertCorelyVmModelSessionMaintenance, parseVmModelWorkerCommand, VmModelWorkerError } from './corely-vm-model-worker.mjs';
 import { CORELY_VM_MODEL_JOB_SCOPE as SCOPE, CORELY_VM_MODEL_JOB_RESOURCE as RESOURCE,
   CORELY_VM_HOST_ID_HASH as HOST, CORELY_VM_VERIFICATION_URI as VERIFICATION } from './corely-vm-model-job-client.mjs';
 import { createSiwcModelTransports, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
@@ -198,12 +198,100 @@ test('lifecycle lock is exclusive and consent reference is protected, token-free
   assert.doesNotMatch(JSON.stringify(receipt), /ABCD|requestId|vm_models_|access|refresh|PRIVATE/);
   const path = join(f.root, PROMPT_FILE), record = JSON.parse(await readFile(path));
   assert.equal((await lstat(path)).mode & 0o777, 0o600);
-  assert.deepEqual(Object.keys(record).sort(), ['kind', 'version', 'verificationUriComplete', 'userCode', 'expiresIn', 'keyThumbprint', 'syntheticOnly', 'apiFallbackEnabled'].sort());
+  assert.deepEqual(Object.keys(record).sort(), ['kind', 'version', 'ownerNonce', 'scope', 'vmHostIdHash',
+    'verificationUriComplete', 'userCode', 'expiresIn', 'keyThumbprint', 'syntheticOnly', 'apiFallbackEnabled'].sort());
+  assert.equal(record.version, 2); assert.equal(record.scope, SCOPE); assert.equal(record.vmHostIdHash, HOST);
+  assert.match(record.ownerNonce, /^[0-9a-f-]{36}$/);
+  await assert.rejects(openCorelyVmModelWorkerLifecycle(f.root, f.thumbprint), code('WORKER_ALREADY_RUNNING'));
+  assert.deepEqual(JSON.parse(await readFile(path)), record, 'A live owner keeps its pending consent unchanged');
   await assert.rejects(lifecycle.presentConsent(approval(f.thumbprint)), code('WORKER_AUTHORITY_HELD'));
   await lifecycle.clearConsent(); await assert.rejects(readFile(path), { code: 'ENOENT' });
   await lifecycle.close(); await assert.rejects(readFile(join(f.root, LOCK_FILE)), { code: 'ENOENT' });
   const reopened = await openCorelyVmModelWorkerLifecycle(f.root, f.thumbprint); await reopened.close();
 });
+
+test('Linux lifecycle restart retires only its proven-dead owner prompt and requires fresh normal consent',
+  { skip: process.platform !== 'linux' }, async t => {
+    const f = await identity(t), path = join(f.root, LOCK_FILE);
+    const source = `import { openCorelyVmModelWorkerLifecycle } from ${JSON.stringify(import.meta.url.replace(/\.test\.mjs$/, '.mjs'))};
+      const lifecycle = await openCorelyVmModelWorkerLifecycle(${JSON.stringify(f.root)}, ${JSON.stringify(f.thumbprint)});
+      await lifecycle.presentConsent(${JSON.stringify(approval(f.thumbprint))});
+      process.stdout.write('SYNTHETIC_LOCK_CREATED'); process.exit(0);`;
+    const exited = spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(exited.status, 0); assert.equal(exited.stdout, 'SYNTHETIC_LOCK_CREATED');
+    const previous = await readFile(path, 'utf8'), previousPrompt = JSON.parse(await readFile(join(f.root, PROMPT_FILE)));
+    const restarted = await openCorelyVmModelWorkerLifecycle(f.root, f.thumbprint);
+    assert.notEqual(await readFile(path, 'utf8'), previous);
+    await assert.rejects(readFile(join(f.root, PROMPT_FILE)), { code: 'ENOENT' });
+    const fresh = { ...approval(f.thumbprint), verificationUriComplete: `${VERIFICATION}?requestId=vm_models_${'s'.repeat(43)}`,
+      userCode: 'EFAB-4567' };
+    await assert.rejects(restarted.presentConsent({ ...fresh, scope: 'not-the-approved-scope' }), code('WORKER_AUTHORITY_HELD'));
+    await assert.rejects(readFile(join(f.root, PROMPT_FILE)), { code: 'ENOENT' });
+    await restarted.presentConsent(fresh);
+    const nextPrompt = JSON.parse(await readFile(join(f.root, PROMPT_FILE)));
+    assert.equal(nextPrompt.verificationUriComplete, fresh.verificationUriComplete);
+    assert.notEqual(nextPrompt.ownerNonce, previousPrompt.ownerNonce);
+    assert.notEqual(nextPrompt.verificationUriComplete, previousPrompt.verificationUriComplete);
+    await restarted.close();
+    const legacy = JSON.stringify({ kind: 'CORELY_DEV_VM_MODEL_WORKER_LOCK', version: 1 });
+    await writeFile(path, legacy, { mode: 0o600 });
+    await assert.rejects(openCorelyVmModelWorkerLifecycle(f.root, f.thumbprint), code('WORKER_ALREADY_RUNNING'));
+    assert.equal(await readFile(path, 'utf8'), legacy);
+  });
+
+test('restart cannot retire legacy, foreign, malformed or changed pending consent references',
+  { skip: process.platform !== 'linux' }, async t => {
+    const workerUrl = import.meta.url.replace(/\.test\.mjs$/, '.mjs');
+    const crashWithConsent = f => {
+      const source = `import { openCorelyVmModelWorkerLifecycle } from ${JSON.stringify(workerUrl)};
+        const lifecycle = await openCorelyVmModelWorkerLifecycle(${JSON.stringify(f.root)}, ${JSON.stringify(f.thumbprint)});
+        await lifecycle.presentConsent(${JSON.stringify(approval(f.thumbprint))}); process.exit(0);`;
+      const exited = spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', timeout: 10000 });
+      assert.equal(exited.status, 0);
+    };
+    for (const [name, change] of [
+      ['legacy v1', value => ({ ...value, version: 1 })],
+      ['foreign owner', value => ({ ...value, ownerNonce: '22222222-2222-4222-8222-222222222222' })],
+      ['foreign key', value => ({ ...value, keyThumbprint: 'A'.repeat(43) })],
+      ['foreign host', value => ({ ...value, vmHostIdHash: '0'.repeat(64) })],
+      ['foreign scope', value => ({ ...value, scope: 'not-the-approved-scope' })],
+      ['extra grant field', value => ({ ...value, granted: true })],
+      ['malformed reference', value => ({ ...value, verificationUriComplete: 'https://example.test/must-not-open' })],
+    ]) await t.test(name, async t => {
+      const f = await identity(t); crashWithConsent(f);
+      const path = join(f.root, PROMPT_FILE), changed = JSON.stringify(change(JSON.parse(await readFile(path))));
+      await writeFile(path, changed, { mode: 0o600 });
+      await assert.rejects(openCorelyVmModelWorkerLifecycle(f.root, f.thumbprint), code('WORKER_AUTHORITY_HELD'));
+      assert.equal(await readFile(path, 'utf8'), changed);
+    });
+    await t.test('replacement after validated read retains even identical canonical contents', async t => {
+      const f = await identity(t); crashWithConsent(f);
+      const path = join(f.root, PROMPT_FILE), prior = await readFile(path, 'utf8');
+      // Isolate the built-in filesystem hook in a child. Replacing exactly at
+      // the second prompt open deterministically exercises retirement's inode
+      // check; production gains no hook and no timing-race test is required.
+      const source = `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+        const path = ${JSON.stringify(path)}, originalOpen = fs.promises.open, original = await fs.promises.readFile(path, 'utf8');
+        let reads = 0;
+        fs.promises.open = async (...args) => {
+          const handle = await originalOpen(...args);
+          if (args[0] === path && ++reads === 2) {
+            await fs.promises.rename(path, path + '.old'); await fs.promises.writeFile(path, original, { mode: 0o600 });
+          }
+          return handle;
+        };
+        syncBuiltinESMExports();
+        const { openCorelyVmModelWorkerLifecycle } = await import(${JSON.stringify(workerUrl)});
+        try { await openCorelyVmModelWorkerLifecycle(${JSON.stringify(f.root)}, ${JSON.stringify(f.thumbprint)}); process.exit(2); }
+        catch (error) {
+          if (error.code !== 'WORKER_STORAGE_NOT_PRIVATE' || reads !== 2 || await fs.promises.readFile(path, 'utf8') !== original) process.exit(3);
+          process.stdout.write('SYNTHETIC_REPLACEMENT_RETAINED');
+        }`;
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', timeout: 10000 });
+      assert.equal(result.status, 0); assert.equal(result.stdout, 'SYNTHETIC_REPLACEMENT_RETAINED');
+      assert.equal(await readFile(path, 'utf8'), prior);
+    });
+  });
 
 test('directory inode replacement during explicit bootstrap is rejected without writing a key into the replacement', async t => {
   const f = await storage(t), moved = `${f.root}-moved`;
@@ -354,6 +442,47 @@ test('legacy, missing producer, lost authority and maintenance failure hold befo
     assert.equal(f.generated.length, 0); assert.equal(f.claims.length, 0); assert.equal(f.closed(), 1);
     assert.equal(f.failures.length, 0);
     if (kind === 'producer missing') assert.deepEqual(f.sleeps, [1000, 1000]);
+  });
+});
+
+test('account-local standby maintenance failure does not stop healthy Info or authorize local rotation', async t => {
+  const now = 1_800_000_000_000;
+  const active = alias => ({ alias, state: 'active', identityVerified: true, registrationRetained: true,
+    authorizationSource: 'APP_OWNED_SIWC', apiFallbackEnabled: false, syntheticOnly: true, expiresAt: now + 120000 });
+  const report = (info, eason) => ({ status: 'SESSION_MAINTENANCE_COMPLETED', accounts: [info, eason], apiFallbackUsed: false });
+  for (const reason of ['SESSION_REAUTH_REQUIRED', 'REFRESH_OUTCOME_UNCERTAIN', 'REFRESH_CLIENT_INVALID']) {
+    await t.test(reason, async () => {
+      const f = workerFixture({ purposes: ['reply_generation'], maintainChange: async () => {
+        assertCorelyVmModelSessionMaintenance(report(active('info'), { alias: 'eason', state: 'held', code: reason }), now);
+      } });
+      assert.equal((await runCorelyVmModelWorker(f.options)).completed, 1);
+      assert.deepEqual(f.claims, ['info']); assert.deepEqual(f.generated.map(call => call.alias), ['info']);
+      assert.equal(f.completions.length, 1); assert.equal(f.failures.length, 0);
+    });
+  }
+  await t.test('unavailable Info is not silently replaced without a producer-bound receipt', async () => {
+    const f = workerFixture({ purposes: ['reply_generation'], maintainChange: async () => {
+      assertCorelyVmModelSessionMaintenance(report({ alias: 'info', state: 'held', code: 'SESSION_REAUTH_REQUIRED' }, active('eason')), now);
+    }, generateChange: async alias => { assert.equal(alias, 'info'); throw new Error('PRIVATE_REAUTH_REQUIRED'); } });
+    await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_EXECUTION_HELD'));
+    assert.deepEqual(f.claims, ['info']); assert.deepEqual(f.generated.map(call => call.alias), ['info']);
+    assert.equal(f.completions.length, 0); assert.equal(f.failures.length, 1);
+  });
+  for (const [name, value] of [
+    ['all unavailable', report({ alias: 'info', state: 'held', code: 'SESSION_REAUTH_REQUIRED' }, { alias: 'eason', state: 'not_connected' })],
+    ['fatal store', report(active('info'), { alias: 'eason', state: 'held', code: 'SESSION_STORAGE_WRITE_FAILED' })],
+    ['identity failure', report(active('info'), { alias: 'eason', state: 'held', code: 'REFRESH_IDENTITY_INVALID' })],
+    ['scope failure', report(active('info'), { alias: 'eason', state: 'held', code: 'REFRESH_SCOPE_INVALID' })],
+    ['clock failure', report(active('info'), { alias: 'eason', state: 'held', code: 'SESSION_CLOCK_INVALID' })],
+    ['cancelled', report(active('info'), { alias: 'eason', state: 'held', code: 'SESSION_OPERATION_ABORTED' })],
+    ['duplicate alias', report(active('info'), active('info'))],
+    ['expired primary', report({ ...active('info'), expiresAt: now }, active('eason'))],
+    ['API flag', { ...report(active('info'), active('eason')), apiFallbackUsed: true }],
+    ['missing account', { ...report(active('info'), active('eason')), accounts: [active('info')] }],
+  ]) await t.test(name, async () => {
+    const f = workerFixture({ maintainChange: async () => { assertCorelyVmModelSessionMaintenance(value, now); } });
+    await assert.rejects(runCorelyVmModelWorker(f.options), code('WORKER_SESSION_HELD'));
+    assert.equal(f.claims.length, 0); assert.equal(f.generated.length, 0); assert.equal(f.completions.length, 0);
   });
 });
 

@@ -2,7 +2,7 @@
 // No native Codex/Luna cache, API key, general-purpose proxy or customer input.
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readlink, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ISSUER, RESOURCE, SCOPES, ProbeError, digest, publicJson, validateSession, runSyntheticProbe } from './siwc-local-runtime.mjs';
@@ -85,6 +85,169 @@ async function privateWrite(root, filename, value, { exclusive = false } = {}) {
   } finally { await handle?.close(); if (!exclusive) await unlink(temporary).catch(() => {}); }
 }
 
+const LOCK_KIND = 'NEW_API_SIWC_PROCESS_LOCK';
+const sameInode = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const privateLockFile = stat => stat.isFile() && stat.nlink === 1 && (stat.mode & 0o777) === 0o600 &&
+  stat.size <= 4096 && (!process.getuid || stat.uid === process.getuid());
+
+/** Linux start ticks are immutable for one process lifetime. PID alone, age,
+ * wall clocks and a different PID namespace can never prove an owner dead. */
+function processStart(stat, pid) {
+  const end = stat.lastIndexOf(')'), fields = stat.slice(end + 2).trim().split(/\s+/);
+  if (!stat.startsWith(`${pid} (`) || end < 0 || !/^[A-Z]$/.test(fields[0] ?? '') || !/^\d{1,24}$/.test(fields[19] ?? '')) return undefined;
+  return { state: fields[0], ticks: fields[19] };
+}
+
+async function processWitness() {
+  const unavailable = { pid: process.pid, bootId: null, pidNamespace: null, startTicks: null };
+  if (process.platform !== 'linux') return unavailable;
+  try {
+    const [boot, pidNamespace, stat] = await Promise.all([readFile('/proc/sys/kernel/random/boot_id', 'utf8'),
+      readlink('/proc/self/ns/pid'), readFile('/proc/self/stat', 'utf8')]);
+    const bootId = boot.trim(), started = processStart(stat, process.pid);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(bootId) ||
+      !/^pid:\[\d{1,24}\]$/.test(pidNamespace) || !started) return unavailable;
+    return { pid: process.pid, bootId, pidNamespace, startTicks: started.ticks };
+  } catch { return unavailable; }
+}
+
+function validLockRecord(record) {
+  if (!sameKeys(record, ['kind', 'version', 'nonce', 'owner']) || Object.keys(record).length !== 4 ||
+    record.kind !== LOCK_KIND || record.version !== 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.nonce ?? '') ||
+    !sameKeys(record.owner, ['pid', 'bootId', 'pidNamespace', 'startTicks']) || Object.keys(record.owner).length !== 4 ||
+    !Number.isSafeInteger(record.owner.pid) || record.owner.pid < 1) return false;
+  const { bootId, pidNamespace, startTicks } = record.owner;
+  return (bootId === null && pidNamespace === null && startTicks === null) ||
+    (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(bootId ?? '') &&
+      /^pid:\[\d{1,24}\]$/.test(pidNamespace ?? '') && /^\d{1,24}$/.test(startTicks ?? ''));
+}
+
+async function ownerProvenDead(owner, current) {
+  if (process.platform !== 'linux' || !current.bootId || owner.bootId !== current.bootId ||
+    owner.pidNamespace !== current.pidNamespace || owner.startTicks === null) return false;
+  try {
+    const [stat, pidNamespace] = await Promise.all([readFile(`/proc/${owner.pid}/stat`, 'utf8'), readlink(`/proc/${owner.pid}/ns/pid`)]);
+    const started = processStart(stat, owner.pid);
+    if (pidNamespace !== current.pidNamespace || !started) return false;
+    return started.ticks !== owner.startTicks || ['Z', 'X'].includes(started.state);
+  } catch (error) {
+    if (!['ENOENT', 'ESRCH'].includes(error.code)) return false;
+    try { process.kill(owner.pid, 0); return false; }
+    catch (error) { return error.code === 'ESRCH'; }
+  }
+}
+
+/** A recovery sentinel serializes conditional unlink/recreate. Every creator
+ * checks it both before and after O_EXCL. Legacy locks, foreign namespaces and
+ * an interrupted recovery sentinel remain held; no timeout deletes a live lock.
+ * This does not restore a refresh_pending record or extend a Corely grant. */
+export async function acquireSessionProcessLock(root, filename) {
+  if (typeof root !== 'string' || !isAbsolute(root) || resolve(root) !== root ||
+    !['info.lock', 'eason.lock', 'corely-vm-model-worker.lock'].includes(filename)) fail('SESSION_STORAGE_INVALID');
+  let directory, lock, recovery, recoveredOwnerNonce = null, released = false;
+  const lockPath = join(root, filename), recoveryPath = `${lockPath}.recovery`;
+  try {
+    const before = await lstat(root);
+    directory = await open(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const admitted = await directory.stat();
+    const checkDirectory = async () => {
+      const current = await lstat(root), retained = await directory.stat();
+      if (!current.isDirectory() || current.isSymbolicLink() || (current.mode & 0o777) !== 0o700 ||
+        (process.getuid && current.uid !== process.getuid()) || !sameInode(current, admitted) || !sameInode(retained, admitted)) fail('SESSION_STORAGE_NOT_PRIVATE');
+    };
+    if (!sameInode(before, admitted)) fail('SESSION_STORAGE_NOT_PRIVATE');
+    await checkDirectory();
+    const witness = await processWitness();
+    const readLock = async path => {
+      let handle;
+      try {
+        await checkDirectory();
+        const before = await lstat(path);
+        handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const stat = await handle.stat();
+        if (!privateLockFile(stat) || !sameInode(before, stat)) fail('SESSION_STORAGE_NOT_PRIVATE');
+        const bytes = await handle.readFile(), after = await handle.stat(), current = await lstat(path);
+        await checkDirectory();
+        if (bytes.length > 4096 || bytes.length !== stat.size || !privateLockFile(after) || !privateLockFile(current) ||
+          !sameInode(stat, after) || !sameInode(stat, current) || after.size !== stat.size ||
+          after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) fail('SESSION_BUSY_OR_LOCKED');
+        const text = new TextDecoder('utf8', { fatal: true }).decode(bytes), record = JSON.parse(text);
+        if (JSON.stringify(record) !== text || !validLockRecord(record)) fail('SESSION_BUSY_OR_LOCKED');
+        return { stat, record };
+      } catch (error) {
+        throw error instanceof ProbeError ? error : new ProbeError('SESSION_BUSY_OR_LOCKED');
+      } finally { await handle?.close(); }
+    };
+    const sentinelPresent = async () => {
+      await checkDirectory();
+      try { await lstat(recoveryPath); return true; }
+      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    };
+    const createLock = async path => {
+      let handle;
+      try {
+        await checkDirectory();
+        handle = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+        const record = { kind: LOCK_KIND, version: 1, nonce: randomUUID(), owner: witness };
+        await handle.writeFile(JSON.stringify(record)); await handle.sync();
+        const stat = await handle.stat(), current = await readLock(path);
+        if (!sameInode(stat, current.stat) || current.record.nonce !== record.nonce) fail('SESSION_BUSY_OR_LOCKED');
+        await directory.sync();
+        return { handle, stat, record, path };
+      } catch (error) { await handle?.close(); throw error; }
+    };
+    const removeOwnLock = async owned => {
+      const current = await readLock(owned.path), retained = await owned.handle.stat();
+      if (!sameInode(current.stat, owned.stat) || !sameInode(retained, owned.stat) || current.record.nonce !== owned.record.nonce) fail('SESSION_LOCK_CLEANUP_UNCONFIRMED');
+      await unlink(owned.path); await directory.sync();
+    };
+    const cleanup = async () => {
+      let failed = false;
+      for (const owned of [lock, recovery]) {
+        if (!owned) continue;
+        try { await removeOwnLock(owned); } catch { failed = true; }
+        try { await owned.handle.close(); } catch { failed = true; }
+      }
+      lock = recovery = undefined;
+      try { await directory.close(); } catch { failed = true; }
+      if (failed) fail('SESSION_LOCK_CLEANUP_UNCONFIRMED');
+    };
+    try {
+      if (await sentinelPresent()) fail('SESSION_BUSY_OR_LOCKED');
+      try { lock = await createLock(lockPath); }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        const stale = await readLock(lockPath);
+        if (!await ownerProvenDead(stale.record.owner, witness)) fail('SESSION_BUSY_OR_LOCKED');
+        recovery = await createLock(recoveryPath);
+        const current = await readLock(lockPath), sentinel = await readLock(recoveryPath);
+        if (!sameInode(stale.stat, current.stat) || stale.record.nonce !== current.record.nonce ||
+          !sameInode(recovery.stat, sentinel.stat) || recovery.record.nonce !== sentinel.record.nonce ||
+          !await ownerProvenDead(current.record.owner, witness)) fail('SESSION_BUSY_OR_LOCKED');
+        await unlink(lockPath); await directory.sync();
+        lock = await createLock(lockPath);
+        recoveredOwnerNonce = current.record.nonce;
+      }
+      if (!recovery && await sentinelPresent()) fail('SESSION_BUSY_OR_LOCKED');
+      if (recovery) {
+        await removeOwnLock(recovery); await recovery.handle.close(); recovery = undefined;
+      }
+      const release = async () => { if (!released) { released = true; await cleanup(); } };
+      // Lifecycle records may bind to this non-secret process lease. Only the
+      // proven-dead, exact reclaimed owner is exposed, never a guessed owner.
+      Object.defineProperties(release, { ownerNonce: { value: lock.record.nonce, enumerable: true },
+        recoveredOwnerNonce: { value: recoveredOwnerNonce, enumerable: true } });
+      return Object.freeze(release);
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
+  } catch (error) {
+    if (directory && !lock && !recovery) await directory.close().catch(() => {});
+    throw error instanceof ProbeError ? error : new ProbeError('SESSION_BUSY_OR_LOCKED');
+  }
+}
+
 /** The selected application path is canonicalized; no credential-store discovery
  * or native runtime home is consulted. Existing weak permissions are rejected,
  * never silently repaired. The VM's host ID is separate from imported sessions. */
@@ -124,18 +287,13 @@ export async function openSessionStore(path, { runtime = 'vm' } = {}) {
     const current = new Promise(resolve => { release = resolve; });
     const tail = previous.then(() => current); queues.set(alias, tail);
     await previous;
-    let lock;
-    const lockPath = join(root, `${alias}.lock`);
+    let unlock;
     try {
-      try { lock = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600); }
-      catch { fail('SESSION_BUSY_OR_LOCKED'); }
+      unlock = await acquireSessionProcessLock(root, `${alias}.lock`);
       return await action();
     } finally {
       let cleanupFailed = false;
-      if (lock) {
-        try { await lock.close(); } catch { cleanupFailed = true; }
-        try { await unlink(lockPath); } catch { cleanupFailed = true; }
-      }
+      try { await unlock?.(); } catch { cleanupFailed = true; }
       release(); if (queues.get(alias) === tail) queues.delete(alias);
       if (cleanupFailed) fail('SESSION_LOCK_CLEANUP_UNCONFIRMED');
     }
@@ -322,17 +480,19 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
     return time;
   };
   const checkAbort = signal => { if (signal?.aborted) fail('SESSION_OPERATION_ABORTED'); };
-  async function withFreshRecord(alias, action, signal) {
+  async function withFreshRecord(alias, action, signal, unavailable) {
     checkAbort(signal);
     return store.locked(alias, async () => {
       checkAbort(signal);
       const record = await store.read(alias);
-      if (!record || record.state !== 'active') fail(record?.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED');
       const start = clock(record);
+      if (record?.state === 'reauth_required' && record.subjectHash && unavailable) return unavailable(record);
+      if (!record || record.state !== 'active') fail(record?.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED');
       if (record.expiresAt > start + 60000) return action(record);
       // A durable pending marker prevents rotating-token reuse after crash,
       // network ambiguity or an atomic replacement failure. Never auto-retry it.
       await store.write(alias, { ...record, state: 'refresh_pending' });
+      let refreshed;
       try {
         const token = await refreshTokenRequest(record, fetchImpl, signal);
         // Save a returned rotating renewal handle for revocation only before
@@ -348,15 +508,17 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
         }
         const jwks = token.id_token !== undefined ? await publicJson(`${ISSUER}/.well-known/jwks.json`, {}, fetchImpl, signal) : undefined;
         checkAbort(signal);
-        const refreshed = validatedRefresh(record, token, jwks, clock(record));
+        refreshed = validatedRefresh(record, token, jwks, clock(record));
         await store.write(alias, refreshed);
-        return action(refreshed);
       } catch (error) {
         if (error instanceof ProbeError && error.code === 'SESSION_REAUTH_REQUIRED') {
-          await store.write(alias, withoutTokens(record, 'reauth_required', clock(record)));
+          const unavailableRecord = withoutTokens(record, 'reauth_required', clock(record));
+          await store.write(alias, unavailableRecord);
+          if (unavailable) return unavailable(unavailableRecord);
         }
         throw error instanceof ProbeError ? error : new ProbeError('REFRESH_OUTCOME_UNCERTAIN');
       }
+      return action(refreshed);
     });
   }
   async function probe(alias, signal) {
@@ -385,9 +547,17 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       for (const alias of ['info', 'eason']) {
         checkAbort(signal);
         const record = await store.read(alias);
-        if (!record || record.state !== 'active') continue;
+        clock(record);
+        if (!record) { results.push({ alias, state: 'not_connected' }); continue; }
+        if (record.state !== 'active') {
+          results.push({ alias, state: 'held', code: record.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED' });
+          continue;
+        }
         try { results.push(await withFreshRecord(alias, record => sessionMetadata(record), signal)); }
-        catch (error) { results.push({ alias, state: 'held', code: error instanceof ProbeError ? error.code : 'SESSION_MANAGER_FAILED' }); }
+        catch (error) {
+          if (signal?.aborted || (error instanceof ProbeError && error.code === 'SESSION_OPERATION_ABORTED')) throw error;
+          results.push({ alias, state: 'held', code: error instanceof ProbeError ? error.code : 'SESSION_MANAGER_FAILED' });
+        }
       }
       return Object.freeze({ status: 'SESSION_MAINTENANCE_COMPLETED', accounts: results, apiFallbackUsed: false });
     },
@@ -403,7 +573,15 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       if (modelCalls.has(call) || modelCalls.size >= 1000) return Promise.reject(new ProbeError('MODEL_CALL_REPLAY_OR_CAPACITY'));
       modelCalls.add(call);
       return withFreshRecord(alias, record => runCorelyPlanRequest({ alias, accessToken: record.accessToken,
-        expiresAt: record.expiresAt, planScopeGranted: true, accountMatchesExpected: true }, request, fetchImpl, signal), signal);
+        expiresAt: record.expiresAt, planScopeGranted: true, accountMatchesExpected: true }, request, fetchImpl, signal), signal, record => {
+        checkAbort(signal);
+        // This verifies the retained signed enrollment, not current upstream
+        // authentication. No model call has been dispatched for this witness.
+        return Object.freeze({ accountAlias: alias, authMode: 'siwc_plan', accountVerified: true, model: request.model,
+          callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
+          status: 'account_unavailable', code: 'ACCOUNT_UNAVAILABLE', reason: 'REAUTH_REQUIRED', noModelMade: true,
+          probeSettled: true, accountEnrollmentRevision: record.revision });
+      });
     },
     async probeInAccountOrder(signal) {
       try { return { ...await probe('info', signal), fallbackReason: null }; }

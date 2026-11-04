@@ -668,7 +668,7 @@ func TestSIWCGatewayResponsesPassthroughAndSingleAttempt(t *testing.T) {
 	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: true})
 	_, found := service.GetPreferredChannelByAffinity(c, "gpt-6.1-sol", "corely-dev-siwc-test")
 	assert.False(t, found, "a cold affinity cache must already enforce strict session semantics")
-	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusGatewayTimeout} {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusConflict, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusGatewayTimeout} {
 		decision := service.DecideRelayRetry(c, types.NewErrorWithStatusCode(errors.New("synthetic failure"), types.ErrorCodeDoRequestFailed, status), 3)
 		assert.Equal(t, "stop", decision.Action)
 		assert.Equal(t, "strict_session", decision.Reason)

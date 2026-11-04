@@ -176,6 +176,17 @@ export function snapshotModelResult(input, request, accountAlias, authMode) {
       result.authMode !== authMode || result.accountVerified !== true || result.model !== MODEL ||
       result.callId !== request.callId || result.inputSha256 !== request.inputSha256 || result.schemaSha256 !== request.schemaSha256) held('INVALID_RECEIPT');
   const keys = ['accountAlias', 'authMode', 'accountVerified', 'model', 'callId', 'inputSha256', 'schemaSha256', 'status'];
+  // This is a retained, previously signed enrollment witness, not a fresh
+  // provider-authentication or quota claim. Only the session owner can mint it
+  // before dispatch under its account lock. Gateway nonce and VM lease binding
+  // are still required by the caller; an HTTP 401/403 cannot create it.
+  if (result.status === 'account_unavailable') {
+    if (authMode !== 'siwc_plan' || result.code !== 'ACCOUNT_UNAVAILABLE' || result.reason !== 'REAUTH_REQUIRED' ||
+        result.noModelMade !== true || result.probeSettled !== true ||
+        !Number.isSafeInteger(result.accountEnrollmentRevision) || result.accountEnrollmentRevision < 1 ||
+        Object.keys(result).some(key => ![...keys, 'code', 'reason', 'noModelMade', 'probeSettled', 'accountEnrollmentRevision'].includes(key))) held('INVALID_RECEIPT');
+    return result;
+  }
   if (result.status === 'provider_failure') {
     if (authMode !== 'siwc_plan' || result.code !== 'PROVIDER_UNAVAILABLE' || result.operationSettled !== true ||
         !['RATE_LIMIT', 'UPSTREAM'].includes(result.reason) ||

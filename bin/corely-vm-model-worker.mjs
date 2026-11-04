@@ -14,7 +14,7 @@ import { connectCorelyVmModelJobs, CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_S
 import { executeOneCorelyModelJob } from './siwc-local-corely-worker.mjs';
 import { createSiwcModelTransports } from './siwc-local-model-port.mjs';
 import { createSiwcGatewayModelTransports } from './siwc-gateway-model-port.mjs';
-import { openSessionStore, createPersistentPlanSessions, VM_NAME } from './siwc-local-sessions.mjs';
+import { openSessionStore, createPersistentPlanSessions, acquireSessionProcessLock, VM_NAME } from './siwc-local-sessions.mjs';
 import { assertIsolatedSessionEnvironment } from './siwc-local-vm.mjs';
 import { MODEL, digest } from './siwc-local-runtime.mjs';
 
@@ -68,7 +68,8 @@ async function protectedDirectory(stateDir) {
       if (!current.isDirectory() || current.isSymbolicLink() || !owner(current) || (current.mode & 0o777) !== 0o700 ||
           !sameInode(current, admitted) || !sameInode(retained, admitted)) fail('WORKER_STORAGE_NOT_PRIVATE');
     };
-    const read = async (filename, optional = false) => {
+    const retirementSnapshots = new WeakSet();
+    const readSnapshot = async (filename, optional = false) => {
       let file;
       try {
         await check(); const path = join(root, filename), before = await lstat(path);
@@ -89,11 +90,27 @@ async function protectedDirectory(stateDir) {
         const text = new TextDecoder('utf8', { fatal: true }).decode(bytes), value = JSON.parse(text);
         // Our records have one canonical serialization; reject duplicate fields.
         if (JSON.stringify(value) !== text) fail('WORKER_STORAGE_INVALID');
-        return value;
+        const snapshot = Object.freeze({ filename, value, stat, encodedSha256: digest(text) });
+        retirementSnapshots.add(snapshot);
+        return snapshot;
       } catch (error) {
         if (optional && error.code === 'ENOENT') return undefined;
         throw error instanceof VmModelWorkerError ? error : new VmModelWorkerError('WORKER_STORAGE_INVALID');
       } finally { await file?.close(); }
+    };
+    const read = async (filename, optional = false) => (await readSnapshot(filename, optional))?.value;
+    const retire = async snapshot => {
+      // Only a private canonical prompt read by this directory owner may be
+      // retired. An identical-content replacement is still a different file.
+      if (!retirementSnapshots.has(snapshot) || snapshot.filename !== PROMPT_FILE) fail('WORKER_CLEANUP_UNCONFIRMED');
+      const fresh = await readSnapshot(PROMPT_FILE);
+      if (!sameInode(snapshot.stat, fresh.stat) || snapshot.encodedSha256 !== fresh.encodedSha256 ||
+          snapshot.stat.size !== fresh.stat.size || snapshot.stat.mtimeMs !== fresh.stat.mtimeMs ||
+          snapshot.stat.ctimeMs !== fresh.stat.ctimeMs) fail('WORKER_CLEANUP_UNCONFIRMED');
+      await check(); const path = join(root, PROMPT_FILE), current = await lstat(path);
+      if (!privateFile(current) || !sameInode(current, fresh.stat) || current.size !== fresh.stat.size ||
+          current.mtimeMs !== fresh.stat.mtimeMs || current.ctimeMs !== fresh.stat.ctimeMs) fail('WORKER_CLEANUP_UNCONFIRMED');
+      await unlink(path); await handle.sync(); retirementSnapshots.delete(snapshot);
     };
     const create = async (filename, value) => {
       let file;
@@ -118,7 +135,7 @@ async function protectedDirectory(stateDir) {
         throw error instanceof VmModelWorkerError ? error : new VmModelWorkerError('WORKER_STORAGE_INVALID');
       } finally { await file?.close(); }
     };
-    return { read, create, check, async close() {
+    return { read, create, check, readForRetirement: filename => readSnapshot(filename, true), retire, async close() {
       try { await handle.close(); } catch { fail('WORKER_CLEANUP_UNCONFIRMED'); }
     } };
   } catch (error) {
@@ -260,9 +277,46 @@ export async function openCorelyVmModelGateway(stateDir, sessions, signal, {
 export async function openCorelyVmModelWorkerLifecycle(stateDir, keyThumbprint) {
   if (!/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(keyThumbprint ?? '')) fail('WORKER_OPTIONS_INVALID');
   const directory = await protectedDirectory(stateDir);
-  let release, removePrompt, closed = false;
-  try { release = await directory.create(LOCK_FILE, { kind: 'CORELY_DEV_VM_MODEL_WORKER_LOCK', version: 1 }); }
-  catch (error) { await directory.close(); throw error; }
+  let release, removePrompt, ownerNonce, closed = false;
+  try {
+    await directory.check();
+    const releaseLock = await acquireSessionProcessLock(stateDir, LOCK_FILE);
+    release = async () => {
+      try { await directory.check(); await releaseLock(); }
+      catch { fail('WORKER_CLEANUP_UNCONFIRMED'); }
+    };
+    await directory.check();
+    ownerNonce = releaseLock.ownerNonce;
+    const recoveredOwnerNonce = releaseLock.recoveredOwnerNonce;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(ownerNonce ?? '') ||
+        recoveredOwnerNonce !== null && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(recoveredOwnerNonce ?? '') ||
+        recoveredOwnerNonce === ownerNonce) fail('WORKER_AUTHORITY_HELD');
+    const priorPrompt = await directory.readForRetirement(PROMPT_FILE);
+    if (priorPrompt) {
+      const previous = priorPrompt.value;
+      if (!recoveredOwnerNonce || !exact(previous, ['kind', 'version', 'ownerNonce', 'scope', 'vmHostIdHash',
+        'verificationUriComplete', 'userCode', 'expiresIn', 'keyThumbprint', 'syntheticOnly', 'apiFallbackEnabled']) ||
+          previous.kind !== 'CORELY_DEV_VM_MODEL_CONSENT' || previous.version !== 2 || previous.ownerNonce !== recoveredOwnerNonce ||
+          previous.scope !== CORELY_VM_MODEL_JOB_SCOPE || previous.vmHostIdHash !== CORELY_VM_HOST_ID_HASH ||
+          previous.keyThumbprint !== keyThumbprint || previous.syntheticOnly !== true || previous.apiFallbackEnabled !== false ||
+          typeof previous.verificationUriComplete !== 'string' ||
+          !previous.verificationUriComplete.startsWith(`${CORELY_VM_VERIFICATION_URI}?requestId=`) ||
+          !/^vm_models_[A-Za-z0-9_-]{43}$/.test(previous.verificationUriComplete.slice(`${CORELY_VM_VERIFICATION_URI}?requestId=`.length)) ||
+          !/^[A-F0-9]{4}-[A-F0-9]{4}$/.test(previous.userCode ?? '') || previous.expiresIn !== 300) fail('WORKER_AUTHORITY_HELD');
+      // The old URL/reference is discarded, never resumed or activated. The
+      // caller must obtain and present a fresh normal Corely consent request.
+      await directory.retire(priorPrompt);
+    }
+  } catch (error) {
+    let cleanupFailed = false;
+    if (release) try { await release(); } catch { cleanupFailed = true; }
+    await directory.close();
+    if (cleanupFailed) fail('WORKER_CLEANUP_UNCONFIRMED');
+    if (error instanceof VmModelWorkerError) throw error;
+    if (error?.code === 'SESSION_BUSY_OR_LOCKED') fail('WORKER_ALREADY_RUNNING');
+    if (error?.code === 'SESSION_LOCK_CLEANUP_UNCONFIRMED') fail('WORKER_CLEANUP_UNCONFIRMED');
+    fail(error?.code === 'SESSION_STORAGE_NOT_PRIVATE' ? 'WORKER_STORAGE_NOT_PRIVATE' : 'WORKER_STORAGE_INVALID');
+  }
   const clearConsent = async () => { if (removePrompt) { await removePrompt(); removePrompt = undefined; } };
   return Object.freeze({
     async presentConsent(value) {
@@ -273,7 +327,8 @@ export async function openCorelyVmModelWorkerLifecycle(stateDir, keyThumbprint) 
           !value.verificationUriComplete.startsWith(`${CORELY_VM_VERIFICATION_URI}?requestId=`) ||
           !/^[A-F0-9]{4}-[A-F0-9]{4}$/.test(value.userCode ?? '') || value.expiresIn !== 300 || value.interval !== 5 ||
           value.scope !== CORELY_VM_MODEL_JOB_SCOPE || value.vmHostIdHash !== CORELY_VM_HOST_ID_HASH || value.keyThumbprint !== keyThumbprint) fail('WORKER_AUTHORITY_HELD');
-      removePrompt = await directory.create(PROMPT_FILE, { kind: 'CORELY_DEV_VM_MODEL_CONSENT', version: 1,
+      removePrompt = await directory.create(PROMPT_FILE, { kind: 'CORELY_DEV_VM_MODEL_CONSENT', version: 2,
+        ownerNonce, scope: value.scope, vmHostIdHash: value.vmHostIdHash,
         verificationUriComplete: value.verificationUriComplete, userCode: value.userCode, expiresIn: value.expiresIn,
         keyThumbprint: value.keyThumbprint, syntheticOnly: true, apiFallbackEnabled: false });
       return Object.freeze({ status: 'CORELY_VM_MODEL_WORKER_CONSENT_REQUIRED', record: PROMPT_FILE, expiresIn: 300,
@@ -293,6 +348,30 @@ const readyStatus = status => status?.status === 'SYNTHETIC_VM_MODEL_TRANSPORT_V
   status.producerConnected === true && status.authMode === 'siwc_plan' && status.enrolled === true && status.syntheticOnly === true &&
   status.tenantId === 'moztech' && status.brandId === 'moztech-test' && status.scope === CORELY_VM_MODEL_JOB_SCOPE &&
   status.apiFallbackEnabled === false && status.sendingCapability === false && status.learningCapability === false;
+
+/** Session maintenance is not a model receipt or permission to rotate accounts.
+ * A failed standby must not block a healthy primary, but unknown store/identity
+ * failures and an entirely unavailable account set still stop the worker. The
+ * producer continues to own account selection; generation rechecks its session. */
+export function assertCorelyVmModelSessionMaintenance(maintenance, now = Date.now()) {
+  if (!exact(maintenance, ['status', 'accounts', 'apiFallbackUsed']) || maintenance.status !== 'SESSION_MAINTENANCE_COMPLETED' ||
+      maintenance.apiFallbackUsed !== false || !Array.isArray(maintenance.accounts) || maintenance.accounts.length !== 2 ||
+      !Number.isSafeInteger(now) || now < 0) fail('WORKER_SESSION_HELD');
+  let available = false;
+  for (const [index, alias] of ['info', 'eason'].entries()) {
+    const account = maintenance.accounts[index];
+    if (!object(account) || account.alias !== alias) fail('WORKER_SESSION_HELD');
+    if (account.state === 'active') {
+      if (account.identityVerified !== true || account.registrationRetained !== true ||
+          account.authorizationSource !== 'APP_OWNED_SIWC' || account.apiFallbackEnabled !== false || account.syntheticOnly !== true ||
+          !Number.isSafeInteger(account.expiresAt) || account.expiresAt <= now) fail('WORKER_SESSION_HELD');
+      available = true;
+    } else if (account.state === 'held') {
+      if (!['SESSION_REAUTH_REQUIRED', 'REFRESH_OUTCOME_UNCERTAIN', 'REFRESH_CLIENT_INVALID'].includes(account.code)) fail('WORKER_SESSION_HELD');
+    } else if (!['not_connected', 'disconnected', 'reauth_required'].includes(account.state)) fail('WORKER_SESSION_HELD');
+  }
+  if (!available) fail('WORKER_SESSION_HELD');
+}
 
 /** Single-flight consumer. Corely owns producer admission and account fallback;
  * this loop cannot create work, approve a draft, send, learn, or retry ambiguity. */
@@ -420,8 +499,7 @@ export async function runVmModelWorkerCommand(argv) {
     safe(await runCorelyVmModelWorker({ client, ports: gateway?.ports ?? createSiwcModelTransports(sessions), signal: active,
       onReceipt: value => safe(gateway && value.status === 'CORELY_SYNTHETIC_MODEL_JOB_COMPLETED'
         ? { ...value, modelTransport: 'new_api_gateway_siwc' } : value), maintainSessions: async active => {
-        const maintenance = await sessions.maintain(active);
-        if (maintenance.accounts.some(account => account.state === 'held')) fail('WORKER_SESSION_HELD');
+        assertCorelyVmModelSessionMaintenance(await sessions.maintain(active));
       } }));
   } finally {
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); controller.abort();
