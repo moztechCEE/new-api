@@ -33,6 +33,19 @@ function resultFixture(request, alias = 'info', overrides = {}) {
     text: 'Synthetic support answer.', usage: { inputTokens: 23, outputTokens: 7, cachedInputTokens: 3 }, ...overrides };
 }
 
+function jointRequestFixture(callId, overrides = {}, omitted = []) {
+  const options = { workload: 'DECISION_LLM', purpose: 'joint_evidence_decision', responseFormat: 'json',
+    system: '完整合成證據與決策規範🙂\r\n先依據完整來源判讀；獨立品質覆核仍須另行執行。',
+    user: JSON.stringify({ evidenceContext: { sources: [{ id: 'K1', text: '完整合成來源🙂\r\n第二行依據。' }] },
+      decisionContext: '完整當前合成問題\r\n保留 topic、階段與工具邊界。' }),
+    responseSchema: { type: 'object', additionalProperties: false, required: ['evidence', 'decisionJson'], properties: {
+      evidence: { type: 'object', additionalProperties: false, required: ['coverage'], properties: {
+        coverage: { type: 'array', minItems: 1, items: { type: 'string' } } } },
+      decisionJson: { type: 'string' } } }, reasoningEffort: 'low', verbosity: 'low', ...overrides };
+  for (const key of omitted) delete options[key];
+  return requestFixture(callId, options);
+}
+
 async function bridgeCall(handleRequest, body, { headers = {}, remoteAddress = '127.0.0.1', method = 'POST',
   url = '/v1/responses', rawHeaders, chunks, onReady } = {}) {
   const req = Readable.from(chunks ?? [Buffer.from(body)]);
@@ -119,6 +132,121 @@ test('bound hints cross the Gateway while both accounts send the complete conser
   assert.equal(state.calls.length, 2); assert.equal(providerCalls.length, 2);
   assert.deepEqual(providerCalls.map(call => call.alias), ['info', 'eason']);
   assert.deepEqual(providerCalls[0].payload, providerCalls[1].payload);
+});
+
+test('joint decision keeps immutable prompts and strict JSON through both Gateway accounts; review remains a separate call', async t => {
+  const providerCalls = [], catalogCalls = [], jointText = JSON.stringify({ evidence: { coverage: ['Synthetic topic'] },
+    decisionJson: JSON.stringify({ intentCode: 'synthetic', notes: 'Synthetic decision, not a reply or review.' }) });
+  const state = harness(t, { generate: (alias, original, signal) => runCorelyPlanRequest({ alias,
+    planScopeGranted: true, accountMatchesExpected: true, accessToken: `synthetic-${alias}-access`, expiresAt: Date.now() + 300_000 },
+  original, async (url, init) => {
+    assert.equal(init.headers.Authorization, `Bearer synthetic-${alias}-access`);
+    if (url === 'https://api.openai.com/v1/models') {
+      catalogCalls.push(alias); return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+    }
+    assert.equal(url, 'https://api.openai.com/v1/responses');
+    const payload = JSON.parse(init.body); providerCalls.push({ alias, purpose: original.purpose, payload });
+    assert.equal(payload.instructions, original.system); assert.deepEqual(payload.input, [{ role: 'user', content: original.user }]);
+    assert.deepEqual(payload.text, { format: { type: 'json_schema', name: 'corely_model_output', strict: true,
+      schema: original.responseSchema }, verbosity: 'low' });
+    assert.equal(payload.model, MODEL); assert.equal(payload.stream, true); assert.equal(payload.store, false);
+    assert.deepEqual(payload.reasoning, { effort: 'low' }); assert.equal(Object.hasOwn(payload, 'metadata'), false);
+    const text = original.purpose === 'joint_evidence_decision' ? jointText : '{"accepted":true}';
+    return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: {
+      id: `synthetic-${alias}-${original.callId}`, status: 'completed', model: MODEL,
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }],
+      usage: { input_tokens: 23, output_tokens: 7, total_tokens: 30, input_tokens_details: { cached_tokens: 3 } },
+    } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+  }, signal) });
+  for (const alias of ['info', 'eason']) {
+    const request = jointRequestFixture(`joint-${alias}`), expected = canonical(request);
+    const running = state.instance.ports[alias].generate(request, new AbortController().signal);
+    request.system = 'Changed after dispatch'; request.user = 'Changed after dispatch';
+    request.responseSchema.properties.decisionJson.type = 'number';
+    const result = await running;
+    assert.equal(result.status, 'success'); assert.equal(result.accountAlias, alias); assert.equal(result.authMode, 'siwc_plan');
+    assert.equal(result.accountVerified, true); assert.equal(result.completionStatus, 'completed'); assert.equal(result.model, MODEL);
+    assert.equal(result.text, jointText); assert.equal(result.inputSha256, expected.inputSha256);
+    assert.equal(result.schemaSha256, expected.schemaSha256); assert.equal(result.callId, expected.callId);
+    assert.deepEqual(state.calls.at(-1).request, expected); assert.equal(Object.isFrozen(state.calls.at(-1).request), true);
+    assert.equal(Object.isFrozen(state.calls.at(-1).request.responseSchema.properties), true);
+    const wire = JSON.parse(state.requests.at(-1).init.body);
+    assert.equal(wire.instructions, expected.system); assert.deepEqual(wire.input, [{ role: 'user', content: expected.user }]);
+    assert.equal(wire.text.format.strict, true); assert.deepEqual(wire.text.format.schema, expected.responseSchema);
+    const review = requestFixture(`review-${alias}`, { purpose: 'semantic_reply_review', responseFormat: 'json',
+      reasoningEffort: 'low', verbosity: 'low', responseSchema: { type: 'object', additionalProperties: false,
+        required: ['accepted'], properties: { accepted: { type: 'boolean' } } } });
+    assert.equal((await state.instance.ports[alias].generate(review, new AbortController().signal)).text, '{"accepted":true}');
+  }
+  assert.deepEqual(state.calls.map(call => call.request.purpose),
+    ['joint_evidence_decision', 'semantic_reply_review', 'joint_evidence_decision', 'semantic_reply_review']);
+  assert.deepEqual(providerCalls.map(call => [call.alias, call.purpose]),
+    [['info', 'joint_evidence_decision'], ['info', 'semantic_reply_review'], ['eason', 'joint_evidence_decision'], ['eason', 'semantic_reply_review']]);
+  assert.equal(catalogCalls.length, 4); assert.equal(state.requests.length, 4); assert.equal(state.diagnostics.length, 0);
+  assert.deepEqual(providerCalls[0].payload, providerCalls[2].payload);
+});
+
+test('joint decision workload, JSON, schema, scope and hash failures stop before Gateway/provider dispatch', async t => {
+  const variants = [
+    ...['REPLY_LLM', 'WEB_CHAT_VISION', 'MEDIA_IMAGE_ANALYSIS'].map(workload => [workload, { workload }, [], 'INVALID_REQUEST']),
+    ['missing-json', {}, ['responseFormat'], 'INVALID_REQUEST'],
+    ['wrong-format', { responseFormat: 'text' }, [], 'INVALID_REQUEST'],
+    ['missing-schema', {}, ['responseSchema'], 'INVALID_REQUEST'],
+    ['null-schema', { responseSchema: null }, [], 'INVALID_REQUEST'],
+    ['empty-schema', { responseSchema: {} }, [], 'UNSUPPORTED_CAPABILITY'],
+    ['invalid-schema', { responseSchema: { type: 'object', properties: {}, required: [], additionalProperties: true } }, [], 'UNSUPPORTED_CAPABILITY'],
+    ['foreign-brand', { scope: { tenantId: 'moztech', brandId: 'other-brand', synthetic: true, jobId: 'synthetic' } }, [], 'SCOPE_NOT_ADMITTED'],
+    ['foreign-tenant', { scope: { tenantId: 'other-tenant', brandId: 'moztech-test', synthetic: true, jobId: 'synthetic' } }, [], 'SCOPE_NOT_ADMITTED'],
+    ['real-customer', { scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: false, jobId: 'synthetic' } }, [], 'SCOPE_NOT_ADMITTED'],
+  ];
+  for (const [name, overrides, omitted, code] of variants) await t.test(name, async t => {
+    const state = harness(t);
+    await assert.rejects(state.instance.ports.info.generate(jointRequestFixture(name, overrides, omitted), new AbortController().signal), { code });
+    assert.equal(state.requests.length, 0); assert.equal(state.calls.length, 0);
+  });
+  for (const field of ['system', 'schema']) await t.test(`tampered-${field}`, async t => {
+    const state = harness(t), request = jointRequestFixture(`tampered-${field}`);
+    if (field === 'system') request.system += ' Changed without rebinding.';
+    else request.responseSchema.properties.decisionJson.type = 'number';
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'INPUT_MISMATCH' });
+    assert.equal(state.requests.length, 0); assert.equal(state.calls.length, 0);
+  });
+});
+
+test('joint Gateway payload tampering and invalid provider JSON cannot produce a verified completion or retry', async t => {
+  for (const field of ['instructions', 'schema']) await t.test(`wire-${field}`, async t => {
+    const state = harness(t, { gateway: async (instance, init) => {
+      const payload = JSON.parse(init.body);
+      if (field === 'instructions') payload.instructions += ' Modified at Gateway.';
+      else payload.text.format.schema.properties.decisionJson.type = 'number';
+      return (await bridgeCall(instance.handleRequest, JSON.stringify(payload))).response;
+    } });
+    await assert.rejects(state.instance.ports.info.generate(jointRequestFixture(`wire-${field}`), new AbortController().signal));
+    assert.equal(state.requests.length, 1); assert.equal(state.calls.length, 0);
+  });
+  for (const text of ['not JSON', '{"evidence":{"coverage":["Synthetic topic"]},"decisionJson":{}}',
+    '{"evidence":{"coverage":["Synthetic topic"]}}', '{"evidence":{"coverage":[]},"decisionJson":"{}"}']) {
+    await t.test('invalid joint provider completion', async t => {
+      let providerCalls = 0;
+      const state = harness(t, { generate: (alias, request, signal) => runCorelyPlanRequest({ alias,
+        planScopeGranted: true, accountMatchesExpected: true, accessToken: 'synthetic-info-access', expiresAt: Date.now() + 300_000 },
+      request, async url => {
+        if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+        assert.equal(url, 'https://api.openai.com/v1/responses'); providerCalls++;
+        return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: {
+          id: 'synthetic-invalid-joint', status: 'completed', model: MODEL,
+          output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }],
+          usage: { input_tokens: 23, output_tokens: 7, total_tokens: 30 },
+        } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+      }, signal) });
+      const request = jointRequestFixture('invalid-joint');
+      await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_CALL_ABORTED' });
+      assert.equal(state.diagnostics[0].reason, 'INVALID_STRUCTURED_OUTPUT');
+      assert.equal(state.calls.length, 1); assert.equal(state.calls[0].alias, 'info'); assert.equal(providerCalls, 1);
+      await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+      assert.equal(state.calls.length, 1); assert.equal(state.requests.length, 1); assert.equal(providerCalls, 1);
+    });
+  }
 });
 
 test('only bound authenticated quota receipt returns quota; generic/fabricated Gateway429 never does', async t => {

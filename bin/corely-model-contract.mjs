@@ -8,7 +8,7 @@ const MAX_BYTES = 1024 * 1024;
 const REQUEST_KEYS = new Set(['version', 'callId', 'workload', 'purpose', 'model', 'scope', 'system', 'user', 'responseFormat',
   'responseSchema', 'image', 'reasoningEffort', 'verbosity', 'promptCache', 'inputSha256', 'schemaSha256']);
 const WORKLOADS = new Set(['DECISION_LLM', 'REPLY_LLM', 'WEB_CHAT_VISION', 'MEDIA_IMAGE_ANALYSIS']);
-const PURPOSES = new Set(['semantic_reply_review', 'semantic_evidence_selection', 'support_decision', 'reply_generation',
+const PURPOSES = new Set(['semantic_reply_review', 'semantic_evidence_selection', 'joint_evidence_decision', 'support_decision', 'reply_generation',
   'reply_repair', 'structured_output', 'text_generation', 'image_analysis']);
 const SCHEMA_KEYS = new Set(['type', 'description', 'title', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
   'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'uniqueItems']);
@@ -132,6 +132,8 @@ function snapshotRequest(input, options) {
       request.version !== 1 || request.model !== MODEL || typeof request.callId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(request.callId) ||
       !WORKLOADS.has(request.workload) || !PURPOSES.has(request.purpose) || typeof request.system !== 'string' || !request.system.trim() ||
       typeof request.user !== 'string' || !request.user.trim() || (request.responseFormat !== undefined && request.responseFormat !== 'json') ||
+      (request.purpose === 'joint_evidence_decision' && (request.workload !== 'DECISION_LLM' ||
+        request.responseFormat !== 'json' || !request.responseSchema)) ||
       (request.verbosity !== undefined && request.verbosity !== 'low') ||
       (request.reasoningEffort !== undefined && (typeof request.reasoningEffort !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/.test(request.reasoningEffort)))) held('INVALID_REQUEST');
   const s = request.scope;
