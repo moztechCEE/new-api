@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   ISSUER, RESOURCE, MODEL, PROBE_INPUT, PROBE_OUTPUT, SCOPES, ProbeError,
   createAttempt, consumeCallback, validateSession, publicJson, selectExactModel,
-  syntheticRequest, consumeProbeStream, runSyntheticProbe, inferenceFailureDiagnostic, inferenceErrorClasses, digest,
+  syntheticRequest, consumeProbeStream, runSyntheticProbe, inferenceFailureDiagnostic, inferenceErrorClasses, settledInferenceFailureReason, digest,
 } from './siwc-local-runtime.mjs';
 import { loadRegistration, saveRegistration, startLocalPilot } from './siwc-local-pilot.mjs';
 
@@ -704,6 +704,53 @@ test('inference diagnostic hashes request IDs and never returns raw headers', as
   assert.equal('requestIdHash' in await inferenceFailureDiagnostic(excessive), false);
 });
 
+test('only coherent HTTP technical errors read through EOF carry a private settled witness', async t => {
+  for (const [status, type, code, reason] of [
+    [429, 'rate_limit_error', 'rate_limit_exceeded', 'RATE_LIMIT'],
+    [500, 'server_error', 'server_error', 'UPSTREAM'],
+    [503, 'server_error', 'service_unavailable', 'UPSTREAM'],
+    [503, 'server_error', 'server_is_overloaded', 'UPSTREAM'],
+  ]) await t.test(`${status}-${code}`, async () => {
+    const response = jsonResponse({ error: { type, code, param: null, message: 'PRIVATE_PROVIDER_MESSAGE' } }, status);
+    const diagnostic = await inferenceFailureDiagnostic(response);
+    assert.equal(response.body.locked, false);
+    assert.equal(settledInferenceFailureReason(diagnostic), reason);
+    assert.equal(settledInferenceFailureReason({ ...diagnostic, operationSettled: true, reason }), undefined);
+    assert.equal(settledInferenceFailureReason(new ProbeError(`INFERENCE_HTTP_${status}`, diagnostic)), undefined);
+    let touched = 0;
+    const foreign = new Proxy(diagnostic, { get() { touched++; throw new Error('PRIVATE_GETTER'); },
+      getOwnPropertyDescriptor() { touched++; throw new Error('PRIVATE_DESCRIPTOR'); } });
+    assert.equal(settledInferenceFailureReason(foreign), undefined); assert.equal(touched, 0);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE|rate_limit_exceeded|server_is_overloaded|service_unavailable/);
+  });
+  const rate = { type: 'rate_limit_error', code: 'rate_limit_exceeded' }, server = { type: 'server_error', code: 'server_error' };
+  const variants = [
+    ['success HTTP', 200, { error: server }], ['wrong rate status', 409, { error: rate }],
+    ['wrong server status', 429, { error: server }], ['wrong type', 503, { error: rate }],
+    ['missing code', 429, { error: { type: 'rate_limit_error' } }], ['null code', 500, { error: { ...server, code: null } }],
+    ['unknown code', 500, { error: { ...server, code: 'PRIVATE_UNKNOWN_CODE' } }],
+    ['global slow down', 429, { error: { ...rate, code: 'slow_down' } }],
+    ['permission type', 500, { error: { ...server, type: 'permission_error' } }],
+    ['eligibility code', 500, { error: { ...server, code: 'subscription_sharing_user_not_eligible' } }],
+    ['invalid user code', 429, { error: { ...rate, code: 'subscription_sharing_invalid_user' } }],
+    ['plan quota code', 429, { error: { ...rate, code: 'subscription_sharing_usage_limit_exceeded' } }],
+    ['parameter conflict', 429, { error: { ...rate, param: 'reasoning.effort' } }],
+    ['safety field', 500, { error: { ...server, refusal: 'PRIVATE_SAFETY' } }],
+    ['other envelope', 500, { error: server, detail: { code: 'permission_error' } }],
+    ['duplicate type', 500, '{"error":{"type":"permission_error","type":"server_error","code":"server_error"}}'],
+    ['escaped duplicate code', 500, '{"error":{"type":"server_error","code":"permission_error","co\\u0064e":"server_error"}}'],
+    ['wrong MIME', 500, { error: server }, { 'content-type': 'text/plain' }],
+    ...['30', '', 'PRIVATE_INVALID_RETRY'].map(value => [`retry-after-${value.length}`, 503,
+      { error: { ...server, code: 'server_is_overloaded' } }, { 'retry-after': value }]),
+  ];
+  for (const [name, status, body, headers = {}] of variants) await t.test(name, async () => {
+    const diagnostic = await inferenceFailureDiagnostic(new Response(typeof body === 'string' ? body : JSON.stringify(body),
+      { status, headers: { 'content-type': 'application/json', ...headers } }));
+    assert.equal(settledInferenceFailureReason(diagnostic), undefined);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE/);
+  });
+});
+
 test('inference diagnostic enforces the 16 KiB bound regardless of MIME and cancels over-limit bodies', async () => {
   const payload = JSON.stringify({ detail: 'synthetic-private-detail' });
   const atLimit = `${payload}${' '.repeat(16384 - Buffer.byteLength(payload))}`;
@@ -718,6 +765,7 @@ test('inference diagnostic enforces the 16 KiB bound regardless of MIME and canc
     });
     const result = await inferenceFailureDiagnostic(new Response(body, { headers }));
     assert.equal(result.bodyShape, 'OVER_LIMIT');
+    assert.equal(settledInferenceFailureReason(result), undefined);
     assert.equal(canceled, true);
   }
 });
@@ -739,6 +787,7 @@ test('inference diagnostic terminates unreadable, interrupted or stalled bodies 
     const stalled = new ReadableStream({ cancel() { canceled = true; } });
     const diagnostic = await inferenceFailureDiagnostic(new Response(stalled, { headers }), 5);
     assert.equal(diagnostic.bodyShape, 'UNREADABLE');
+    assert.equal(settledInferenceFailureReason(diagnostic), undefined);
     assert.equal(canceled, true);
     assert.equal(JSON.stringify(diagnostic).includes('SYNTHETIC_SECRET_DO_NOT_EMIT'), false);
   }

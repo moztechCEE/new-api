@@ -5,6 +5,7 @@ import { Readable } from 'node:stream';
 import { after, before, test } from 'node:test';
 import { createSiwcGatewayModelTransports } from './siwc-gateway-model-port.mjs';
 import { runCorelyPlanRequest } from './siwc-local-model-port.mjs';
+import { snapshotModelResult } from './corely-model-contract.mjs';
 import { MODEL, ProbeError } from './siwc-local-runtime.mjs';
 
 // Only injected synthetic Gateway/session fixtures run. No provider, credentials,
@@ -77,6 +78,17 @@ function harness(t, { generate, gateway, options = {} } = {}) {
   }, onDiagnostic: event => diagnostics.push(event), ...options });
   t.after(() => instance.close());
   return { instance, calls, requests, diagnostics, lifetime };
+}
+
+function publicPlanProvider(responseFor, providerCalls) {
+  return (alias, request, signal) => runCorelyPlanRequest({ alias, planScopeGranted: true, accountMatchesExpected: true,
+    accessToken: `synthetic-${alias}-access`, expiresAt: Date.now() + 300_000 }, request, async (url, init) => {
+    assert.equal(init.headers.Authorization, `Bearer synthetic-${alias}-access`);
+    if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+    assert.equal(url, 'https://api.openai.com/v1/responses');
+    providerCalls.push({ alias, request });
+    return responseFor(alias, request, signal);
+  }, signal);
 }
 
 test('Gateway and private bridge retain strict structured facts, identity, usage and single-attempt receipt', async t => {
@@ -263,6 +275,131 @@ test('only bound authenticated quota receipt returns quota; generic/fabricated G
       { status: 429, headers: { 'content-type': 'application/json' } }) });
     await assert.rejects(state.instance.ports.info.generate(requestFixture(), new AbortController().signal), { code: 'GATEWAY_RESPONSE_INVALID' });
     assert.equal(state.calls.length, 0); assert.equal(state.requests.length, 1);
+  });
+});
+
+test('settled SIWC HTTP failures cross only their original account/call/nonce record with fixed Gateway409', async t => {
+  for (const [status, type, code, reason] of [[429, 'rate_limit_error', 'rate_limit_exceeded', 'RATE_LIMIT'],
+    [500, 'server_error', 'server_error', 'UPSTREAM'], [503, 'server_error', 'service_unavailable', 'UPSTREAM']]) {
+    await t.test(`${status}-${reason}`, async t => {
+      const providerCalls = [], state = harness(t, { generate: publicPlanProvider(() =>
+        Response.json({ error: { type, code, message: 'PRIVATE_PROVIDER_MESSAGE' } }, { status }), providerCalls),
+      gateway: async (instance, init) => {
+        const bridge = await bridgeCall(instance.handleRequest, init.body);
+        assert.equal(bridge.res.status, 409);
+        assert.equal(bridge.res.body, '{"error":{"type":"corely_siwc_error","code":"provider_unavailable","message":"Corely SIWC request held"}}');
+        return bridge.response;
+      } });
+      const request = jointRequestFixture(`settled-${status}`);
+      for (const alias of ['info', 'eason']) {
+        const result = await state.instance.ports[alias].generate(request, new AbortController().signal);
+        assert.deepEqual(result, { accountAlias: alias, authMode: 'siwc_plan', accountVerified: true, model: MODEL,
+          callId: request.callId, inputSha256: request.inputSha256, schemaSha256: request.schemaSha256,
+          status: 'provider_failure', code: 'PROVIDER_UNAVAILABLE', reason, operationSettled: true });
+        assert.equal(Object.isFrozen(result), true);
+        assert.equal(state.calls.length, alias === 'info' ? 1 : 2);
+        await assert.rejects(state.instance.ports[alias].generate(request, new AbortController().signal), { code: 'GATEWAY_REPLAY_OR_CAPACITY' });
+      }
+      assert.deepEqual(providerCalls.map(call => call.alias), ['info', 'eason']);
+      assert.equal(state.requests.length, 2); assert.equal(state.diagnostics.length, 0);
+      assert.equal(new Set(state.requests.map(call => JSON.parse(call.init.body).metadata.corely_siwc_nonce)).size, 2);
+      assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE/);
+    });
+  }
+});
+
+test('Go status/body and foreign failure fields cannot create or transfer settled authority', async t => {
+  const request = jointRequestFixture('failure-binding');
+  const bound = { accountAlias: 'info', authMode: 'siwc_plan', accountVerified: true, model: MODEL, callId: request.callId,
+    inputSha256: request.inputSha256, schemaSha256: request.schemaSha256, status: 'provider_failure',
+    code: 'PROVIDER_UNAVAILABLE', reason: 'UPSTREAM', operationSettled: true };
+  for (const change of [{ reason: 'NETWORK' }, { operationSettled: false }, { code: 'QUOTA_EXHAUSTED' },
+    { accountAlias: 'eason' }, { callId: 'different-call' }, { inputSha256: '0'.repeat(64) },
+    { schemaSha256: null }, { text: 'PRIVATE_OUTPUT' }]) {
+    assert.throws(() => snapshotModelResult({ ...bound, ...change }, request, 'info', 'siwc_plan'), { code: 'INVALID_RECEIPT' });
+  }
+  assert.throws(() => snapshotModelResult({ ...bound, authMode: 'managed_chatgpt' }, request, 'info', 'managed_chatgpt'), { code: 'INVALID_RECEIPT' });
+  for (const status of [409, 429, 500]) await t.test(`unbound-Go-${status}`, async t => {
+    const state = harness(t, { gateway: () => Response.json(bound, { status }) });
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_RESPONSE_INVALID' });
+    assert.equal(state.calls.length, 0); assert.equal(state.requests.length, 1);
+  });
+  for (const status of [200, 429, 500]) await t.test(`changed-bound-Go-${status}`, async t => {
+    const providerCalls = [], state = harness(t, { generate: publicPlanProvider(() =>
+      Response.json({ error: { type: 'server_error', code: 'server_error' } }, { status: 500 }), providerCalls),
+    gateway: async (instance, init) => {
+      const { res } = await bridgeCall(instance.handleRequest, init.body);
+      return new Response(res.body, { status, headers: res.headers });
+    } });
+    await assert.rejects(state.instance.ports.info.generate(request, new AbortController().signal), { code: 'GATEWAY_RESPONSE_INVALID' });
+    assert.equal(state.calls.length, 1); assert.equal(providerCalls.length, 1); assert.equal(state.requests.length, 1);
+  });
+});
+
+test('unknown, conflicting, Retry-After and forged provider errors remain HOLD without another account or API', async t => {
+  const rate = { type: 'rate_limit_error', code: 'rate_limit_exceeded' }, server = { type: 'server_error', code: 'server_error' };
+  const variants = [
+    ['naked429', () => Response.json({}, { status: 429 })], ['naked500', () => Response.json({}, { status: 500 })],
+    ['bad status', () => Response.json({ error: rate }, { status: 409 })],
+    ['missing code', () => Response.json({ error: { type: 'server_error' } }, { status: 500 })],
+    ['unknown code', () => Response.json({ error: { ...server, code: 'PRIVATE_UNKNOWN' } }, { status: 500 })],
+    ['permission', () => Response.json({ error: { ...server, type: 'permission_error' } }, { status: 500 })],
+    ['invalid user', () => Response.json({ error: { ...server, code: 'subscription_sharing_invalid_user' } }, { status: 500 })],
+    ['eligibility', () => Response.json({ error: { ...server, code: 'subscription_sharing_user_not_eligible' } }, { status: 500 })],
+    ['slow down', () => Response.json({ error: { ...rate, code: 'slow_down' } }, { status: 429 })],
+    ...['30', '', 'PRIVATE_RETRY'].map(value => [`retry-${value.length}`, () => Response.json({ error: rate },
+      { status: 429, headers: { 'Retry-After': value } })]),
+    ['network', () => { throw new Error('PRIVATE_NETWORK'); }],
+    ['partial stream', () => new Response(`data: ${JSON.stringify({ type: 'response.created',
+      response: { id: 'synthetic-partial', model: MODEL } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } })],
+    ['policy stream failure', () => new Response(`data: ${JSON.stringify({ type: 'response.failed',
+      response: { id: 'synthetic-policy', model: MODEL, status: 'failed', error: { code: 'content_filter' } } })}\n\n`,
+    { headers: { 'Content-Type': 'text/event-stream' } })],
+    ['forged error', () => { throw new ProbeError('INFERENCE_HTTP_500', {
+      providerErrorTypeClass: 'SERVER', providerParamClass: 'MISSING', operationSettled: true, reason: 'UPSTREAM' }); }],
+  ];
+  for (const [name, responseFor] of variants) await t.test(name, async t => {
+    const providerCalls = [], state = harness(t, { generate: publicPlanProvider(responseFor, providerCalls) });
+    await assert.rejects(state.instance.ports.info.generate(requestFixture('held-technical'), new AbortController().signal));
+    assert.equal(state.calls.length, 1); assert.equal(state.calls[0].alias, 'info');
+    assert.equal(providerCalls.length, 1); assert.equal(state.requests.length, 1);
+    assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE/);
+  });
+});
+
+test('a completed negative independent review is not reclassified as an account outage', async t => {
+  const providerCalls = [], state = harness(t, { generate: publicPlanProvider(() => new Response(`data: ${JSON.stringify({
+    type: 'response.completed', response: { id: 'synthetic-negative-review', model: MODEL, status: 'completed',
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '{"accepted":false}' }] }],
+      usage: { input_tokens: 23, output_tokens: 7, total_tokens: 30 },
+    } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } }), providerCalls) });
+  const request = requestFixture('negative-review', { purpose: 'semantic_reply_review', responseFormat: 'json',
+    responseSchema: { type: 'object', additionalProperties: false, required: ['accepted'], properties: { accepted: { type: 'boolean' } } } });
+  const result = await state.instance.ports.info.generate(request, new AbortController().signal);
+  assert.equal(result.status, 'success'); assert.deepEqual(JSON.parse(result.text), { accepted: false });
+  assert.equal(state.calls.length, 1); assert.equal(state.calls[0].request.purpose, 'semantic_reply_review');
+  assert.equal(state.calls[0].alias, 'info'); assert.equal(providerCalls.length, 1); assert.equal(state.requests.length, 1);
+});
+
+test('an unfinished error body cannot settle; caller cancellation wins and the diagnostic deadline remains bounded', async t => {
+  for (const mode of ['deadline', 'caller']) await t.test(mode, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let started, controller, canceled = false;
+    const ready = new Promise(resolve => { started = resolve; }), providerCalls = [];
+    const state = harness(t, { generate: publicPlanProvider(() => new Response(new ReadableStream({
+      start(value) { controller = value; value.enqueue(Buffer.from('{"error":{"type":"server_error","code":"server_error"}}')); started(); },
+      cancel() { canceled = true; },
+    }), { status: 500, headers: { 'Content-Type': 'application/json' } }), providerCalls) });
+    const caller = new AbortController(), running = state.instance.ports.info.generate(requestFixture(`unfinished-${mode}`), caller.signal);
+    const rejection = assert.rejects(running, { code: 'GATEWAY_CALL_ABORTED' });
+    await ready; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(providerCalls.length, 1);
+    if (mode === 'caller') { caller.abort(0); controller.close(); }
+    else t.mock.timers.tick(3000);
+    await rejection;
+    assert.equal(state.calls.length, 1); assert.equal(state.calls[0].alias, 'info'); assert.equal(state.requests.length, 1);
+    if (mode === 'deadline') assert.equal(canceled, true);
+    assert.equal(state.diagnostics.some(event => event.reason === 'INVALID_RECEIPT'), false);
   });
 });
 

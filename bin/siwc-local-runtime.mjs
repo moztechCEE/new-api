@@ -1,5 +1,6 @@
 // Local personal-project SIWC probe. Not a hosted-service credential importer.
 import { createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, verify } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 
 export const ISSUER = 'https://auth.openai.com';
 export const RESOURCE = 'https://api.openai.com/v1';
@@ -14,6 +15,7 @@ const PLAN_ERROR_CODES = new Set(['subscription_sharing_user_not_eligible', 'sub
 const PROVIDER_ERROR_TYPES = new Set(['INVALID_REQUEST', 'AUTHENTICATION', 'PERMISSION', 'RATE_LIMIT', 'SERVER', 'OTHER', 'MISSING']);
 const PROVIDER_ERROR_PARAMS = new Set(['CACHE_KEY', 'CACHE_OPTIONS', 'INPUT_BREAKPOINT', 'INPUT_ROLE', 'STRUCTURED_SCHEMA', 'REASONING', 'OTHER', 'MISSING']);
 const INFERENCE_ERROR_CLASSES = new WeakMap();
+const SETTLED_INFERENCE_FAILURES = new WeakMap();
 
 export class ProbeError extends Error {
   constructor(code, diagnostic) {
@@ -56,6 +58,10 @@ export class ProbeError extends Error {
 /** Only actual local ProbeError instances carry this fixed diagnostic snapshot;
  * arbitrary errors, accessors and proxies are never inspected by consumers. */
 export const inferenceErrorClasses = error => INFERENCE_ERROR_CLASSES.get(error);
+// Only the exact diagnostic object produced after bounded EOF/reader release
+// carries this witness. Public fields, error constructors and proxies cannot
+// manufacture it; the selected model port supplies account/catalog authority.
+export const settledInferenceFailureReason = diagnostic => SETTLED_INFERENCE_FAILURES.get(diagnostic);
 const fail = code => { throw new ProbeError(code); };
 export const digest = value => createHash('sha256').update(value).digest('hex');
 
@@ -206,6 +212,29 @@ export function syntheticRequest() {
   return { model: MODEL, input: [{ role: 'user', content: PROBE_INPUT }], store: false, stream: true };
 }
 
+function technicalHttpFailureReason(response, media, body, text) {
+  if (response.ok !== false || !Number.isInteger(response.status) || media !== 'application/json' || response.headers.has('retry-after') ||
+      !body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1 ||
+      !Object.hasOwn(body, 'error') || !body.error || typeof body.error !== 'object' || Array.isArray(body.error)) return;
+  const error = body.error;
+  if (Object.keys(error).some(key => !['code', 'type', 'param', 'message'].includes(key)) ||
+      (error.param !== undefined && error.param !== null) ||
+      (error.message !== undefined && typeof error.message !== 'string')) return;
+  // The admitted body has only two object levels and scalar error fields.
+  // Detect repeated/escaped field names without interpreting private messages.
+  const keys = new Set();
+  for (const match of text.matchAll(/"(?:\\.|[^"\\])*"/g)) {
+    if (!text.slice(match.index + match[0].length).trimStart().startsWith(':')) continue;
+    const key = JSON.parse(match[0]);
+    if (keys.has(key)) return;
+    keys.add(key);
+  }
+  if (response.status === 429 && error.type === 'rate_limit_error' && error.code === 'rate_limit_exceeded') return 'RATE_LIMIT';
+  if (response.status >= 500 && response.status <= 599 && error.type === 'server_error' &&
+      (error.code === 'server_error' || response.status === 503 &&
+        ['service_unavailable', 'server_is_overloaded'].includes(error.code))) return 'UPSTREAM';
+}
+
 // Fixed enums and hashes only: never retain raw headers, bodies, messages or credentials.
 export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
   const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() ?? '';
@@ -216,13 +245,14 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
   const requestId = response.headers.get('x-request-id');
   if (requestId && requestId.length <= 1024) diagnostic.requestIdHash = digest(requestId);
   const bytes = [];
-  let length = 0, reader, timer;
+  const timeout = Math.max(1, Math.min(timeoutMs, 3000)), deadlineAt = performance.now() + timeout;
+  let length = 0, reader, timer, fullyRead = false, technicalReason;
   try {
-    const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new ProbeError('DIAGNOSTIC_TIMEOUT')), Math.max(1, Math.min(timeoutMs, 3000))); });
+    const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new ProbeError('DIAGNOSTIC_TIMEOUT')), timeout); });
     reader = response.body?.getReader();
     while (reader) {
       const part = await Promise.race([reader.read(), deadline]);
-      if (part.done) break;
+      if (part.done) { fullyRead = true; break; }
       length += part.value.length;
       if (length > 16384) { diagnostic.bodyShape = 'OVER_LIMIT'; return diagnostic; }
       bytes.push(Buffer.from(part.value));
@@ -260,8 +290,15 @@ export async function inferenceFailureDiagnostic(response, timeoutMs = 3000) {
     if (body?.object === 'response' && ['completed', 'in_progress', 'failed', 'incomplete', 'queued'].includes(body.status)) {
       diagnostic.responseStatus = body.status;
     }
-  } catch { diagnostic.bodyShape = 'UNREADABLE'; }
-  finally { clearTimeout(timer); void reader?.cancel().catch(() => {}); }
+    if (fullyRead) technicalReason = technicalHttpFailureReason(response, media, body, text);
+  } catch { diagnostic.bodyShape = 'UNREADABLE'; technicalReason = undefined; }
+  finally {
+    clearTimeout(timer);
+    if (fullyRead) {
+      try { reader.releaseLock(); } catch { technicalReason = undefined; }
+    } else void reader?.cancel().catch(() => {});
+  }
+  if (technicalReason && performance.now() <= deadlineAt) SETTLED_INFERENCE_FAILURES.set(diagnostic, technicalReason);
   return diagnostic;
 }
 

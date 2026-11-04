@@ -209,6 +209,7 @@ export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gateway
       active.throwIfAborted();
       if (!response || response.redirected || (response.url && response.url !== endpoint)) reject('GATEWAY_RESPONSE_INVALID');
       if (response.status === 429 && record.state === 'quota' && record.result?.status === 'quota_exhausted') return record.result;
+      if (response.status === 409 && record.state === 'provider_failure' && record.result?.status === 'provider_failure') return record.result;
       if (response.status !== 200 || !/^text\/event-stream(?:;\s*charset=utf-8)?$/i.test(response.headers?.get('content-type') ?? '')) reject('GATEWAY_RESPONSE_INVALID');
       stage = 'GATEWAY_RESULT';
       const receipt = await whileActive(consumePlanTextStream(response.body, active), active);
@@ -269,6 +270,11 @@ export function createSiwcGatewayModelTransports({ sessions, gatewayUrl, gateway
       if (result.status === 'quota_exhausted') {
         record.result = result; record.state = 'quota';
         respond(res, 429, 'subscription_sharing_usage_limit_exceeded');
+        return;
+      }
+      if (result.status === 'provider_failure') {
+        record.result = result; record.state = 'provider_failure';
+        respond(res, 409, 'provider_unavailable');
         return;
       }
       stage = 'BRIDGE_RESPONSE';

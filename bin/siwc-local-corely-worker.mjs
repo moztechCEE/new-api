@@ -13,8 +13,8 @@ export async function executeOneCorelyModelJob(client, ports, signal) {
       status.learningCapability !== false) throw new ProbeError('MODEL_WORKER_NOT_ADMITTED');
   let lease = await client.claimModel('info', signal);
   // The Corely router, not this worker, creates an Eason job only after it
-  // receives a bound authenticated Info-quota receipt. Polling an empty queue
-  // is not account fallback and cannot itself generate a paid request.
+  // receives an admitted bound Info quota or settled technical receipt.
+  // Polling an empty queue is not fallback and cannot create a model request.
   if (lease === null) lease = await client.claimModel('eason', signal);
   if (lease === null) return Object.freeze({ status: 'NO_SYNTHETIC_MODEL_JOB', modelRequestsMade: 0, apiFallbackUsed: false });
   signal.throwIfAborted();

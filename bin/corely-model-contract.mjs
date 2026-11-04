@@ -176,6 +176,12 @@ export function snapshotModelResult(input, request, accountAlias, authMode) {
       result.authMode !== authMode || result.accountVerified !== true || result.model !== MODEL ||
       result.callId !== request.callId || result.inputSha256 !== request.inputSha256 || result.schemaSha256 !== request.schemaSha256) held('INVALID_RECEIPT');
   const keys = ['accountAlias', 'authMode', 'accountVerified', 'model', 'callId', 'inputSha256', 'schemaSha256', 'status'];
+  if (result.status === 'provider_failure') {
+    if (authMode !== 'siwc_plan' || result.code !== 'PROVIDER_UNAVAILABLE' || result.operationSettled !== true ||
+        !['RATE_LIMIT', 'UPSTREAM'].includes(result.reason) ||
+        Object.keys(result).some(key => ![...keys, 'code', 'reason', 'operationSettled'].includes(key))) held('INVALID_RECEIPT');
+    return result;
+  }
   if (result.status === 'quota_exhausted') {
     if (result.code !== 'QUOTA_EXHAUSTED' || result.authenticated !== true ||
         Object.keys(result).some(key => ![...keys, 'code', 'authenticated'].includes(key))) held('INVALID_RECEIPT');

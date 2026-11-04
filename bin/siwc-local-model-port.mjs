@@ -2,7 +2,7 @@
 // native credential cache, tool execution, sending or learning capability.
 import { randomUUID } from 'node:crypto';
 import { MODEL, RESOURCE, ProbeError, publicJson, selectExactModel, consumePlanTextStream,
-  inferenceFailureDiagnostic } from './siwc-local-runtime.mjs';
+  inferenceFailureDiagnostic, settledInferenceFailureReason } from './siwc-local-runtime.mjs';
 import { snapshotModelRequest, validateModelOutput } from './corely-model-contract.mjs';
 
 /** Preserve the complete prompt and strict output contract. SIWC uses the
@@ -64,8 +64,16 @@ export async function runCorelyPlanRequest(session, input, fetchImpl = globalThi
         body: JSON.stringify(payload), signal: active });
     }), active);
     if (!response || response.redirected || (response.url && response.url !== `${RESOURCE}/responses`)) throw new ProbeError('INFERENCE_RESPONSE_INVALID');
-    if (!response.ok) throw new ProbeError(`INFERENCE_HTTP_${response.status}`,
-      await whileActive(inferenceFailureDiagnostic(response), active));
+    if (!response.ok) {
+      const diagnostic = await whileActive(inferenceFailureDiagnostic(response), active);
+      active.throwIfAborted();
+      const reason = settledInferenceFailureReason(diagnostic);
+      if (reason) {
+        if (session.expiresAt <= Date.now()) throw new ProbeError('SESSION_NOT_ELIGIBLE');
+        return Object.freeze({ ...bound, status: 'provider_failure', code: 'PROVIDER_UNAVAILABLE', reason, operationSettled: true });
+      }
+      throw new ProbeError(`INFERENCE_HTTP_${response.status}`, diagnostic);
+    }
     const media = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
     if (media && media !== 'text/event-stream') throw new ProbeError('INVALID_STREAM_CONTENT_TYPE',
       await whileActive(inferenceFailureDiagnostic(response), active));
