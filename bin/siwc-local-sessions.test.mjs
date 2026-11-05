@@ -719,6 +719,7 @@ test('fatal identity/scope or unknown maintenance errors stop both loops without
     const { vm } = await transferred(t, ['info', 'eason']), events = []; let easonCancelled = false;
     let enteredEason; const easonStarted = new Promise(resolve => { enteredEason = resolve; });
     const manager = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async (_url, init) => {
+      if (_url === `${ISSUER}/.well-known/jwks.json`) return Response.json(JWKS);
       if (init.body.get('client_id') === 'fixture_eason') { enteredEason(); return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => {
         easonCancelled = true; reject(new Error('PRIVATE_STOPPED_EASON')); }, { once: true })); }
       await easonStarted;
