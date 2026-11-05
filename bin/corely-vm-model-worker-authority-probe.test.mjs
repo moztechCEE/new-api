@@ -89,6 +89,8 @@ async function fixture(mode = 'success') {
       if (mode === 'expired-error') return Response.json({ error: 'expired_token' }, { status: 401, headers: negativeHeaders });
       if (mode === 'wrong-challenge') return Response.json({ error: 'invalid_token' }, { status: 401, headers: { ...negativeHeaders, 'www-authenticate': 'Bearer' } });
       if (mode === 'cacheable') return Response.json({ error: 'invalid_token' }, { status: 401, headers: { ...negativeHeaders, 'cache-control': 'private' } });
+      if (mode === 'length-mismatch') return Response.json({ error: 'invalid_token' }, { status: 401, headers: { ...negativeHeaders, 'content-length': '1' } });
+      if (mode === 'oversized') return new Response(' '.repeat(4096) + '{"error":"invalid_token"}', { status: 401, headers: negativeHeaders });
       if (mode === 'redirected') { const response = Response.json({ error: 'invalid_token' }, { status: 401, headers: negativeHeaders });
         Object.defineProperty(response, 'redirected', { value: true }); return response; }
       if (mode === 'wrong-url') { const response = Response.json({ error: 'invalid_token' }, { status: 401, headers: negativeHeaders });
@@ -169,7 +171,7 @@ if (childMode) {
 
   test('only complete unambiguous 401 invalid_token with no-store and DPoP challenge passes', async t => {
     for (const mode of ['duplicate', 'escaped', 'extra', 'invalid-dpop', 'expired-error', 'wrong-challenge', 'cacheable',
-      'redirected', 'wrong-url', 'http-200', 'http-403', 'unfinished-eof', 'network-uncertain']) {
+      'length-mismatch', 'oversized', 'redirected', 'wrong-url', 'http-200', 'http-403', 'unfinished-eof', 'network-uncertain']) {
       await t.test(mode, async () => {
         const result = await runControlled(mode);
         assert.equal(result.receipt.status, 'CLOUD_AUTHORITY_PROBE_HELD');

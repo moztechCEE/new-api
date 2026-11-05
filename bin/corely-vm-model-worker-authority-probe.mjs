@@ -264,6 +264,7 @@ export async function runCorelyVmAuthorityProbe({ stateDir = '/state', input = p
       const message = `${header}.${payload}`;
       let proof = `${message}.${sign(null, Buffer.from(message), key).toString('base64url')}`; key = undefined;
       const traceId = randomBytes(16).toString('hex');
+      const startedAt = new Date(fresh.wall).toISOString();
       let response, reader;
       const negativeSignal = AbortSignal.any([operation.signal, AbortSignal.timeout(10_000)]);
       try {
@@ -271,6 +272,7 @@ export async function runCorelyVmAuthorityProbe({ stateDir = '/state', input = p
           headers: { Accept: 'application/json', Authorization: `DPoP ${retainedToken}`, DPoP: proof,
             'X-Cloud-Trace-Context': `${traceId}/0;o=1` }, signal: negativeSignal }), negativeSignal);
         proof = '';
+        await emit('CANDIDATE_HTTP_RECEIPT', { operation: 'negative', traceId, startedAt, httpStatus: response.status });
         if (response.status !== 401 || response.redirected || response.url && response.url !== STATUS ||
             !/^application\/json(?:\s*;|$)/i.test(response.headers?.get('content-type') ?? '') ||
             response.headers?.get('cache-control') !== 'no-store' || response.headers?.get('www-authenticate') !== 'DPoP error="invalid_token"' ||
@@ -294,6 +296,9 @@ export async function runCorelyVmAuthorityProbe({ stateDir = '/state', input = p
         await emit('CORELY_POST_RESTART_REVOKED_TOKEN_DENIED', { traceId, httpStatus: 401, errorClass: 'invalid_token',
           completeEofVerified: true, freshProofUsed: true, originalGrantUnexpired: true, cloudRevisionVerifiedByThisDriver: false });
         return 'COMPLETE';
+      } catch {
+        if (!response) await emit('CANDIDATE_HTTP_UNCERTAIN', { operation: 'negative', traceId, startedAt });
+        throw held();
       } finally {
         proof = ''; retainedToken = ''; key = undefined;
         if (reader) { try { Promise.resolve(reader.cancel()).catch(() => {}); reader.releaseLock(); } catch { /* No body is exposed. */ } }
