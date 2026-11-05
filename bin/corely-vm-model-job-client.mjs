@@ -22,7 +22,13 @@ const failure = code => new VmModelJobClientError(code);
 const sha256 = value => createHash('sha256').update(value).digest('base64url');
 
 function untilAborted(work, signal) {
-  if (signal.aborted) return Promise.reject(signal.reason);
+  if (signal.aborted) {
+    // The caller may already have created a rejecting promise. Observe that
+    // result even though cancellation wins; it must not escape as unhandled
+    // asynchronous activity or cause a retry after the operation has stopped.
+    Promise.resolve(work).catch(() => {});
+    return Promise.reject(signal.reason);
+  }
   return new Promise((resolve, reject) => {
     const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason); };
     signal.addEventListener('abort', abort, { once: true });

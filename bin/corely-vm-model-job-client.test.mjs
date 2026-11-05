@@ -249,6 +249,20 @@ test('an in-flight revocation fences concurrent work and a second revoke cannot 
   assert.equal((await pending).remoteRevocation, 'CONFIRMED');
 });
 
+test('pre-aborted authority operations observe scheduled rejection without starting HTTP or leaving asynchronous errors', async () => {
+  const f = fixture(), client = await connectCorelyVmModelJobs(f.options), operation = new AbortController();
+  operation.abort();
+  await assert.rejects(client.authorityStatus(operation.signal), isCode('ABORTED'));
+  assert.deepEqual(await client.revokeAuthority(operation.signal), {
+    status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'UNKNOWN', reason: 'ABORTED',
+  });
+  // Let already-scheduled work settle inside this test. The node:test runner
+  // treats any unhandled rejection as a failure rather than ignoring it.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.length, 2);
+  await assert.rejects(client.authorityStatus(), isCode('GRANT_CLOSED'));
+});
+
 test('revocation abort, expired grant and late success cannot claim remote termination or reopen work', async t => {
   for (const state of ['operation aborted', 'parent aborted', 'expired grant', 'closed during response', 'late response']) await t.test(state, async () => {
     const parent = new AbortController(), operation = new AbortController(); let release, entered;
