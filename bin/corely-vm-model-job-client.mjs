@@ -41,7 +41,8 @@ function waitInterval(ms, signal) {
 
 /** Only called with this module's fixed TLS endpoints. No redirects, cookies,
  * retries, logging, unbounded bodies, or raw provider errors escape here. */
-async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, token, signal, requestTimeoutMs, limit = 16_384, kind, flatResponse = false }) {
+async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, token, signal, requestTimeoutMs, limit = 16_384, kind,
+  flatResponse = false, emptyResponse = false }) {
   const controller = new AbortController(), abort = () => controller.abort(failure('ABORTED'));
   const uncertain = kind === 'token' ? 'TOKEN_EXCHANGE_UNCERTAIN' : kind === 'resource' ? 'RESOURCE_REQUEST_UNCERTAIN' : 'AUTHORIZATION_FAILED';
   const invalid = kind === 'token' ? 'TOKEN_RESPONSE_INVALID' : kind === 'resource' ? 'RESOURCE_RESPONSE_INVALID' : 'DEVICE_RESPONSE_INVALID';
@@ -58,8 +59,23 @@ async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, 
           ...(proof ? { DPoP: proof } : {}), ...(token ? { Authorization: `DPoP ${token}` } : {}) },
         ...(serialized === undefined ? {} : { body: serialized }), signal: controller.signal });
     }), controller.signal);
-    if (!response || response.redirected || (response.url && response.url !== endpoint) ||
-        !/^application\/json(?:\s*;|$)/i.test(response.headers?.get('content-type') ?? '') || !response.body?.getReader) throw failure(invalid);
+    if (!response || response.redirected || (response.url && response.url !== endpoint)) throw failure(invalid);
+    if (emptyResponse) {
+      const length = response.headers?.get('content-length');
+      if (response.status !== 200 || (length !== null && length !== '0') || response.headers?.has('content-encoding')) throw failure(invalid);
+      if (response.body === null) return undefined;
+      if (!response.body?.getReader) throw failure(invalid);
+      reader = response.body.getReader();
+      // A successful revocation has no representation. Even one byte, an
+      // unfinished body, or a no-progress stream is not a confirmed receipt.
+      for (let reads = 0; reads < 32; reads++) {
+        const part = await untilAborted(reader.read(), controller.signal);
+        if (part.done) return undefined;
+        if (!(part.value instanceof Uint8Array) || part.value.byteLength !== 0) throw failure(invalid);
+      }
+      throw failure(invalid);
+    }
+    if (!/^application\/json(?:\s*;|$)/i.test(response.headers?.get('content-type') ?? '') || !response.body?.getReader) throw failure(invalid);
     reader = response.body.getReader(); const chunks = []; let size = 0;
     for (;;) {
       const part = await untilAborted(reader.read(), controller.signal); if (part.done) break;
@@ -73,7 +89,7 @@ async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, 
     // Both OAuth responses are flat, fixed-field JSON. Reject escaped or
     // duplicate member names instead of accepting ambiguous credentials.
     if (kind !== 'resource' || flatResponse) {
-      const names = [...text.matchAll(/"([a-z_]+)"\s*:/g)].map(match => match[1]);
+      const names = [...text.matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"\s*:/g)].map(match => match[1]);
       if (text.includes('\\') || names.length !== Object.keys(value).length || new Set(names).size !== names.length) throw failure(invalid);
     }
     if (kind === 'token' && response.status === 400 && Object.keys(value).length === 1 &&
@@ -193,22 +209,22 @@ export async function connectCorelyVmModelJobs(options = {}) {
     if (transaction.signal.aborted && transaction.signal.reason instanceof VmModelJobClientError) throw transaction.signal.reason;
     throw failure('AUTHORIZATION_FAILED');
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
-  let closed = false, held = false, stopping = false;
+  let closed = false, held = false, stopping = false, authorityExpiresAt;
   const leases = new Map();
   const close = () => { closed = true; token = ''; leases.clear(); signal?.removeEventListener('abort', close); };
   signal?.addEventListener('abort', close, { once: true });
-  const live = (terminal = false) => {
+  const live = (terminal = false, cleanup = false) => {
     if (signal?.aborted) { close(); throw failure('ABORTED'); }
     if (closed || !token) throw failure('GRANT_CLOSED');
     if (stopping && !terminal) throw failure('GRANT_CLOSED');
-    if (held) throw failure('RESOURCE_REQUEST_UNCERTAIN');
+    if (held && !cleanup) throw failure('RESOURCE_REQUEST_UNCERTAIN');
     if (readClock() >= expiresAt || readMonotonic() - tokenStarted >= grantLifetime) { close(); throw failure('GRANT_EXPIRED'); }
   };
   const resource = async (operation, body, operationSignal, { limit = 1024 * 1024, flatResponse = false, timeoutMs = requestTimeoutMs, terminal = false } = {}) => {
     live(terminal);
     if (operationSignal !== undefined && !(operationSignal instanceof AbortSignal)) throw failure('INVALID_OPTIONS');
     const active = signal && operationSignal ? AbortSignal.any([signal, operationSignal]) : signal ?? operationSignal;
-    const endpoint = `${CORELY_VM_MODEL_JOB_RESOURCE}/${operation}`, method = operation === 'status' ? 'GET' : 'POST';
+    const endpoint = `${CORELY_VM_MODEL_JOB_RESOURCE}/${operation}`, method = ['status', 'oauth/status'].includes(operation) ? 'GET' : 'POST';
     try {
       const value = await requestJson(endpoint, { fetchImpl, requestTimeoutMs: timeoutMs, signal: active, kind: 'resource', method, body,
         token, proof: proof(endpoint, method, token), limit, flatResponse });
@@ -221,6 +237,41 @@ export async function connectCorelyVmModelJobs(options = {}) {
     receipt() { live(); return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CONNECTED', scope: CORELY_VM_MODEL_JOB_SCOPE,
       resource: CORELY_VM_MODEL_JOB_RESOURCE, vmHostIdHash: CORELY_VM_HOST_ID_HASH, keyThumbprint, expiresAt,
       syntheticOnly: true, apiFallbackEnabled: false, sendingCapability: false, learningCapability: false }); },
+    async authorityStatus(operationSignal) {
+      try {
+        const value = await resource('oauth/status', undefined, operationSignal, { limit: 4096, flatResponse: true });
+        if (Object.keys(value).length !== 13 || value.status !== 'CORELY_VM_MODEL_JOB_AUTHORITY_VALID' ||
+            value.scope !== CORELY_VM_MODEL_JOB_SCOPE || value.resource !== CORELY_VM_MODEL_JOB_RESOURCE ||
+            value.tenantId !== 'moztech' || value.brandId !== 'moztech-test' || !bindingValid(value) ||
+            value.syntheticOnly !== true || typeof value.modelTransportEnabled !== 'boolean' ||
+            value.apiFallbackEnabled !== false || value.sendingCapability !== false || value.learningCapability !== false ||
+            !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs ||
+            (authorityExpiresAt !== undefined && value.expiresAt !== authorityExpiresAt)) throw failure('RESOURCE_RESPONSE_INVALID');
+        // This is only the current Corely grant. It neither verifies provider
+        // login/model/quota nor changes the original local grant deadline.
+        authorityExpiresAt = value.expiresAt;
+        return Object.freeze({ ...value });
+      } catch (error) { held = true; throw error; }
+    },
+    async revokeAuthority(operationSignal) {
+      // A second terminal call must not close or steal the first one's in-flight
+      // receipt. Held authority may only be used for this fixed cleanup route.
+      if (closed || stopping) throw failure('GRANT_CLOSED');
+      stopping = true;
+      try {
+        live(true, true);
+        if (operationSignal !== undefined && !(operationSignal instanceof AbortSignal)) throw failure('INVALID_OPTIONS');
+        const active = signal && operationSignal ? AbortSignal.any([signal, operationSignal]) : signal ?? operationSignal;
+        const endpoint = `${CORELY_VM_MODEL_JOB_ISSUER}/revoke`;
+        await requestJson(endpoint, { fetchImpl, method: 'POST', body: {}, proof: proof(endpoint, 'POST', token), token,
+          signal: active, requestTimeoutMs, kind: 'resource', limit: 4096, emptyResponse: true });
+        live(true, true);
+        return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'CONFIRMED' });
+      } catch (error) {
+        return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'UNKNOWN',
+          reason: error instanceof VmModelJobClientError ? error.code : 'RESOURCE_REQUEST_UNCERTAIN' });
+      } finally { close(); }
+    },
     async modelStatus(operationSignal) {
       const value = await resource('status', undefined, operationSignal);
       // V1 explicitly has no producer. The hosted synthetic producer is a

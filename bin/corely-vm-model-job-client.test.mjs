@@ -33,6 +33,9 @@ function fixture(change = {}) {
   const status = () => ({ status: 'SYNTHETIC_VM_MODEL_TRANSPORT', scope: SCOPE, tenantId: 'moztech', brandId: 'moztech-test',
     authMode: 'siwc_plan', syntheticOnly: true, enrolled: true, producerConnected: false, apiFallbackEnabled: false,
     sendingCapability: false, learningCapability: false, vmHostIdHash: HOST, keyThumbprint: thumbprint, expiresAt: grantExpiry });
+  const authority = () => ({ status: 'CORELY_VM_MODEL_JOB_AUTHORITY_VALID', scope: SCOPE, resource: RESOURCE,
+    tenantId: 'moztech', brandId: 'moztech-test', vmHostIdHash: HOST, keyThumbprint: thumbprint, expiresAt: grantExpiry,
+    syntheticOnly: true, modelTransportEnabled: false, apiFallbackEnabled: false, sendingCapability: false, learningCapability: false });
   const assertProof = (raw, url, method, accessToken) => {
     assert.equal(typeof raw, 'string'); const [h, p, s] = raw.split('.');
     const header = JSON.parse(Buffer.from(h, 'base64url')), payload = JSON.parse(Buffer.from(p, 'base64url'));
@@ -71,6 +74,16 @@ function fixture(change = {}) {
         const value = { access_token: TOKEN, token_type: 'DPoP', expires_in: Math.floor((grantExpiry - clock) / 1000), scope: SCOPE };
         return change.token?.(value, init) ?? Response.json(value);
       }
+      if (url === `${ISSUER}/status` || url === `${ISSUER}/revoke`) {
+        assert.equal(init.headers.Authorization, `DPoP ${TOKEN}`); assertProof(init.headers.DPoP, url, init.method, TOKEN);
+        if (url.endsWith('/status')) {
+          assert.equal(init.method, 'GET'); assert.equal(init.body, undefined); assert.equal(init.headers['Content-Type'], undefined);
+          return change.authority?.(authority(), init) ?? Response.json(authority());
+        }
+        assert.equal(init.method, 'POST'); assert.equal(init.headers['Content-Type'], 'application/json');
+        assert.deepEqual(JSON.parse(init.body), {});
+        return change.revoke?.(init) ?? new Response(null, { status: 200 });
+      }
       assert.ok(['status', 'enroll', 'claim', 'complete', 'fail'].some(operation => url === `${RESOURCE}/${operation}`), 'no arbitrary URL, customer, provider, API, or producer call');
       const op = url.slice(RESOURCE.length + 1);
       assert.equal(init.headers.Authorization, `DPoP ${TOKEN}`); assertProof(init.headers.DPoP, url, init.method, TOKEN);
@@ -91,14 +104,14 @@ function fixture(change = {}) {
       return Response.json({ accepted: true, replayed: false, callId: request.callId,
         resultSha256: createHash('sha256').update(JSON.stringify(body.result)).digest('hex') });
     } };
-  return { options, calls, waits, lease, result, thumbprint, publicKey, status, assertProof,
+  return { options, calls, waits, lease, result, thumbprint, publicKey, status, authority, assertProof,
     advance, advanceWall: ms => { clock += ms; }, advanceMonotonic: ms => { monotonic += ms; },
     completed: () => completeCount };
 }
 
 test('offline device + sender-constrained grant completes only one bound synthetic lease without exposing credentials', async () => {
   const f = fixture(), client = await connectCorelyVmModelJobs(f.options);
-  assert.deepEqual(Object.keys(client).sort(), ['receipt', 'modelStatus', 'enrollModels', 'claimModel', 'completeModel', 'failModel', 'close'].sort());
+  assert.deepEqual(Object.keys(client).sort(), ['receipt', 'authorityStatus', 'revokeAuthority', 'modelStatus', 'enrollModels', 'claimModel', 'completeModel', 'failModel', 'close'].sort());
   const receipt = client.receipt(); assert.equal(receipt.apiFallbackEnabled, false); assert.equal(receipt.keyThumbprint, f.thumbprint);
   assert.doesNotMatch(JSON.stringify(receipt), /vm_models_access_|vm_models_device_|Synthetic generated|PRIVATE KEY/);
   assert.equal((await client.modelStatus()).producerConnected, false); assert.equal((await client.enrollModels()).enrolled, true);
@@ -107,6 +120,159 @@ test('offline device + sender-constrained grant completes only one bound synthet
   await assert.rejects(client.completeModel(lease.leaseId, f.result), isCode('MODEL_JOB_NOT_CURRENT')); assert.equal(f.completed(), 1);
   assert.deepEqual(f.waits, [5000]); assert.equal(f.calls.filter(call => call.url.endsWith('/token')).length, 1);
   assert.equal(client.close().remoteRevocation, 'NOT_PERFORMED'); await assert.rejects(client.modelStatus(), isCode('GRANT_CLOSED'));
+});
+
+test('authority status uses only the fixed sender-bound GET and preserves the original grant deadline', async () => {
+  let transport = false;
+  const f = fixture({ authority: value => Response.json({ ...value, modelTransportEnabled: transport }) });
+  const client = await connectCorelyVmModelJobs(f.options), localExpiry = client.receipt().expiresAt;
+  const first = await client.authorityStatus();
+  assert.deepEqual(first, f.authority()); assert.equal(Object.isFrozen(first), true);
+  assert.equal(Object.keys(first).length, 13);
+  assert.doesNotMatch(JSON.stringify(first), /vm_models_access_|vm_models_device_|PRIVATE KEY|enrolled|provider|quota|modelReady/);
+  f.advance(61_000); transport = true;
+  const restored = await client.authorityStatus();
+  assert.equal(restored.expiresAt, first.expiresAt); assert.equal(restored.modelTransportEnabled, true);
+  assert.equal(client.receipt().expiresAt, localExpiry);
+  assert.deepEqual(f.calls.slice(2).map(({ url, method }) => ({ url, method })), [
+    { url: `${ISSUER}/status`, method: 'GET' }, { url: `${ISSUER}/status`, method: 'GET' },
+  ]);
+  f.advanceMonotonic(86_400_000);
+  await assert.rejects(client.authorityStatus(), isCode('GRANT_EXPIRED'));
+  assert.equal(f.calls.length, 4);
+});
+
+test('authority status rejects widened, ambiguous, foreign or expired metadata and holds subsequent work', async t => {
+  for (const [name, change] of [
+    ['wrong status', { status: 'SYNTHETIC_VM_MODEL_TRANSPORT' }], ['wrong scope', { scope: 'corely:dev-drafts' }],
+    ['wrong audience', { resource: RESOURCE + '/other' }], ['wrong tenant', { tenantId: 'foreign' }],
+    ['wrong brand', { brandId: 'foreign' }], ['wrong host', { vmHostIdHash: '0'.repeat(64) }],
+    ['wrong key', { keyThumbprint: 'x'.repeat(43) }], ['not synthetic', { syntheticOnly: false }],
+    ['non boolean transport', { modelTransportEnabled: 'false' }], ['api enabled', { apiFallbackEnabled: true }],
+    ['sending enabled', { sendingCapability: true }], ['learning enabled', { learningCapability: true }],
+    ['extra readiness claim', { modelReady: true }], ['missing field', { learningCapability: undefined }],
+    ['expired', { expiresAt: 1 }], ['excessive lifetime', { expiresAt: Number.MAX_SAFE_INTEGER }],
+  ]) await t.test(name, async () => {
+    const f = fixture({ authority: value => Response.json({ ...value, ...change }) });
+    const client = await connectCorelyVmModelJobs(f.options);
+    await assert.rejects(client.authorityStatus(), isCode('RESOURCE_RESPONSE_INVALID'));
+    const count = f.calls.length;
+    await assert.rejects(client.claimModel('info'), isCode('RESOURCE_REQUEST_UNCERTAIN'));
+    assert.equal(f.calls.length, count); client.close();
+  });
+  for (const [name, response] of [
+    ['duplicate camel-case key', value => new Response(JSON.stringify(value).replace('"syntheticOnly":true', '"syntheticOnly":false,"syntheticOnly":true'), { headers: { 'content-type': 'application/json' } })],
+    ['escaped key', value => new Response(JSON.stringify(value).replace('"syntheticOnly"', '"synthetic\\u004fnly"'), { headers: { 'content-type': 'application/json' } })],
+    ['oversized', () => new Response(' '.repeat(4097), { headers: { 'content-type': 'application/json' } })],
+    ['rejected', value => Response.json(value, { status: 401 })],
+    ['redirected', value => { const response = Response.json(value); Object.defineProperty(response, 'redirected', { value: true }); return response; }],
+    ['wrong response URL', value => { const response = Response.json(value); Object.defineProperty(response, 'url', { value: 'https://foreign.invalid/status' }); return response; }],
+  ]) await t.test(name, async () => {
+    const f = fixture({ authority: response }), client = await connectCorelyVmModelJobs(f.options);
+    await assert.rejects(client.authorityStatus(), isCode('RESOURCE_RESPONSE_INVALID')); client.close();
+  });
+});
+
+test('authority status cannot silently renew or shorten the same original server grant expiry', async () => {
+  for (const drift of [-1, 1]) {
+    let calls = 0;
+    const f = fixture({ authority: value => Response.json({ ...value, expiresAt: value.expiresAt + (calls++ ? drift : 0) }) });
+    const client = await connectCorelyVmModelJobs(f.options), first = await client.authorityStatus();
+    assert.equal(first.expiresAt, f.authority().expiresAt);
+    await assert.rejects(client.authorityStatus(), isCode('RESOURCE_RESPONSE_INVALID'));
+    assert.equal((await client.revokeAuthority()).remoteRevocation, 'CONFIRMED');
+  }
+});
+
+test('explicit revocation confirms only a complete empty 200 receipt and closes all local capabilities', async t => {
+  for (const [name, response] of [
+    ['null body', () => new Response(null, { status: 200, headers: { 'content-length': '0' } })],
+    ['empty streamed EOF', () => new Response(new ReadableStream({ start(controller) { controller.close(); } }), { status: 200 })],
+  ]) await t.test(name, async () => {
+    const f = fixture({ revoke: response }), client = await connectCorelyVmModelJobs(f.options), lease = await client.claimModel('info');
+    const receipt = await client.revokeAuthority();
+    assert.deepEqual(receipt, { status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'CONFIRMED' });
+    assert.equal(Object.isFrozen(receipt), true);
+    const count = f.calls.length;
+    assert.throws(() => client.receipt(), isCode('GRANT_CLOSED'));
+    for (const operation of [() => client.authorityStatus(), () => client.modelStatus(), () => client.enrollModels(),
+      () => client.claimModel('eason'), () => client.completeModel(lease.leaseId, f.result),
+      () => client.failModel(lease.leaseId), () => client.revokeAuthority()]) await assert.rejects(operation(), isCode('GRANT_CLOSED'));
+    assert.equal(f.calls.length, count); assert.equal(f.calls.filter(call => call.url === `${ISSUER}/revoke`).length, 1);
+  });
+});
+
+test('lost, nonempty, redirected, rejected or unfinished revocation receipts stay UNKNOWN without retry', async t => {
+  for (const [name, response, reason] of [
+    ['lost response', () => new Promise(() => {}), 'RESOURCE_REQUEST_UNCERTAIN'],
+    ['unfinished body', () => new Response(new ReadableStream({ start() {} }), { status: 200 }), 'RESOURCE_REQUEST_UNCERTAIN'],
+    ['private exception', () => { throw new Error('PRIVATE_UPSTREAM_TOKEN_DETAIL'); }, 'RESOURCE_REQUEST_UNCERTAIN'],
+    ['wrong status', () => new Response(null, { status: 204 }), 'RESOURCE_RESPONSE_INVALID'],
+    ['json body', () => Response.json({ revoked: true }), 'RESOURCE_RESPONSE_INVALID'],
+    ['whitespace body', () => new Response(' ', { status: 200 }), 'RESOURCE_RESPONSE_INVALID'],
+    ['nonzero length', () => new Response(null, { status: 200, headers: { 'content-length': '1' } }), 'RESOURCE_RESPONSE_INVALID'],
+    ['encoded body', () => new Response(null, { status: 200, headers: { 'content-encoding': 'gzip' } }), 'RESOURCE_RESPONSE_INVALID'],
+    ['no progress stream', () => new Response(new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array()); } }), { status: 200 }), 'RESOURCE_RESPONSE_INVALID'],
+    ['wrong URL', () => { const response = new Response(null, { status: 200 }); Object.defineProperty(response, 'url', { value: 'https://foreign.invalid/revoke' }); return response; }, 'RESOURCE_RESPONSE_INVALID'],
+    ['redirected', () => { const response = new Response(null, { status: 200 }); Object.defineProperty(response, 'redirected', { value: true }); return response; }, 'RESOURCE_RESPONSE_INVALID'],
+  ]) await t.test(name, async () => {
+    const f = fixture({ revoke: response }), client = await connectCorelyVmModelJobs({ ...f.options, requestTimeoutMs: 10 });
+    const receipt = await client.revokeAuthority();
+    assert.deepEqual(receipt, { status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'UNKNOWN', reason });
+    assert.doesNotMatch(JSON.stringify(receipt), /PRIVATE_|vm_models_access_|vm_models_device_/);
+    await assert.rejects(client.revokeAuthority(), isCode('GRANT_CLOSED'));
+    await assert.rejects(client.enrollModels(), isCode('GRANT_CLOSED'));
+    assert.equal(f.calls.filter(call => call.url === `${ISSUER}/revoke`).length, 1);
+  });
+});
+
+test('held authority permits only fixed remote cleanup, never model resurrection', async () => {
+  const f = fixture({ authority: () => { throw new Error('PRIVATE_LOST_STATUS'); } });
+  const client = await connectCorelyVmModelJobs(f.options);
+  await assert.rejects(client.authorityStatus(), isCode('RESOURCE_REQUEST_UNCERTAIN'));
+  await assert.rejects(client.claimModel('info'), isCode('RESOURCE_REQUEST_UNCERTAIN'));
+  assert.equal((await client.revokeAuthority()).remoteRevocation, 'CONFIRMED');
+  assert.deepEqual(f.calls.slice(2).map(call => call.url), [`${ISSUER}/status`, `${ISSUER}/revoke`]);
+});
+
+test('an in-flight revocation fences concurrent work and a second revoke cannot steal its receipt', async () => {
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const f = fixture({ revoke: () => { entered(); return new Promise(resolve => { release = resolve; }); } });
+  const client = await connectCorelyVmModelJobs(f.options), pending = client.revokeAuthority(); await started;
+  const count = f.calls.length;
+  await assert.rejects(client.revokeAuthority(), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.authorityStatus(), isCode('GRANT_CLOSED'));
+  await assert.rejects(client.enrollModels(), isCode('GRANT_CLOSED'));
+  assert.equal(f.calls.length, count);
+  release(new Response(null, { status: 200 }));
+  assert.equal((await pending).remoteRevocation, 'CONFIRMED');
+});
+
+test('revocation abort, expired grant and late success cannot claim remote termination or reopen work', async t => {
+  for (const state of ['operation aborted', 'parent aborted', 'expired grant', 'closed during response', 'late response']) await t.test(state, async () => {
+    const parent = new AbortController(), operation = new AbortController(); let release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const f = fixture({ revoke: () => { entered(); return new Promise(resolve => { release = resolve; }); } });
+    const client = await connectCorelyVmModelJobs({ ...f.options, signal: parent.signal, requestTimeoutMs: 10 });
+    if (state === 'operation aborted') operation.abort();
+    if (state === 'parent aborted') parent.abort();
+    if (state === 'expired grant') f.advance(86_400_000);
+    if (state === 'parent aborted') {
+      await assert.rejects(client.revokeAuthority(), isCode('GRANT_CLOSED'));
+      assert.equal(f.calls.length, 2); return;
+    }
+    const pending = client.revokeAuthority(operation.signal);
+    if (state === 'closed during response') { await started; client.close(); release(new Response(null, { status: 200 })); }
+    const receipt = await pending;
+    assert.equal(receipt.remoteRevocation, 'UNKNOWN');
+    assert.equal(receipt.reason, state === 'operation aborted' ? 'ABORTED' : state === 'expired grant' ? 'GRANT_EXPIRED'
+      : state === 'closed during response' ? 'GRANT_CLOSED' : 'RESOURCE_REQUEST_UNCERTAIN');
+    if (state === 'late response') release(new Response(null, { status: 200 }));
+    await assert.rejects(client.claimModel('info'), isCode('GRANT_CLOSED'));
+    await assert.rejects(client.revokeAuthority(), isCode('GRANT_CLOSED'));
+    assert.equal(f.calls.filter(call => call.url === `${ISSUER}/revoke`).length, ['operation aborted', 'expired grant'].includes(state) ? 0 : 1);
+  });
 });
 
 test('terminal failure uses one sender-bound owned lease, fixed metadata only, then closes local authority', async () => {
