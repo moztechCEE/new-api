@@ -41,14 +41,27 @@ function awaitSessionOperation(work, signal) {
  * fallback policy is installed. ASVS 5.0.0 7.3.2/7.4.1/10.1.1: original
  * authority bounds remain intact, pending ambiguity is quarantined, and safe
  * health metadata is distinct from model/quota success. */
-export async function runPersistentPlanMaintenance({ sessions, signal, onReceipt = async () => {},
+export async function runPersistentPlanMaintenance({ sessions, signal, onReceipt = async () => {}, onReady = async () => {},
   sleep = (ms, active) => delay(ms, undefined, { signal: active }), pollIntervalMs = 30000, now = Date.now } = {}) {
   if (!sessions || typeof sessions.maintainAccount !== 'function' || !(signal instanceof AbortSignal) ||
-      typeof onReceipt !== 'function' || typeof sleep !== 'function' || typeof now !== 'function' ||
+      typeof sessions.openMaintenanceOwner !== 'function' ||
+      typeof onReceipt !== 'function' || typeof onReady !== 'function' || typeof sleep !== 'function' || typeof now !== 'function' ||
       !Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1000 || pollIntervalMs > 30000) fail('SESSION_MANAGER_INVALID');
+  if (signal.aborted) return Object.freeze({ status: 'SESSION_MAINTENANCE_STOPPED', reason: 'OWNER_STOPPED', modelRequestsMade: 0, apiFallbackUsed: false });
   if (maintenanceOwners.has(sessions)) fail('SESSION_BUSY_OR_LOCKED');
   maintenanceOwners.add(sessions);
   const owner = new AbortController(), active = AbortSignal.any([signal, owner.signal]);
+  let ownership;
+  try {
+    ownership = await sessions.openMaintenanceOwner(active);
+    if (!ownership || typeof ownership.close !== 'function') fail('SESSION_MAINTENANCE_FAILED');
+    await awaitSessionOperation(Promise.resolve().then(onReady), AbortSignal.any([active, AbortSignal.timeout(5000)]));
+  } catch (error) {
+    owner.abort(); maintenanceOwners.delete(sessions);
+    try { await ownership?.close(); } catch { fail('SESSION_LOCK_CLEANUP_UNCONFIRMED'); }
+    if (signal.aborted) return Object.freeze({ status: 'SESSION_MAINTENANCE_STOPPED', reason: 'OWNER_STOPPED', modelRequestsMade: 0, apiFallbackUsed: false });
+    throw error instanceof ProbeError ? error : new ProbeError('SESSION_MAINTENANCE_FAILED');
+  }
   const tasks = ['info', 'eason'].map(async alias => {
     let previous;
     while (!active.aborted) {
@@ -89,7 +102,9 @@ export async function runPersistentPlanMaintenance({ sessions, signal, onReceipt
     owner.abort();
     // Join both owners before the enclosing worker closes its authority/store.
     await Promise.allSettled(tasks);
-    maintenanceOwners.delete(sessions);
+    let released = false;
+    try { await ownership.close(); released = true; }
+    finally { maintenanceOwners.delete(sessions); if (!released) fail('SESSION_LOCK_CLEANUP_UNCONFIRMED'); }
   }
 }
 const timestamp = value => Number.isSafeInteger(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER - 86400000;
@@ -219,7 +234,7 @@ async function ownerProvenDead(owner, current) {
  * This does not restore a refresh_pending record or extend a Corely grant. */
 export async function acquireSessionProcessLock(root, filename) {
   if (typeof root !== 'string' || !isAbsolute(root) || resolve(root) !== root ||
-    !['info.lock', 'eason.lock', 'corely-vm-model-worker.lock'].includes(filename)) fail('SESSION_STORAGE_INVALID');
+    !['info.lock', 'eason.lock', 'corely-vm-model-worker.lock', 'siwc-session-maintenance.lock'].includes(filename)) fail('SESSION_STORAGE_INVALID');
   let directory, lock, recovery, recoveredOwnerNonce = null, released = false;
   const lockPath = join(root, filename), recoveryPath = `${lockPath}.recovery`;
   try {
@@ -683,6 +698,13 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       return Object.freeze({ status: 'SESSION_MAINTENANCE_COMPLETED', accounts: results, apiFallbackUsed: false });
     },
     maintainAccount(alias, signal) { return maintainAccount(alias, signal); },
+    async openMaintenanceOwner(signal) {
+      checkAbort(signal);
+      const release = await acquireSessionProcessLock(store.root, 'siwc-session-maintenance.lock');
+      if (signal?.aborted) { await release(); checkAbort(signal); }
+      let closed = false;
+      return Object.freeze({ async close() { if (!closed) { closed = true; await release(); } } });
+    },
     probe,
     generate(alias, input, signal) {
       account(alias);

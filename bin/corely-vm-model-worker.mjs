@@ -480,10 +480,17 @@ export async function runCorelyVmModelWorkerWithSessions({ sessions, client, con
   const owner = new AbortController(), active = AbortSignal.any([signal, owner.signal]);
   const authority = AbortSignal.any([authoritySignal, owner.signal]);
   let maintenanceFailed = false;
-  const maintenance = runPersistentPlanMaintenance({ sessions, signal: active, onReceipt }).catch(() => {
+  let ready, notReady;
+  const readyOwner = new Promise((accept, reject) => { ready = accept; notReady = reject; });
+  void readyOwner.catch(() => {}); // Also observed if an already-stopped owner wins before awaiting it.
+  const maintenance = runPersistentPlanMaintenance({ sessions, signal: active, onReceipt, onReady: ready }).catch(error => {
+    notReady(error);
     if (!active.aborted) { maintenanceFailed = true; owner.abort(); }
   });
   try {
+    // Only the fixed local owner lease is awaited here, never account refresh.
+    // A duplicate daemon cannot open Corely consent or dispatch model work.
+    await bounded(readyOwner, active, 5000, 'WORKER_SESSION_HELD');
     // Existing app-owned OAuth maintenance starts before normal Corely consent.
     // It never renews that separate grant or changes its original deadline.
     const ownedClient = client ?? await connect(authority);

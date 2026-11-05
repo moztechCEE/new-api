@@ -613,6 +613,21 @@ test('resident wiring maintains safe per-account health while fresh Corely conse
   assert.doesNotMatch(JSON.stringify(f.events), /synthetic-.*-(?:access|refresh)|SYNTHETIC_PRIVATE_REPLY/);
 });
 
+test('a standalone maintenance owner excludes resident worker consent and all model claims', { timeout: 5000 }, async t => {
+  const storageFixture = await storage(t), store = await openSessionStore(storageFixture.root);
+  const daemon = createPersistentPlanSessions(store), owner = await daemon.openMaintenanceOwner();
+  let providerCalls = 0, connectCalls = 0;
+  const sessions = createPersistentPlanSessions(await openSessionStore(storageFixture.root), { fetchImpl: () => {
+    providerCalls++; throw new Error('NO_PROVIDER_ON_OWNER_CONFLICT');
+  } });
+  const f = workerFixture({ purposes: ['reply_generation'] });
+  await assert.rejects(runCorelyVmModelWorkerWithSessions({ ...f.options, sessions, client: undefined,
+    connect: async () => { connectCalls++; return f.options.client; } }), code('WORKER_SESSION_HELD'));
+  assert.deepEqual({ providerCalls, connectCalls, claims: f.claims.length }, { providerCalls: 0, connectCalls: 0, claims: 0 });
+  await owner.close();
+  const nextOwner = await sessions.openMaintenanceOwner(); await nextOwner.close();
+});
+
 test('resident refresh can produce only a bound Info reauth witness; an explicit producer-created Eason lease completes it', { timeout: 5000 }, async t => {
   const storageFixture = await storage(t), store = await openSessionStore(storageFixture.root), now = Date.now();
   for (const alias of ['info', 'eason']) await store.write(alias, {
@@ -664,7 +679,8 @@ test('resident inference cancellation retains separate live authority for the ex
   const f = workerFixture({ generateChange: async () => { inference.abort(); return new Promise(() => {}); } });
   const now = Date.now(), active = alias => ({ alias, expectedAccount: SESSION_ACCOUNTS[alias], state: 'active', identityVerified: true,
     registrationRetained: true, expiresAt: now + 3600000, revision: 1, authorizationSource: 'APP_OWNED_SIWC', apiFallbackEnabled: false, syntheticOnly: true });
-  const sessions = { maintainAccount: async alias => active(alias), maintain: async () => ({ status: 'SESSION_MAINTENANCE_COMPLETED',
+  const sessions = { openMaintenanceOwner: async () => ({ close: async () => {} }),
+    maintainAccount: async alias => active(alias), maintain: async () => ({ status: 'SESSION_MAINTENANCE_COMPLETED',
     accounts: [active('info'), active('eason')], apiFallbackUsed: false }) };
   await assert.rejects(runCorelyVmModelWorkerWithSessions({ ...f.options, sessions, signal: inference.signal, authoritySignal: f.controller.signal }), code('WORKER_ABORTED'));
   assert.equal(f.failures.length, 1); assert.equal(f.events.at(-1).status, 'CORELY_VM_MODEL_WORKER_REMOTE_HELD');

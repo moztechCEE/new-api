@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
-import { chmod, link, lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { after, before, test } from 'node:test';
 import { ISSUER, RESOURCE, MODEL, PROBE_OUTPUT, SCOPES, ProbeError, digest } from './siwc-local-runtime.mjs';
 import { openSessionStore, persistValidatedAuthorization, retainIssuedRegistration, writeEnrollment, importEnrollment,
@@ -714,6 +714,77 @@ test('maintenance has one owner, safe state health and cancellation-bound receip
   assert.equal((await runPersistentPlanMaintenance({ sessions, signal: again.signal })).status, 'SESSION_MAINTENANCE_STOPPED');
 });
 
+test('a fixed private maintenance lease excludes another manager and a real child daemon, then releases on normal stop', { timeout: 5000 }, async t => {
+  const { vm } = await transferred(t), manager = createPersistentPlanSessions(vm);
+  const child = spawn(process.execPath, ['--input-type=module', '-e',
+    `const m = await import(process.argv[1]); const store = await m.openSessionStore(process.argv[2]);
+     const sessions = m.createPersistentPlanSessions(store); const stop = new AbortController();
+     process.once('SIGTERM', () => stop.abort()); await m.runPersistentPlanMaintenance({ sessions, signal: stop.signal,
+       onReady: () => { process.stdout.write('OWNED\\n'); } });`,
+    new URL('./siwc-local-sessions.mjs', import.meta.url).href, vm.root], { env: {}, stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  await new Promise((accept, reject) => { child.once('error', reject); child.stdout.once('data', chunk => {
+    try { assert.equal(chunk.toString(), 'OWNED\n'); accept(); } catch (error) { reject(error); }
+  }); });
+  let providerCalls = 0;
+  const second = createPersistentPlanSessions(await openSessionStore(vm.root), { fetchImpl: () => { providerCalls++; throw new Error('OWNER_CONFLICT_MUST_NOT_REFRESH'); } });
+  await assert.rejects(manager.openMaintenanceOwner(), code('SESSION_BUSY_OR_LOCKED'));
+  await assert.rejects(runPersistentPlanMaintenance({ sessions: second, signal: new AbortController().signal }), code('SESSION_BUSY_OR_LOCKED'));
+  const stopped = new Promise(resolve => child.once('close', (status, signal) => resolve({ status, signal })));
+  child.kill('SIGTERM'); assert.deepEqual(await stopped, { status: 0, signal: null });
+  assert.equal(stderr, ''); assert.equal(providerCalls, 0);
+  const owner = await second.openMaintenanceOwner(); assert.deepEqual(Object.keys(owner), ['close']);
+  await owner.close(); await owner.close();
+  assert.deepEqual((await readdir(vm.root)).filter(name => name.endsWith('.lock')), []);
+});
+
+test('a proven exited maintenance owner can be recovered but does not restore pending OAuth rotation', { skip: process.platform !== 'linux', timeout: 5000 }, async t => {
+  const { vm } = await transferred(t, ['info', 'eason']), old = await vm.read('info');
+  await vm.write('info', { ...old, state: 'refresh_pending' });
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `const m = await import(process.argv[1]); const manager = m.createPersistentPlanSessions(await m.openSessionStore(process.argv[2]));
+     await manager.openMaintenanceOwner(); process.exit(0);`,
+    new URL('./siwc-local-sessions.mjs', import.meta.url).href, vm.root], { env: {}, timeout: 5000 });
+  assert.equal(child.status, 0);
+  const stop = new AbortController(), events = []; let calls = 0;
+  const restarted = createPersistentPlanSessions(await openSessionStore(vm.root), { now: () => NOW + 2000,
+    fetchImpl: () => { calls++; throw new Error('UNCERTAIN_REFRESH_MUST_NOT_RETRY'); } });
+  await runPersistentPlanMaintenance({ sessions: restarted, signal: stop.signal, now: () => NOW + 2000,
+    sleep: () => new Promise(() => {}), onReceipt: event => { events.push(event); if (events.length === 2) stop.abort(); } });
+  assert.equal(calls, 0); assert.equal((await vm.read('info')).state, 'refresh_pending');
+  assert.equal(events.find(event => event.alias === 'info').code, 'REFRESH_OUTCOME_UNCERTAIN');
+  assert.equal(events.find(event => event.alias === 'eason').healthy, true);
+  assert.deepEqual((await readdir(vm.root)).filter(name => name.endsWith('.lock') || name.endsWith('.recovery')), []);
+});
+
+test('maintenance owner recovery refuses foreign boot/namespace and cleanup never deletes a replaced lease', { skip: process.platform !== 'linux', timeout: 5000 }, async t => {
+  for (const kind of ['boot', 'namespace', 'replaced']) await t.test(kind, async t => {
+    const { vm } = await transferred(t), manager = createPersistentPlanSessions(vm), path = join(vm.root, 'siwc-session-maintenance.lock');
+    if (kind === 'replaced') {
+      const stop = new AbortController(); let replaced = false, bytes;
+      await assert.rejects(runPersistentPlanMaintenance({ sessions: manager, signal: stop.signal,
+        sleep: () => new Promise(() => {}), onReceipt: async () => {
+          if (replaced) return; replaced = true; bytes = await readFile(path);
+          await rename(path, `${path}.original`); await writeFile(path, bytes, { mode: 0o600 }); stop.abort();
+        } }), code('SESSION_LOCK_CLEANUP_UNCONFIRMED'));
+      assert.deepEqual(await readFile(path), bytes); return;
+    }
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `const m = await import(process.argv[1]); const manager = m.createPersistentPlanSessions(await m.openSessionStore(process.argv[2]));
+       await manager.openMaintenanceOwner(); process.exit(0);`,
+      new URL('./siwc-local-sessions.mjs', import.meta.url).href, vm.root], { env: {}, timeout: 5000 });
+    assert.equal(child.status, 0);
+    const record = JSON.parse(await readFile(path, 'utf8'));
+    if (kind === 'boot') record.owner.bootId = '11111111-1111-4111-8111-111111111111';
+    else record.owner.pidNamespace = 'pid:[123456789]';
+    const bytes = JSON.stringify(record); await writeFile(path, bytes, { mode: 0o600 });
+    await assert.rejects(manager.openMaintenanceOwner(), code('SESSION_BUSY_OR_LOCKED'));
+    assert.equal(await readFile(path, 'utf8'), bytes);
+  });
+});
+
 test('fatal identity/scope or unknown maintenance errors stop both loops without a credential-shaped diagnostic', { timeout: 5000 }, async t => {
   for (const kind of ['scope', 'identity', 'unknown']) await t.test(kind, async t => {
     const { vm } = await transferred(t, ['info', 'eason']), events = []; let easonCancelled = false;
@@ -726,7 +797,7 @@ test('fatal identity/scope or unknown maintenance errors stop both loops without
       if (kind === 'identity') return Response.json(fixtureToken('eason', { token: { expires_in: 3600 } }));
       return Response.json({ access_token: 'synthetic-next-access', token_type: 'Bearer', expires_in: 3600, scope: `${SCOPES} unsafe_scope` });
     } });
-    const sessions = kind === 'unknown' ? { maintainAccount: async alias => {
+    const sessions = kind === 'unknown' ? { openMaintenanceOwner: manager.openMaintenanceOwner, maintainAccount: async alias => {
       if (alias === 'info') throw new Error('PRIVATE_MAINTENANCE_SECRET');
       return { alias, state: 'not_connected' };
     } } : manager;
