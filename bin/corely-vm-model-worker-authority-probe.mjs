@@ -321,6 +321,9 @@ export async function runCorelyVmAuthorityProbe({ stateDir = '/state', input = p
     input.on('error', ioFailed); output.on('error', ioFailed);
     input.on('data', boundedInput);
     lines = createInterface({ input, crlfDelay: Infinity, terminal: false });
+    // readline forwards its input error to the Interface as a separate event.
+    // Handling only the underlying stream would still cause an uncaught error.
+    lines.on('error', ioFailed);
     lines.on('line', line => {
       if (finishing) return;
       if (line === 'STOP') { void finish('OPERATOR_STOPPED'); return; }
