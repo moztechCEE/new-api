@@ -718,7 +718,8 @@ test('a fixed private maintenance lease excludes another manager and a real chil
   const { vm } = await transferred(t), manager = createPersistentPlanSessions(vm);
   const child = spawn(process.execPath, ['--input-type=module', '-e',
     `const m = await import(process.argv[1]); const store = await m.openSessionStore(process.argv[2]);
-     const sessions = m.createPersistentPlanSessions(store); const stop = new AbortController();
+     const sessions = m.createPersistentPlanSessions(store, { fetchImpl: async () => { throw new Error('NETWORK_DISABLED_IN_CHILD_FIXTURE'); } });
+     const stop = new AbortController();
      process.once('SIGTERM', () => stop.abort()); await m.runPersistentPlanMaintenance({ sessions, signal: stop.signal,
        onReady: () => { process.stdout.write('OWNED\\n'); } });`,
     new URL('./siwc-local-sessions.mjs', import.meta.url).href, vm.root], { env: {}, stdio: ['ignore', 'pipe', 'pipe'] });
