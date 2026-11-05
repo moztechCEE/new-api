@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { after, before, test } from 'node:test';
-import { openCorelyVmModelIdentity, openCorelyVmModelWorkerLifecycle, openCorelyVmModelGateway, runCorelyVmModelWorker,
+import { openCorelyVmModelIdentity, openCorelyVmModelWorkerLifecycle, openCorelyVmModelGateway, runCorelyVmModelWorker, runCorelyVmModelWorkerWithSessions,
   assertCorelyVmModelSessionMaintenance, parseVmModelWorkerCommand, VmModelWorkerError } from './corely-vm-model-worker.mjs';
 import { CORELY_VM_MODEL_JOB_SCOPE as SCOPE, CORELY_VM_MODEL_JOB_RESOURCE as RESOURCE,
   CORELY_VM_HOST_ID_HASH as HOST, CORELY_VM_VERIFICATION_URI as VERIFICATION } from './corely-vm-model-job-client.mjs';
@@ -573,6 +573,102 @@ test('preclaim inspection never waits for a slow standby refresh while selected 
   assert.equal(f.completions[0].result.accountAlias, 'info'); assert.equal(refreshCalls, 0);
   assert.deepEqual(modelRoutes, ['https://api.openai.com/v1/models', 'https://api.openai.com/v1/responses']);
   assert.doesNotMatch(JSON.stringify(f.events), /synthetic-info-access|synthetic-eason-refresh|SYNTHETIC_PRIVATE_REPLY/);
+});
+
+test('resident wiring maintains safe per-account health while fresh Corely consent is still waiting', { timeout: 5000 }, async t => {
+  const storageFixture = await storage(t), store = await openSessionStore(storageFixture.root), now = Date.now();
+  for (const alias of ['info', 'eason']) await store.write(alias, {
+    kind: 'NEW_API_SIWC_DEV_SESSION', version: 1, alias, email: SESSION_ACCOUNTS[alias], issuer: ISSUER,
+    hostId: store.host.hostId, authorizationHostId: store.host.hostId, state: 'active', clientId: `synthetic_${alias}_client`,
+    subjectHash: digest(`synthetic-${alias}-subject`), accessToken: `synthetic-${alias}-access`, refreshToken: `synthetic-${alias}-refresh`,
+    idToken: `synthetic-${alias}-id`, nonce: `synthetic-${alias}-nonce`, scopes: SCOPES.split(' '),
+    expiresAt: now + 3600000, createdAt: now - 1000, updatedAt: now - 1000, revision: 3,
+  });
+  let modelRoutes = 0, connectStarted = false, releaseConsent;
+  const waiting = new Promise(resolve => { releaseConsent = resolve; });
+  const sessions = createPersistentPlanSessions(store, { fetchImpl: async (url, init) => {
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-info-access'); modelRoutes++;
+    if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+    assert.equal(url, 'https://api.openai.com/v1/responses');
+    return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: {
+      id: 'synthetic-maintained-response', status: 'completed', model: MODEL,
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'SYNTHETIC_PRIVATE_REPLY' }] }],
+      usage: { input_tokens: 21, output_tokens: 8, total_tokens: 29 },
+    } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+  } });
+  const f = workerFixture({ purposes: ['reply_generation'] }), health = [];
+  const result = await runCorelyVmModelWorkerWithSessions({ ...f.options, client: undefined, sessions,
+    ports: createSiwcModelTransports(sessions), connect: async authority => {
+      connectStarted = true; assert.equal(authority.aborted, false); await waiting; return f.options.client;
+    }, onReceipt: async event => {
+      f.events.push(event);
+      if (event.status === 'SESSION_ACCOUNT_MAINTENANCE') {
+        assert.equal(connectStarted, true); assert.equal(modelRoutes, 0); assert.equal(f.claims.length, 0);
+        health.push(event); if (health.length === 2) releaseConsent();
+      }
+    } });
+  assert.equal(result.completed, 1); assert.equal(modelRoutes, 2); assert.equal(f.closed(), 1);
+  assert.deepEqual(health.map(event => event.alias).sort(), ['eason', 'info']);
+  assert.equal(health.every(event => event.healthy && event.healthKind === 'APP_OWNED_SESSION_RECORD'), true);
+  assert.doesNotMatch(JSON.stringify(f.events), /synthetic-.*-(?:access|refresh)|SYNTHETIC_PRIVATE_REPLY/);
+});
+
+test('resident refresh can produce only a bound Info reauth witness; an explicit producer-created Eason lease completes it', { timeout: 5000 }, async t => {
+  const storageFixture = await storage(t), store = await openSessionStore(storageFixture.root), now = Date.now();
+  for (const alias of ['info', 'eason']) await store.write(alias, {
+    kind: 'NEW_API_SIWC_DEV_SESSION', version: 1, alias, email: SESSION_ACCOUNTS[alias], issuer: ISSUER,
+    hostId: store.host.hostId, authorizationHostId: store.host.hostId, state: 'active', clientId: `synthetic_${alias}_client`,
+    subjectHash: digest(`synthetic-${alias}-subject`), accessToken: `synthetic-${alias}-access`, refreshToken: `synthetic-${alias}-refresh`,
+    idToken: `synthetic-${alias}-id`, nonce: `synthetic-${alias}-nonce`, scopes: SCOPES.split(' '),
+    expiresAt: now + (alias === 'info' ? 10000 : 3600000), createdAt: now - 1000, updatedAt: now - 1000, revision: 3,
+  });
+  let refreshes = 0; const modelAliases = [];
+  const sessions = createPersistentPlanSessions(store, { fetchImpl: async (url, init) => {
+    if (url === `${ISSUER}/api/accounts/oauth/token`) {
+      refreshes++; assert.equal(init.body.get('client_id'), 'synthetic_info_client');
+      return Response.json({ error: 'invalid_grant' }, { status: 400 });
+    }
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-eason-access'); modelAliases.push('eason');
+    if (url === 'https://api.openai.com/v1/models') return Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+    return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: {
+      id: 'synthetic-standby-review', status: 'completed', model: MODEL,
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'SYNTHETIC_PRIVATE_REPLY' }] }],
+      usage: { input_tokens: 21, output_tokens: 8, total_tokens: 29 },
+    } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+  } });
+  const f = workerFixture({ purposes: ['semantic_reply_review', 'semantic_reply_review'] });
+  const original = request('semantic_reply_review', 0), receipts = []; let index = 0;
+  f.options.client.claimModel = async alias => {
+    f.claims.push(alias);
+    if (index > 1 || alias !== (index === 0 ? 'info' : 'eason')) return null;
+    return { leaseId: `63388770-cd07-4b5b-a53b-f73ee875a54${index}`, accountAlias: alias, expiresAt: Date.now() + 50000, request: original };
+  };
+  f.options.client.completeModel = async (_id, result) => {
+    if (index === 0) {
+      assert.equal(result.status, 'account_unavailable'); assert.equal(result.reason, 'REAUTH_REQUIRED');
+      assert.equal(result.noModelMade, true); assert.equal(result.accountEnrollmentRevision, 4);
+      assert.equal((await store.read('info')).state, 'reauth_required');
+    } else { assert.equal(result.status, 'success'); assert.equal(result.accountAlias, 'eason'); }
+    receipts.push(result); index++;
+    return { accepted: true, replayed: false, callId: result.callId, resultSha256: digest(JSON.stringify(result)) };
+  };
+  const result = await runCorelyVmModelWorkerWithSessions({ ...f.options, sessions, ports: createSiwcModelTransports(sessions) });
+  assert.equal(result.completed, 2); assert.equal(refreshes, 1); assert.deepEqual(modelAliases, ['eason', 'eason']);
+  assert.deepEqual(receipts.map(value => value.callId), [original.callId, original.callId]);
+  assert.equal(result.apiFallbackUsed, false); assert.equal(f.closed(), 1);
+  assert.doesNotMatch(JSON.stringify(f.events), /synthetic-.*-(?:access|refresh)|SYNTHETIC_PRIVATE_REPLY/);
+});
+
+test('resident inference cancellation retains separate live authority for the existing single terminal hold', async () => {
+  const inference = new AbortController();
+  const f = workerFixture({ generateChange: async () => { inference.abort(); return new Promise(() => {}); } });
+  const now = Date.now(), active = alias => ({ alias, expectedAccount: SESSION_ACCOUNTS[alias], state: 'active', identityVerified: true,
+    registrationRetained: true, expiresAt: now + 3600000, revision: 1, authorizationSource: 'APP_OWNED_SIWC', apiFallbackEnabled: false, syntheticOnly: true });
+  const sessions = { maintainAccount: async alias => active(alias), maintain: async () => ({ status: 'SESSION_MAINTENANCE_COMPLETED',
+    accounts: [active('info'), active('eason')], apiFallbackUsed: false }) };
+  await assert.rejects(runCorelyVmModelWorkerWithSessions({ ...f.options, sessions, signal: inference.signal, authoritySignal: f.controller.signal }), code('WORKER_ABORTED'));
+  assert.equal(f.failures.length, 1); assert.equal(f.events.at(-1).status, 'CORELY_VM_MODEL_WORKER_REMOTE_HELD');
+  assert.equal(f.closed(), 1);
 });
 
 test('producer readiness may be awaited but is never invented or activated by the consumer', async () => {

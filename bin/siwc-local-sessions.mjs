@@ -22,6 +22,76 @@ const INVALID_REFRESH = new Set(['invalid_grant', 'invalid_refresh_token', 'toke
   'refresh_token_invalidated', 'refresh_token_reused']);
 const fail = code => { throw new ProbeError(code); };
 const object = value => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+const maintenanceOwners = new WeakSet();
+// Cancellation is a bound, not a promise that every transport cooperates.
+// Observe late rejection even when cancellation wins; never retry rotation.
+function awaitSessionOperation(work, signal) {
+  const discard = value => { if (value?.body && !value.body.locked) void value.body.cancel().catch(() => {}); };
+  if (signal.aborted) { Promise.resolve(work).then(discard, () => {}); return Promise.reject(new ProbeError('SESSION_OPERATION_ABORTED')); }
+  return new Promise((accept, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(new ProbeError('SESSION_OPERATION_ABORTED')); };
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve(work).then(value => { signal.removeEventListener('abort', abort); if (signal.aborted) { discard(value); reject(new ProbeError('SESSION_OPERATION_ABORTED')); } else accept(value); },
+      error => { signal.removeEventListener('abort', abort); reject(error); });
+  });
+}
+
+/** One owner, two independent account loops. The same per-account store lock
+ * serializes background renewal with selected generation; no third process or
+ * fallback policy is installed. ASVS 5.0.0 7.3.2/7.4.1/10.1.1: original
+ * authority bounds remain intact, pending ambiguity is quarantined, and safe
+ * health metadata is distinct from model/quota success. */
+export async function runPersistentPlanMaintenance({ sessions, signal, onReceipt = async () => {},
+  sleep = (ms, active) => delay(ms, undefined, { signal: active }), pollIntervalMs = 30000, now = Date.now } = {}) {
+  if (!sessions || typeof sessions.maintainAccount !== 'function' || !(signal instanceof AbortSignal) ||
+      typeof onReceipt !== 'function' || typeof sleep !== 'function' || typeof now !== 'function' ||
+      !Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1000 || pollIntervalMs > 30000) fail('SESSION_MANAGER_INVALID');
+  if (maintenanceOwners.has(sessions)) fail('SESSION_BUSY_OR_LOCKED');
+  maintenanceOwners.add(sessions);
+  const owner = new AbortController(), active = AbortSignal.any([signal, owner.signal]);
+  const tasks = ['info', 'eason'].map(async alias => {
+    let previous;
+    while (!active.aborted) {
+      let value;
+      try { value = await sessions.maintainAccount(alias, active); }
+      catch (error) { if (active.aborted) return; value = { alias, state: 'held', code: 'SESSION_MAINTENANCE_FAILED' }; }
+      if (active.aborted) return;
+      const checkedAt = now();
+      const usable = value?.state === 'active' && value.alias === alias && value.expectedAccount === account(alias) &&
+        value.identityVerified === true && value.registrationRetained === true && value.authorizationSource === 'APP_OWNED_SIWC' &&
+        value.apiFallbackEnabled === false && value.syntheticOnly === true && timestamp(value.expiresAt) && value.expiresAt > checkedAt &&
+        Number.isSafeInteger(value.revision) && value.revision > 0;
+      const unavailable = value?.alias === alias && value.state === 'held' &&
+        ['SESSION_REAUTH_REQUIRED', 'REFRESH_OUTCOME_UNCERTAIN', 'REFRESH_CLIENT_INVALID'].includes(value.code);
+      const missing = value?.alias === alias && value.state === 'not_connected';
+      const metadata = Object.freeze({ alias, state: usable ? 'active' : missing ? 'not_connected' : 'held',
+        healthy: Boolean(usable), apiFallbackUsed: false, ...(usable ? { expiresAt: value.expiresAt, revision: value.revision,
+          identityVerified: true, registrationRetained: true, authorizationSource: 'APP_OWNED_SIWC' } :
+          missing ? {} : { code: unavailable ? value.code : 'SESSION_MAINTENANCE_FAILED' }) });
+      if (!timestamp(checkedAt)) fail('SESSION_CLOCK_INVALID');
+      const serialized = JSON.stringify(metadata);
+      if (serialized !== previous) {
+        try { await awaitSessionOperation(Promise.resolve().then(() => onReceipt(Object.freeze({
+            status: 'SESSION_ACCOUNT_MAINTENANCE', ...metadata, checkedAt, healthKind: 'APP_OWNED_SESSION_RECORD', modelRequestsMade: 0 }))),
+          AbortSignal.any([active, AbortSignal.timeout(5000)])); }
+        catch (error) { if (active.aborted) return; throw error; }
+        previous = serialized;
+      }
+      if (!usable && !unavailable && !missing) fail('SESSION_MAINTENANCE_FAILED');
+      try { await awaitSessionOperation(sleep(pollIntervalMs, active), active); }
+      catch (error) { if (active.aborted) return; throw error; }
+    }
+  });
+  try {
+    await Promise.all(tasks);
+    return Object.freeze({ status: 'SESSION_MAINTENANCE_STOPPED', reason: 'OWNER_STOPPED', modelRequestsMade: 0, apiFallbackUsed: false });
+  } finally {
+    owner.abort();
+    // Join both owners before the enclosing worker closes its authority/store.
+    await Promise.allSettled(tasks);
+    maintenanceOwners.delete(sessions);
+  }
+}
 const timestamp = value => Number.isSafeInteger(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER - 86400000;
 const secret = (value, limit = 65536) => typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\u0000-\u0020\u007f]/.test(value);
 const sameKeys = (value, keys) => object(value) && Object.keys(value).every(key => keys.includes(key));
@@ -420,29 +490,48 @@ export async function forgetTransferredEnrollment(store, alias, importedEnrollme
   });
 }
 
-async function refreshTokenRequest(record, fetchImpl, signal) {
-  let response;
+async function oauthSessionJson(endpoint, init, fetchImpl, signal) {
+  let response, reader;
+  const active = signal ? AbortSignal.any([signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(20000);
   try {
-    response = await fetchImpl(`${ISSUER}/api/accounts/oauth/token`, { method: 'POST', redirect: 'error', credentials: 'omit', cache: 'no-store',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: record.clientId,
-        refresh_token: record.refreshToken, resource: RESOURCE }),
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(20000) });
-    if (response.redirected || (response.url && response.url !== `${ISSUER}/api/accounts/oauth/token`) ||
+    if (endpoint !== `${ISSUER}/api/accounts/oauth/token` && endpoint !== `${ISSUER}/.well-known/jwks.json`) fail('REFRESH_OUTCOME_UNCERTAIN');
+    response = await awaitSessionOperation(Promise.resolve().then(() => {
+      active.throwIfAborted();
+      return fetchImpl(endpoint, { ...init, redirect: 'error', credentials: 'omit', cache: 'no-store', signal: active });
+    }), active);
+    if (response.redirected || (response.url && response.url !== endpoint) ||
       !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')) fail('REFRESH_OUTCOME_UNCERTAIN');
-    const chunks = []; let size = 0;
-    for await (const chunk of response.body ?? []) {
-      size += chunk.length; if (size > MAX_RECORD) fail('REFRESH_OUTCOME_UNCERTAIN'); chunks.push(Buffer.from(chunk));
+    if (!response.body?.getReader) fail('REFRESH_OUTCOME_UNCERTAIN');
+    reader = response.body.getReader(); const chunks = []; let size = 0;
+    for (;;) {
+      const part = await awaitSessionOperation(reader.read(), active); if (part.done) break;
+      if (!(part.value instanceof Uint8Array) || (size += part.value.byteLength) > MAX_RECORD) fail('REFRESH_OUTCOME_UNCERTAIN');
+      chunks.push(Buffer.from(part.value));
     }
     const value = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(Buffer.concat(chunks)));
-    if (!response.ok) {
-      const code = typeof value?.error === 'string' ? value.error : value?.error?.code;
-      if (INVALID_REFRESH.has(code) && response.status >= 400 && response.status < 500) fail('SESSION_REAUTH_REQUIRED');
-      if (code === 'invalid_client' && response.status >= 400 && response.status < 500) fail('REFRESH_CLIENT_INVALID');
-      fail('REFRESH_OUTCOME_UNCERTAIN');
-    }
-    return value;
-  } catch (error) { throw error instanceof ProbeError ? error : new ProbeError('REFRESH_OUTCOME_UNCERTAIN'); }
+    return { status: response.status, value };
+  } catch (error) {
+    if (active.aborted && !signal?.aborted) fail('REFRESH_OUTCOME_UNCERTAIN');
+    throw error instanceof ProbeError ? error : new ProbeError('REFRESH_OUTCOME_UNCERTAIN');
+  }
+  finally {
+    if (reader) { try { Promise.resolve(reader.cancel()).catch(() => {}); reader.releaseLock(); } catch { /* No late refresh is accepted. */ } }
+    else if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
+  }
+}
+
+async function refreshTokenRequest(record, fetchImpl, signal) {
+  const { status, value } = await oauthSessionJson(`${ISSUER}/api/accounts/oauth/token`, { method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+    body: new URLSearchParams({ grant_type: 'refresh_token', client_id: record.clientId,
+      refresh_token: record.refreshToken, resource: RESOURCE }) }, fetchImpl, signal);
+  if (status < 200 || status >= 300) {
+    const code = typeof value?.error === 'string' ? value.error : value?.error?.code;
+    if (INVALID_REFRESH.has(code) && status >= 400 && status < 500) fail('SESSION_REAUTH_REQUIRED');
+    if (code === 'invalid_client' && status >= 400 && status < 500) fail('REFRESH_CLIENT_INVALID');
+    fail('REFRESH_OUTCOME_UNCERTAIN');
+  }
+  return value;
 }
 
 export async function revokeRenewableSession(record, fetchImpl = globalThis.fetch) {
@@ -485,7 +574,7 @@ function validatedRefresh(record, token, jwks, now) {
  * until the separate trusted Corely model-job transport is installed. */
 export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fetch, now = Date.now } = {}) {
   if (store.host.runtime !== 'vm' || typeof fetchImpl !== 'function' || typeof now !== 'function') fail('SESSION_MANAGER_INVALID');
-  const modelCalls = new Set();
+  const modelCalls = new Set(), refreshing = new Map();
   const clock = record => {
     const time = now();
     if (!timestamp(time) || (record && time < record.updatedAt)) fail('SESSION_CLOCK_INVALID');
@@ -503,9 +592,10 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       if (record.expiresAt > start + 60000) return action(record);
       // A durable pending marker prevents rotating-token reuse after crash,
       // network ambiguity or an atomic replacement failure. Never auto-retry it.
-      await store.write(alias, { ...record, state: 'refresh_pending' });
       let refreshed;
+      refreshing.set(alias, record);
       try {
+        await store.write(alias, { ...record, state: 'refresh_pending' });
         const token = await refreshTokenRequest(record, fetchImpl, signal);
         // Save a returned rotating renewal handle for revocation only before
         // JWKS/identity validation. Pending records can never run inference.
@@ -518,7 +608,10 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
             fail(revoked ? 'REFRESH_PERSISTENCE_FAILED' : 'REFRESH_REMOTE_REVOCATION_UNCONFIRMED');
           }
         }
-        const jwks = token.id_token !== undefined ? await publicJson(`${ISSUER}/.well-known/jwks.json`, {}, fetchImpl, signal) : undefined;
+        const identity = token.id_token !== undefined ? await oauthSessionJson(`${ISSUER}/.well-known/jwks.json`,
+          { method: 'GET', headers: { Accept: 'application/json' } }, fetchImpl, signal) : undefined;
+        if (identity && identity.status !== 200) fail('REFRESH_OUTCOME_UNCERTAIN');
+        const jwks = identity?.value;
         checkAbort(signal);
         refreshed = validatedRefresh(record, token, jwks, clock(record));
         await store.write(alias, refreshed);
@@ -529,9 +622,37 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
           if (unavailable) return unavailable(unavailableRecord);
         }
         throw error instanceof ProbeError ? error : new ProbeError('REFRESH_OUTCOME_UNCERTAIN');
-      }
+      } finally { refreshing.delete(alias); }
       return action(refreshed);
     });
+  }
+  async function maintainAccount(alias, signal, { refresh = true } = {}) {
+    account(alias); checkAbort(signal);
+    const observedOwner = refreshing.get(alias);
+    let record = await store.read(alias);
+    let owner = refreshing.get(alias);
+    // An atomic rename may finish while a read still holds the pending inode.
+    // Re-read once after an observed owner exits; never reuse that past owner
+    // as a readiness witness for a now-ambiguous pending record.
+    if (record?.state === 'refresh_pending' && observedOwner && !owner) { record = await store.read(alias); owner = refreshing.get(alias); }
+    const time = clock(record);
+    if (!record) return { alias, state: 'not_connected' };
+    // This in-process witness exists only while the same manager owns the
+    // account lock. It admits waiting for that owner, never use of its old
+    // token. After interruption/restart the map is empty: pending stays HOLD.
+    const ownedPending = record.state === 'refresh_pending' && owner &&
+      ['revision', 'clientId', 'subjectHash', 'hostId', 'expiresAt'].every(key => record[key] === owner[key]);
+    if (record.state !== 'active' && !ownedPending) return { alias, state: 'held',
+      code: record.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED' };
+    if (!refresh) {
+      const metadata = sessionMetadata(record);
+      return record.expiresAt <= time + 60000 || ownedPending ? Object.freeze({ ...metadata, state: 'renewal_due' }) : metadata;
+    }
+    try { return await withFreshRecord(alias, record => sessionMetadata(record), signal); }
+    catch (error) {
+      if (signal?.aborted || error instanceof ProbeError && error.code === 'SESSION_OPERATION_ABORTED') throw error;
+      return { alias, state: 'held', code: error instanceof ProbeError ? error.code : 'SESSION_MANAGER_FAILED' };
+    }
   }
   async function probe(alias, signal) {
     return withFreshRecord(alias, async record => {
@@ -557,33 +678,11 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
     async maintain(signal, options) {
       if (options !== undefined && (!sameKeys(options, ['refresh']) || Object.keys(options).length !== 1 ||
         typeof options.refresh !== 'boolean')) fail('SESSION_MANAGER_INVALID');
-      const refresh = options?.refresh ?? true;
       const results = [];
-      for (const alias of ['info', 'eason']) {
-        checkAbort(signal);
-        const record = await store.read(alias);
-        const time = clock(record);
-        if (!record) { results.push({ alias, state: 'not_connected' }); continue; }
-        if (record.state !== 'active') {
-          results.push({ alias, state: 'held', code: record.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED' });
-          continue;
-        }
-        if (!refresh) {
-          const metadata = sessionMetadata(record);
-          // Readiness inspection never renews the standby or claims that a due
-          // token is usable. The selected generate call re-reads under its own
-          // alias lock and refreshes within that call's original lease/deadline.
-          results.push(record.expiresAt <= time + 60000 ? Object.freeze({ ...metadata, state: 'renewal_due' }) : metadata);
-          continue;
-        }
-        try { results.push(await withFreshRecord(alias, record => sessionMetadata(record), signal)); }
-        catch (error) {
-          if (signal?.aborted || (error instanceof ProbeError && error.code === 'SESSION_OPERATION_ABORTED')) throw error;
-          results.push({ alias, state: 'held', code: error instanceof ProbeError ? error.code : 'SESSION_MANAGER_FAILED' });
-        }
-      }
+      for (const alias of ['info', 'eason']) results.push(await maintainAccount(alias, signal, options));
       return Object.freeze({ status: 'SESSION_MAINTENANCE_COMPLETED', accounts: results, apiFallbackUsed: false });
     },
+    maintainAccount(alias, signal) { return maintainAccount(alias, signal); },
     probe,
     generate(alias, input, signal) {
       account(alias);

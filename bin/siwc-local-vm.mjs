@@ -4,10 +4,10 @@
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { setTimeout as delay } from 'node:timers/promises';
 import { createAttempt, consumeCallback, publicJson, ISSUER, ProbeError } from './siwc-local-runtime.mjs';
 import { openSessionStore, retainIssuedRegistration, persistValidatedAuthorization, writeEnrollment,
-  importEnrollment, forgetTransferredEnrollment, createPersistentPlanSessions, SESSION_ACCOUNTS, revokeRenewableSession } from './siwc-local-sessions.mjs';
+  importEnrollment, forgetTransferredEnrollment, createPersistentPlanSessions, runPersistentPlanMaintenance,
+  SESSION_ACCOUNTS, revokeRenewableSession } from './siwc-local-sessions.mjs';
 
 const APP_NAME = 'New API DEV Personal Plan';
 const safe = value => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -183,12 +183,7 @@ export async function runSessionCommand(argv) {
   const controller = new AbortController(), stop = () => controller.abort();
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try {
-    let previous = '';
-    while (!controller.signal.aborted) {
-      const receipt = await sessions.maintain(controller.signal), serialized = JSON.stringify(receipt);
-      if (serialized !== previous) { safe(receipt); previous = serialized; }
-      try { await delay(30000, undefined, { signal: controller.signal }); } catch { /* Normal daemon shutdown. */ }
-    }
+    safe(await runPersistentPlanMaintenance({ sessions, signal: controller.signal, onReceipt: safe }));
   } catch (error) { if (!controller.signal.aborted) throw error; }
   finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
 }

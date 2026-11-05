@@ -14,7 +14,7 @@ import { connectCorelyVmModelJobs, CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_S
 import { executeOneCorelyModelJob } from './siwc-local-corely-worker.mjs';
 import { createSiwcModelTransports } from './siwc-local-model-port.mjs';
 import { createSiwcGatewayModelTransports } from './siwc-gateway-model-port.mjs';
-import { openSessionStore, createPersistentPlanSessions, acquireSessionProcessLock, VM_NAME } from './siwc-local-sessions.mjs';
+import { openSessionStore, createPersistentPlanSessions, runPersistentPlanMaintenance, acquireSessionProcessLock, VM_NAME } from './siwc-local-sessions.mjs';
 import { assertIsolatedSessionEnvironment } from './siwc-local-vm.mjs';
 import { MODEL, digest } from './siwc-local-runtime.mjs';
 
@@ -469,6 +469,36 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
   } finally { try { client.close(); } catch { fail('WORKER_CLEANUP_UNCONFIRMED'); } }
 }
 
+/** Resident wiring owns maintenance and generation in one process. Background
+ * renewal never chooses an account or creates work; the original Corely lease
+ * still bounds selected generation. Fatal maintenance stops the worker. */
+export async function runCorelyVmModelWorkerWithSessions({ sessions, client, connect, signal, authoritySignal = signal, onReceipt = async () => {},
+  ports = createSiwcModelTransports(sessions), ...options } = {}) {
+  if (!sessions || typeof sessions.maintain !== 'function' || typeof sessions.maintainAccount !== 'function' ||
+      !(signal instanceof AbortSignal) || !(authoritySignal instanceof AbortSignal) || typeof onReceipt !== 'function' ||
+      Boolean(client) === Boolean(connect) || connect !== undefined && typeof connect !== 'function') fail('WORKER_OPTIONS_INVALID');
+  const owner = new AbortController(), active = AbortSignal.any([signal, owner.signal]);
+  const authority = AbortSignal.any([authoritySignal, owner.signal]);
+  let maintenanceFailed = false;
+  const maintenance = runPersistentPlanMaintenance({ sessions, signal: active, onReceipt }).catch(() => {
+    if (!active.aborted) { maintenanceFailed = true; owner.abort(); }
+  });
+  try {
+    // Existing app-owned OAuth maintenance starts before normal Corely consent.
+    // It never renews that separate grant or changes its original deadline.
+    const ownedClient = client ?? await connect(authority);
+    const result = await runCorelyVmModelWorker({ ...options, client: ownedClient, ports, signal: active, onReceipt,
+      maintainSessions: async selected => {
+        // Inspection remains zero-network. A selected generate waits on the
+        // same account lock and rechecks the original signal after renewal.
+        assertCorelyVmModelSessionMaintenance(await sessions.maintain(selected, { refresh: false }));
+      } });
+    if (maintenanceFailed) fail('WORKER_SESSION_HELD');
+    return result;
+  } catch (error) { if (maintenanceFailed) fail('WORKER_SESSION_HELD'); throw error; }
+  finally { owner.abort(); await maintenance; }
+}
+
 export function parseVmModelWorkerCommand(argv) {
   if (!Array.isArray(argv) || argv.length !== 3 || !['init-key', 'status', 'run', 'run-gateway'].includes(argv[0]) || argv[1] !== '--state-dir' ||
       typeof argv[2] !== 'string' || !isAbsolute(argv[2]) || resolve(argv[2]) !== argv[2]) fail('WORKER_OPTIONS_INVALID');
@@ -496,18 +526,15 @@ export async function runVmModelWorkerCommand(argv) {
     const active = gateway?.signal ?? controller.signal;
     // Gateway failure stops inference, but leaves at most one bounded terminal
     // notification possible. SIGINT/SIGTERM still closes authority immediately.
-    const client = await identity.connect({ signal: controller.signal, onAuthorize: async value => {
-      safe(await lifecycle.presentConsent(value));
-    } });
-    await lifecycle.clearConsent();
-    safe(await runCorelyVmModelWorker({ client, ports: gateway?.ports ?? createSiwcModelTransports(sessions), signal: active,
+    safe(await runCorelyVmModelWorkerWithSessions({ sessions, ports: gateway?.ports ?? createSiwcModelTransports(sessions),
+      signal: active, authoritySignal: controller.signal, connect: async authority => {
+        const client = await identity.connect({ signal: authority, onAuthorize: async value => {
+          safe(await lifecycle.presentConsent(value));
+        } });
+        await lifecycle.clearConsent(); return client;
+      },
       onReceipt: value => safe(gateway && value.status === 'CORELY_SYNTHETIC_MODEL_JOB_COMPLETED'
-        ? { ...value, modelTransport: 'new_api_gateway_siwc' } : value), maintainSessions: async active => {
-        // Inspect both current private records without refreshing a standby on
-        // the claim path. generate() still refreshes the selected account under
-        // its own lock and the original model/lease deadline; no background race.
-        assertCorelyVmModelSessionMaintenance(await sessions.maintain(active, { refresh: false }));
-      } }));
+        ? { ...value, modelTransport: 'new_api_gateway_siwc' } : value) }));
   } finally {
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); controller.abort();
     let cleanupFailed = false;

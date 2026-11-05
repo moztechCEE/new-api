@@ -19,8 +19,11 @@ services:
       driver: json-file
       options: {max-size: '5m', max-file: '2'}
   # The reviewed deployment must stop sessions before starting this profile.
-  # One process owns both SIWC maintenance and Corely model execution; the
-  # protected worker lock additionally prevents duplicate model consumers.
+  # One process owns independent per-account idle renewal and Corely execution;
+  # its safe SESSION_ACCOUNT_MAINTENANCE metadata is session-record health, not
+  # quota/model proof. Renewal starts while fresh normal Corely consent waits,
+  # stops with this owner, and never renews its <=24h Corely grant. The protected
+  # worker lock prevents duplicate consumers; do not run sessions alongside it.
   model-worker:
     profiles: ['model-worker']
     image: ${SIWC_IMAGE:?Set the exact approved SIWC image digest}
@@ -40,6 +43,8 @@ services:
       driver: json-file
       options: {max-size: '5m', max-file: '2'}
   # Explicit replacement profile, never start beside model-worker/sessions.
+  # Same owner-bound renewal/health lifecycle; restart remains manual so a new
+  # normal Corely consent is required, with no grant or model-work replay.
   # No published ports. The existing Go Gateway joins this private network
   # and trusts the bridge's pinned TLS certificate/CA. Channel/token/strict
   # affinity setup and their <=24h credentials need a separate approved release.

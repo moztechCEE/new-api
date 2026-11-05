@@ -7,7 +7,8 @@ import { spawnSync } from 'node:child_process';
 import { after, before, test } from 'node:test';
 import { ISSUER, RESOURCE, MODEL, PROBE_OUTPUT, SCOPES, ProbeError, digest } from './siwc-local-runtime.mjs';
 import { openSessionStore, persistValidatedAuthorization, retainIssuedRegistration, writeEnrollment, importEnrollment,
-  forgetTransferredEnrollment, createPersistentPlanSessions, acquireSessionProcessLock, SESSION_ACCOUNTS } from './siwc-local-sessions.mjs';
+  forgetTransferredEnrollment, createPersistentPlanSessions, runPersistentPlanMaintenance,
+  acquireSessionProcessLock, SESSION_ACCOUNTS } from './siwc-local-sessions.mjs';
 import { startPersistentEnrollment, assertIsolatedSessionEnvironment, parseSessionCommand } from './siwc-local-vm.mjs';
 import { corelyPlanPayload, createSiwcModelTransports, createTransientSiwcModelPort, runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 
@@ -602,6 +603,137 @@ test('maintenance keeps both account states visible and never renews uncertain o
     assert.equal(result.accounts[1].alias, 'eason'); assert.equal(result.accounts[1].state, 'active');
     assert.equal(calls, 0); assert.equal(result.apiFallbackUsed, false);
     await assert.rejects(createPersistentPlanSessions(vm, { now: () => NOW }).maintain(), code('SESSION_CLOCK_INVALID'));
+  });
+});
+
+test('resident maintenance renews Eason while Info is slow; only the current manager witnesses its pending owner', { timeout: 5000 }, async t => {
+  const { vm } = await transferred(t, ['info', 'eason']), stop = new AbortController(), events = [];
+  let enteredInfo, easonReady, rejectLate, infoCalls = 0, easonCalls = 0;
+  const infoStarted = new Promise(resolve => { enteredInfo = resolve; });
+  const easonMaintained = new Promise(resolve => { easonReady = resolve; });
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async (url, init) => {
+    assert.equal(url, `${ISSUER}/api/accounts/oauth/token`);
+    if (init.body.get('client_id') === 'fixture_info') {
+      infoCalls++; enteredInfo(); return new Promise((_accept, reject) => { rejectLate = reject; });
+    }
+    easonCalls++;
+    return Response.json({ access_token: 'synthetic-eason-new-access', refresh_token: 'synthetic-eason-new-refresh', token_type: 'Bearer', expires_in: 3600 });
+  } });
+  const running = runPersistentPlanMaintenance({ sessions, signal: stop.signal, now: () => NOW + 250000,
+    sleep: () => new Promise(() => {}), onReceipt: event => {
+      events.push(event); if (event.alias === 'eason' && event.state === 'active') easonReady();
+    } });
+  await infoStarted; await easonMaintained;
+  assert.equal(infoCalls, 1); assert.equal(easonCalls, 1);
+  const inspected = await sessions.maintain(stop.signal, { refresh: false });
+  assert.deepEqual(inspected.accounts.map(record => [record.alias, record.state]), [['info', 'renewal_due'], ['eason', 'active']]);
+  assert.equal((await createPersistentPlanSessions(await openSessionStore(vm.root), { now: () => NOW + 250000 })
+    .maintain(undefined, { refresh: false })).accounts[0].code, 'REFRESH_OUTCOME_UNCERTAIN');
+  stop.abort(); assert.equal((await running).status, 'SESSION_MAINTENANCE_STOPPED');
+  rejectLate(new Error('PRIVATE_LATE_REFRESH_REJECTION')); await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await sessions.maintain(undefined, { refresh: false })).accounts[0].code, 'REFRESH_OUTCOME_UNCERTAIN');
+  const restarted = createPersistentPlanSessions(await openSessionStore(vm.root), { now: () => NOW + 251000,
+    fetchImpl: () => { throw new Error('UNKNOWN_ROTATION_MUST_NOT_RETRY'); } });
+  const recovered = await restarted.maintain();
+  assert.equal(recovered.accounts[0].code, 'REFRESH_OUTCOME_UNCERTAIN'); assert.equal(recovered.accounts[1].state, 'active');
+  assert.equal((await vm.read('eason')).revision, inspected.accounts[1].revision);
+  assert.equal(events[0].healthy, true); assert.equal(events[0].healthKind, 'APP_OWNED_SESSION_RECORD');
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE|synthetic-.*-(?:access|refresh)|accessToken|refreshToken|idToken/);
+  assert.deepEqual((await readdir(vm.root)).filter(name => name.endsWith('.lock')), []);
+});
+
+test('background rotation and selected generation share one account lock and preserve the latest replacement on restart', { timeout: 5000 }, async t => {
+  const { vm } = await transferred(t), stop = new AbortController();
+  let entered, release, refreshes = 0, modelCalls = 0;
+  const started = new Promise(resolve => { entered = resolve; }), pending = new Promise(resolve => { release = resolve; });
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async (url, init) => {
+    if (url === `${ISSUER}/api/accounts/oauth/token`) {
+      refreshes++; entered(); await pending;
+      return Response.json({ access_token: 'synthetic-latest-access', refresh_token: 'synthetic-latest-refresh', token_type: 'Bearer', expires_in: 3600 });
+    }
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-latest-access'); modelCalls++;
+    return url === `${RESOURCE}/models` ? catalog() : modelCompletion('Synthetic reviewed answer.');
+  } });
+  const running = runPersistentPlanMaintenance({ sessions, signal: stop.signal, now: () => NOW + 250000, sleep: () => new Promise(() => {}) });
+  await started;
+  const generated = sessions.generate('info', modelRequest(), new AbortController().signal);
+  release(); assert.equal((await generated).status, 'success');
+  stop.abort(); await running;
+  assert.equal(refreshes, 1); assert.equal(modelCalls, 2);
+  const reloaded = await openSessionStore(vm.root), saved = await reloaded.read('info');
+  assert.equal(saved.state, 'active'); assert.equal(saved.accessToken, 'synthetic-latest-access');
+  const restarted = createPersistentPlanSessions(reloaded, { now: () => NOW + 251000,
+    fetchImpl: () => { throw new Error('COMMITTED_ROTATION_MUST_NOT_REPEAT'); } });
+  assert.equal((await restarted.maintain()).accounts[0].revision, saved.revision);
+});
+
+test('resident cancellation bounds ignored refresh fetch, body and JWKS work without retrying pending rotation', { timeout: 5000 }, async t => {
+  for (const stage of ['fetch', 'body', 'jwks']) await t.test(stage, async t => {
+    const { vm } = await transferred(t), stop = new AbortController();
+    let reached, rejectLate, cancelled = false, refreshes = 0;
+    const started = new Promise(resolve => { reached = resolve; });
+    const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async url => {
+      if (url === `${ISSUER}/api/accounts/oauth/token`) {
+        refreshes++;
+        if (stage === 'fetch') { reached(); return new Promise((_resolve, reject) => { rejectLate = reject; }); }
+        if (stage === 'body') return new Response(new ReadableStream({ start(controller) {
+          controller.enqueue(Buffer.from('{"access_token":')); reached();
+        }, cancel() { cancelled = true; } }), { headers: { 'content-type': 'application/json' } });
+        return Response.json(fixtureToken('info', { token: { access_token: 'synthetic-next-access', refresh_token: 'synthetic-next-refresh', expires_in: 3600 } }));
+      }
+      assert.equal(url, `${ISSUER}/.well-known/jwks.json`); reached();
+      return new Promise((_resolve, reject) => { rejectLate = reject; });
+    } });
+    const running = runPersistentPlanMaintenance({ sessions, signal: stop.signal, now: () => NOW + 250000, sleep: () => new Promise(() => {}) });
+    await started; stop.abort(); await running;
+    rejectLate?.(new Error('PRIVATE_LATE_AUTH_REJECTION')); await new Promise(resolve => setImmediate(resolve));
+    assert.equal((await vm.read('info')).state, 'refresh_pending'); assert.equal(refreshes, 1);
+    if (stage === 'body') assert.equal(cancelled, true);
+    const restarted = createPersistentPlanSessions(await openSessionStore(vm.root), { now: () => NOW + 251000,
+      fetchImpl: () => { throw new Error('PENDING_MUST_NOT_REFRESH'); } });
+    assert.equal((await restarted.maintain()).accounts[0].code, 'REFRESH_OUTCOME_UNCERTAIN');
+    assert.deepEqual((await readdir(vm.root)).filter(name => name.endsWith('.lock')), []);
+  });
+});
+
+test('maintenance has one owner, safe state health and cancellation-bound receipt callbacks', { timeout: 5000 }, async t => {
+  const { vm } = await transferred(t), stop = new AbortController(); let reached, rejectLate;
+  const received = new Promise(resolve => { reached = resolve; });
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000,
+    fetchImpl: () => { throw new Error('FRESH_HEALTH_MUST_NOT_INFER'); } });
+  const running = runPersistentPlanMaintenance({ sessions, signal: stop.signal, now: () => NOW + 2000,
+    onReceipt: receipt => {
+      assert.equal(receipt.healthKind, 'APP_OWNED_SESSION_RECORD'); assert.equal(receipt.modelRequestsMade, 0);
+      reached(); return new Promise((_resolve, reject) => { rejectLate = reject; });
+    } });
+  await received;
+  await assert.rejects(runPersistentPlanMaintenance({ sessions, signal: new AbortController().signal }), code('SESSION_BUSY_OR_LOCKED'));
+  stop.abort(); await running; rejectLate(new Error('PRIVATE_LATE_RECEIPT_REJECTION'));
+  await new Promise(resolve => setImmediate(resolve));
+  const again = new AbortController(); again.abort();
+  assert.equal((await runPersistentPlanMaintenance({ sessions, signal: again.signal })).status, 'SESSION_MAINTENANCE_STOPPED');
+});
+
+test('fatal identity/scope or unknown maintenance errors stop both loops without a credential-shaped diagnostic', { timeout: 5000 }, async t => {
+  for (const kind of ['scope', 'identity', 'unknown']) await t.test(kind, async t => {
+    const { vm } = await transferred(t, ['info', 'eason']), events = []; let easonCancelled = false;
+    let enteredEason; const easonStarted = new Promise(resolve => { enteredEason = resolve; });
+    const manager = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async (_url, init) => {
+      if (init.body.get('client_id') === 'fixture_eason') { enteredEason(); return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => {
+        easonCancelled = true; reject(new Error('PRIVATE_STOPPED_EASON')); }, { once: true })); }
+      await easonStarted;
+      if (kind === 'identity') return Response.json(fixtureToken('eason', { token: { expires_in: 3600 } }));
+      return Response.json({ access_token: 'synthetic-next-access', token_type: 'Bearer', expires_in: 3600, scope: `${SCOPES} unsafe_scope` });
+    } });
+    const sessions = kind === 'unknown' ? { maintainAccount: async alias => {
+      if (alias === 'info') throw new Error('PRIVATE_MAINTENANCE_SECRET');
+      return { alias, state: 'not_connected' };
+    } } : manager;
+    await assert.rejects(runPersistentPlanMaintenance({ sessions, signal: new AbortController().signal,
+      now: () => NOW + 250000, onReceipt: event => events.push(event), sleep: () => new Promise(() => {}) }), code('SESSION_MAINTENANCE_FAILED'));
+    if (kind !== 'unknown') assert.equal(easonCancelled, true);
+    assert.equal(events.some(event => event.alias === 'info' && event.healthy === false && event.code === 'SESSION_MAINTENANCE_FAILED'), true);
+    assert.doesNotMatch(JSON.stringify(events), /PRIVATE|accessToken|refreshToken|idToken|unsafe_scope/);
   });
 });
 
