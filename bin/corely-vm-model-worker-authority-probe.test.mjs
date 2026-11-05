@@ -126,7 +126,7 @@ async function fixture(mode = 'success') {
   };
 }
 
-async function runControlled(mode, { stopAt, eofAt, maximumRuntimeMs } = {}) {
+async function runControlled(mode, { stopAt, eofAt, inputErrorAt, outputErrorAt, maximumRuntimeMs } = {}) {
   const f = await fixture(mode), input = new PassThrough(), events = [], writes = [];
   const output = new Writable({ write(chunk, _encoding, done) {
     writes.push(chunk.toString()); const event = JSON.parse(chunk); events.push(event); done();
@@ -135,6 +135,8 @@ async function runControlled(mode, { stopAt, eofAt, maximumRuntimeMs } = {}) {
       await f.event(event);
       if (event.status === stopAt) { input.write('STOP\n'); return; }
       if (event.status === eofAt) { input.end(); return; }
+      if (event.status === inputErrorAt) { input.destroy(new Error('PRIVATE_INPUT_ERROR')); return; }
+      if (event.status === outputErrorAt) { output.emit('error', new Error('PRIVATE_OUTPUT_ERROR')); return; }
       const value = protocol(event); if (value) input.write(`${value}\n`);
     })().catch(error => input.destroy(error)); });
   } });
@@ -214,11 +216,12 @@ if (childMode) {
   });
 
   test('STOP and EOF before revocation close input and make one bounded server cleanup attempt', async t => {
-    for (const choice of ['stopAt', 'eofAt']) await t.test(choice, async () => {
+    for (const choice of ['stopAt', 'eofAt', 'inputErrorAt', 'outputErrorAt']) await t.test(choice, async () => {
       const result = await runControlled('success', { [choice]: 'CORELY_AUTHORITY_CONNECTED' });
       assert.equal(result.receipt.status, 'CLOUD_AUTHORITY_PROBE_HELD');
       assert.equal(result.receipt.remoteRevocation, 'CONFIRMED'); assert.equal(result.stats.requests, 3);
       assert.equal(result.inputDestroyed, true); assert.equal(result.stats.closed, 1); assert.equal(result.stats.negativeRequests, 0);
+      assert.doesNotMatch(result.encoded, /PRIVATE_INPUT_ERROR|PRIVATE_OUTPUT_ERROR/);
     });
   });
 

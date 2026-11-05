@@ -194,6 +194,7 @@ export async function runCorelyVmAuthorityProbe({ stateDir = '/state', input = p
     return finishing;
   };
   const stopped = () => { void finish('OPERATOR_STOPPED'); };
+  const ioFailed = () => { void finish('IO_CLOSED'); };
   function boundedInput(chunk) {
     inputBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.byteLength;
     if (inputBytes > 1024) void finish('COMMAND_PROTOCOL_HELD');
@@ -314,6 +315,10 @@ export async function runCorelyVmAuthorityProbe({ stateDir = '/state', input = p
     const metadata = identity.receipt();
     if (metadata.hostIdHash !== HOST || metadata.syntheticOnly !== true || metadata.apiFallbackEnabled !== false) throw held();
     timer = setTimeout(() => { void finish('MAX_RUNTIME_REACHED'); }, maximumRuntimeMs);
+    // These are dedicated diagnostic streams. Error listeners remain attached
+    // through the final write callback/error event; they own no live handle and
+    // never project the underlying I/O error into output.
+    input.on('error', ioFailed); output.on('error', ioFailed);
     input.on('data', boundedInput);
     lines = createInterface({ input, crlfDelay: Infinity, terminal: false });
     lines.on('line', line => {
