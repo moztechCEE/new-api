@@ -5,7 +5,7 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, readFile, readlink, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ISSUER, RESOURCE, SCOPES, ProbeError, digest, publicJson, validateSession, runSyntheticProbe } from './siwc-local-runtime.mjs';
+import { ISSUER, RESOURCE, SCOPES, MODEL, ProbeError, digest, publicJson, selectExactModel, validateSession, runSyntheticProbe } from './siwc-local-runtime.mjs';
 import { runCorelyPlanRequest } from './siwc-local-model-port.mjs';
 import { snapshotModelRequest } from './corely-model-contract.mjs';
 
@@ -680,6 +680,27 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
     }, signal);
   }
   return Object.freeze({
+    async catalog(alias, signal) {
+      account(alias);
+      if (!(signal instanceof AbortSignal)) fail('SESSION_MANAGER_INVALID');
+      checkAbort(signal);
+      // Account selection is explicit. The original lease/renewal authority
+      // stays inside withFreshRecord; this endpoint never dispatches inference
+      // or interprets catalog availability as quota or a debit receipt.
+      return withFreshRecord(alias, async record => {
+        const value = await awaitSessionOperation(publicJson(`${RESOURCE}/models`, {
+          method: 'GET', credentials: 'omit', cache: 'no-store',
+          headers: { Authorization: `Bearer ${record.accessToken}`, Accept: 'application/json' },
+        }, fetchImpl, signal), signal);
+        checkAbort(signal);
+        selectExactModel(value);
+        if (record.expiresAt <= clock(record)) fail('SESSION_NOT_ELIGIBLE');
+        return Object.freeze({ status: 'DEV_ACCOUNT_MODEL_CATALOG_VERIFIED', alias, model: MODEL,
+          authorizationSource: 'APP_OWNED_SIWC', accountVerified: true, planScopeGranted: true,
+          catalogModelVerified: true, modelRequestsMade: 0, inferenceVerified: false,
+          exactDebitAmountVerified: false, apiKeyFallbackUsed: false });
+      }, signal);
+    },
     async status() {
       const accounts = [];
       for (const alias of ['info', 'eason']) {

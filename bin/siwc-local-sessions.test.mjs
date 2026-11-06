@@ -63,6 +63,108 @@ function leaveExitedOwnerLock(root, alias = 'info') {
 const retainedWithoutTokens = (record, state) => Object.fromEntries(Object.entries({ ...record, state, revision: record.revision + 1 })
   .filter(([key]) => !['accessToken', 'refreshToken', 'idToken', 'nonce', 'expiresAt', 'scopes'].includes(key)));
 const catalog = () => Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
+
+test('explicit per-account catalog uses only its app-owned session and never performs inference or fallback', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']);
+  const calls = [];
+  let selected;
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async (url, init) => {
+    calls.push(url);
+    assert.equal(url, `${RESOURCE}/models`); assert.equal(init.method, 'GET');
+    assert.equal(init.redirect, 'error'); assert.equal(init.credentials, 'omit'); assert.equal(init.cache, 'no-store');
+    assert.equal(init.headers.Authorization, `Bearer synthetic-${selected}-access`);
+    return catalog();
+  } });
+  for (const alias of ['info', 'eason']) {
+    selected = alias;
+    const before = await vm.read(alias);
+    const receipt = await sessions.catalog(alias, new AbortController().signal);
+    assert.deepEqual(receipt, { status: 'DEV_ACCOUNT_MODEL_CATALOG_VERIFIED', alias, model: MODEL,
+      authorizationSource: 'APP_OWNED_SIWC', accountVerified: true, planScopeGranted: true,
+      catalogModelVerified: true, modelRequestsMade: 0, inferenceVerified: false,
+      exactDebitAmountVerified: false, apiKeyFallbackUsed: false });
+    assert.equal(Object.isFrozen(receipt), true);
+    assert.deepEqual(await vm.read(alias), before);
+    assert.doesNotMatch(JSON.stringify(receipt), /synthetic-.*-(?:access|refresh)|accessToken|refreshToken|clientId|subjectHash|idToken|nonce/);
+  }
+  assert.deepEqual(calls, [`${RESOURCE}/models`, `${RESOURCE}/models`]);
+  assert.equal(Object.keys(sessions).some(key => /token|credential/i.test(key)), false);
+});
+
+test('catalog normal renewal stays in the same selected account and uses only the atomically saved successor', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']);
+  const untouched = await vm.read('eason'), calls = [];
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 250000, fetchImpl: async (url, init) => {
+    calls.push(url);
+    if (url === `${ISSUER}/api/accounts/oauth/token`) {
+      assert.deepEqual(Object.fromEntries(init.body), { grant_type: 'refresh_token', client_id: 'fixture_info',
+        refresh_token: 'synthetic-info-refresh', resource: RESOURCE });
+      assert.equal((await vm.read('info')).state, 'refresh_pending');
+      return Response.json({ access_token: 'synthetic-catalog-new-access', refresh_token: 'synthetic-catalog-new-refresh', token_type: 'Bearer', expires_in: 3600 });
+    }
+    assert.equal(url, `${RESOURCE}/models`); assert.equal(init.headers.Authorization, 'Bearer synthetic-catalog-new-access');
+    assert.equal((await vm.read('info')).state, 'active');
+    assert.equal((await vm.read('info')).accessToken, 'synthetic-catalog-new-access');
+    return catalog();
+  } });
+  const result = await sessions.catalog('info', new AbortController().signal);
+  assert.equal(result.catalogModelVerified, true); assert.equal(result.modelRequestsMade, 0);
+  assert.deepEqual(calls, [`${ISSUER}/api/accounts/oauth/token`, `${RESOURCE}/models`]);
+  assert.deepEqual(await vm.read('eason'), untouched);
+});
+
+test('catalog rejects unavailable Sol, provider denial, partial JSON and redirects without a model or alternate account', async t => {
+  for (const [name, response, expected] of [
+    ['missing Sol', () => Response.json({ models: [{ slug: 'gpt-6-astra', visibility: 'list' }] }), 'EXACT_MODEL_NOT_AVAILABLE'],
+    ['hidden Sol', () => Response.json({ models: [{ slug: MODEL, visibility: 'hidden' }] }), 'EXACT_MODEL_NOT_AVAILABLE'],
+    ['revoked access', () => Response.json({ error: { message: 'PRIVATE_DETAIL' } }, { status: 401 }), 'UPSTREAM_HTTP_401'],
+    ['model access denied', () => Response.json({ error: { message: 'PRIVATE_DETAIL' } }, { status: 403 }), 'UPSTREAM_HTTP_403'],
+    ['malformed JSON', () => new Response('{"models":', { headers: { 'content-type': 'application/json' } }), 'INVALID_UPSTREAM_RESPONSE'],
+    ['redirect', () => new Response(null, { status: 302, headers: { location: 'https://other.invalid' } }), 'UPSTREAM_HTTP_302'],
+  ]) await t.test(name, async t => {
+    const { vm } = await transferred(t, ['info', 'eason']), calls = [];
+    const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async (url, init) => {
+      calls.push(url); assert.equal(init.headers.Authorization, 'Bearer synthetic-info-access'); return response();
+    } });
+    await assert.rejects(sessions.catalog('info', new AbortController().signal), error =>
+      code(expected)(error) && !JSON.stringify(error).includes('PRIVATE_DETAIL'));
+    assert.deepEqual(calls, [`${RESOURCE}/models`]);
+  });
+});
+
+test('catalog holds missing, invalid, disconnected and unknown rotating sessions before any provider request', async t => {
+  for (const state of ['missing', 'disconnected', 'refresh_pending', 'reauth_required']) await t.test(state, async t => {
+    const { vm } = await transferred(t, state === 'missing' ? [] : ['info']);
+    const old = await vm.read('info');
+    if (state !== 'missing') await vm.write('info', state === 'refresh_pending' ? { ...old, state } : retainedWithoutTokens(old, state));
+    let calls = 0;
+    const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async () => { calls++; throw new Error('NO_NETWORK'); } });
+    await assert.rejects(sessions.catalog('info', new AbortController().signal), code(state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED'));
+    assert.equal(calls, 0);
+  });
+});
+
+test('catalog cancellation bounds an ignored provider and never promotes an expired session', { timeout: 5000 }, async t => {
+  const { vm } = await transferred(t);
+  let entered, finish;
+  const reached = new Promise(resolve => { entered = resolve; }), pending = new Promise(resolve => { finish = resolve; });
+  const stop = new AbortController();
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async () => { entered(); return pending; } });
+  const result = sessions.catalog('info', stop.signal);
+  await reached; stop.abort();
+  await assert.rejects(result, code('SESSION_OPERATION_ABORTED'));
+  finish(catalog());
+  let time = NOW + 2000, calls = 0;
+  const expiresDuringCatalog = createPersistentPlanSessions(vm, { now: () => time, fetchImpl: async () => {
+    calls++; time = NOW + 400000; return catalog();
+  } });
+  await assert.rejects(expiresDuringCatalog.catalog('info', new AbortController().signal), code('SESSION_NOT_ELIGIBLE'));
+  assert.equal(calls, 1);
+  await assert.rejects(sessions.catalog('info'), code('SESSION_MANAGER_INVALID'));
+  await assert.rejects(sessions.catalog('info', AbortSignal.abort()), code('SESSION_OPERATION_ABORTED'));
+  await assert.rejects(sessions.catalog('unknown', new AbortController().signal), code('ACCOUNT_NOT_ADMITTED'));
+});
+
 function completion() {
   return new Response(Buffer.from(`data: ${JSON.stringify({ type: 'response.completed', response: {
     id: 'synthetic-response', status: 'completed', model: MODEL,
@@ -1106,7 +1208,11 @@ test('operator commands never inherit API/proxy/native-auth configuration or acc
     Object.create({ OPENAI_BASE_URL: 'https://example.invalid' })]) assert.throws(() => assertIsolatedSessionEnvironment(env), code('SESSION_ENVIRONMENT_NOT_ISOLATED'));
   assert.doesNotThrow(() => assertIsolatedSessionEnvironment({ PATH: '/usr/bin', HOME: '/synthetic' }));
   assert.equal(parseSessionCommand(['probe', '--state-dir', '/synthetic']).command, 'probe');
+  for (const alias of ['info', 'eason']) assert.deepEqual(parseSessionCommand(['catalog', '--state-dir', '/synthetic', '--account', alias]),
+    { command: 'catalog', options: { '--state-dir': '/synthetic', '--account': alias } });
   for (const args of [[], ['probe', '--state-dir', '/synthetic', '--account', 'eason'],
+    ['catalog', '--state-dir', '/synthetic'], ['catalog', '--state-dir', '/synthetic', '--account', 'unknown'],
+    ['catalog', '--state-dir', '/synthetic', '--account', 'info', '--model', 'other'],
     ['authorize', '--state-dir', '/synthetic', '--account', 'unknown', '--target-host-id', 'fixture'],
     ['status', '--state-dir', '/synthetic', '--state-dir', '/other'],
     ['probe', '--state-dir', '/synthetic', '--prompt', 'customer-data'], ['probe', '--state-dir', '/synthetic', '--model', 'other']]) {

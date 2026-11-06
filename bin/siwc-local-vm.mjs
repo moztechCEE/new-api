@@ -121,7 +121,7 @@ export async function startPersistentEnrollment({ store, alias, targetHostId, fe
 }
 
 export function parseSessionCommand(argv) {
-  const commands = ['init-vm', 'authorize', 'prepare-transfer', 'import', 'forget-transferred', 'status', 'probe', 'maintain', 'disconnect'];
+  const commands = ['init-vm', 'authorize', 'prepare-transfer', 'import', 'forget-transferred', 'status', 'catalog', 'probe', 'maintain', 'disconnect'];
   if (!commands.includes(argv[0]) || argv.length % 2 !== 1) fail('SESSION_COMMAND_INVALID');
   const options = {};
   for (let index = 1; index < argv.length; index += 2) {
@@ -134,7 +134,7 @@ export function parseSessionCommand(argv) {
     'init-vm': ['--state-dir'], authorize: ['--state-dir', '--account', '--target-host-id'],
     'prepare-transfer': ['--state-dir', '--account', '--target-host-id'], import: ['--state-dir', '--account'],
     'forget-transferred': ['--state-dir', '--account', '--imported-sha256'], status: ['--state-dir'],
-    probe: ['--state-dir'], maintain: ['--state-dir'], disconnect: ['--state-dir', '--account'],
+    catalog: ['--state-dir', '--account'], probe: ['--state-dir'], maintain: ['--state-dir'], disconnect: ['--state-dir', '--account'],
   }[argv[0]];
   if (Object.keys(options).length !== allowed.length || allowed.some(key => !options[key]) ||
     (options['--account'] && !Object.hasOwn(SESSION_ACCOUNTS, options['--account']))) fail('SESSION_COMMAND_INVALID');
@@ -174,6 +174,12 @@ export async function runSessionCommand(argv) {
   }
   const sessions = createPersistentPlanSessions(store);
   if (command === 'status') return safe(await sessions.status());
+  if (command === 'catalog') {
+    const controller = new AbortController(), stop = () => controller.abort();
+    process.once('SIGINT', stop); process.once('SIGTERM', stop);
+    try { return safe(await sessions.catalog(options['--account'], AbortSignal.any([controller.signal, AbortSignal.timeout(60000)]))); }
+    finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+  }
   if (command === 'probe') return safe({ status: 'DEV_FIXED_PROBE_COMPLETED', ...await sessions.probeInAccountOrder() });
   if (command === 'disconnect') {
     const receipt = await sessions.disconnect(options['--account']); safe(receipt);
