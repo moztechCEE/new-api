@@ -26,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
@@ -619,6 +620,53 @@ func TestResponsesWSPassthroughPreservesRawPricingParameters(t *testing.T) {
 	storage, err := common.GetBodyStorage(c)
 	require.NoError(t, err)
 	require.NoError(t, storage.Close())
+}
+
+// The private SIWC bridge binds the exact outgoing bytes, not just decoded JSON.
+// Exercise the real request-preparation path without DoRequest, a listener,
+// credentials, a database or model calls. A channel-local body passthrough is
+// required; global passthrough and header passthrough remain disabled.
+func TestSIWCGatewayResponsesExactWireRequiresChannelPassthrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	settings := model_setting.GetGlobalSettings()
+	previousPassthrough := settings.PassThroughRequestEnabled
+	settings.PassThroughRequestEnabled = false
+	t.Cleanup(func() { settings.PassThroughRequestEnabled = previousPassthrough })
+	payload := `{"model":"gpt-6.1-sol","instructions":"合成<>&` + "\u2028\u2029" + `規範","input":[{"role":"user","content":"Synthetic question.\r\nKeep every prompt byte."}],"store":false,"stream":true,"text":{"format":{"type":"json_schema","name":"corely_model_output","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}},"reasoning":{"effort":"low"},"metadata":{"corely_siwc_nonce":"` + strings.Repeat("n", 43) + `"}}`
+	for _, passthrough := range []bool{false, true} {
+		t.Run(fmt.Sprintf("channel_passthrough=%t", passthrough), func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(payload))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-6.1-sol")
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: passthrough})
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{})
+			storage, err := common.GetBodyStorage(c)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, storage.Close()) })
+			var request dto.OpenAIResponsesRequest
+			require.NoError(t, common.Unmarshal([]byte(payload), &request))
+			info := relaycommon.GenRelayInfoResponses(c, &request)
+			adaptor, body, closer, apiErr := PrepareResponsesRequest(c, info, &request)
+			require.Nil(t, apiErr)
+			require.NotNil(t, adaptor)
+			require.NotNil(t, closer)
+			t.Cleanup(func() { require.NoError(t, closer.Close()) })
+			outgoing, err := io.ReadAll(body)
+			require.NoError(t, err)
+			assert.JSONEq(t, payload, string(outgoing), "no prompt, schema, nonce, false value or type may change")
+			assert.False(t, settings.PassThroughRequestEnabled)
+			assert.Empty(t, info.ParamOverride)
+			if passthrough {
+				assert.Equal(t, payload, string(outgoing), "the strict private bridge must receive the original bytes")
+				return
+			}
+			assert.NotEqual(t, payload, string(outgoing), "the normal DTO path cannot satisfy exact-wire binding")
+			assert.Less(t, strings.Index(string(outgoing), `"input"`), strings.Index(string(outgoing), `"instructions"`), "the DTO serializes input before instructions")
+			assert.Contains(t, string(outgoing), `\u003c\u003e\u0026\u2028\u2029`, "Go JSON escaping changes bytes without changing string values")
+		})
+	}
 }
 
 // The SIWC pilot uses the existing HTTP Responses relay, not a new provider or
