@@ -73,6 +73,9 @@ export async function verifyCorelyDevBridgeCredentialRotation(options = {}) {
           return undefined;
         },
       }, res => {
+        // Node can detach a Connection: close socket before the response EOF.
+        // Bind the actual authenticated peer when response headers arrive.
+        const receivedFromPinnedPeer = Boolean(peerVerified && pinnedAddress && res.socket?.remoteAddress === pinnedAddress);
         let size = 0;
         const chunks = [];
         res.on('error', () => reject(hold()));
@@ -82,8 +85,7 @@ export async function verifyCorelyDevBridgeCredentialRotation(options = {}) {
           if (size > 512) res.destroy(hold()); else chunks.push(chunk);
         });
         res.on('end', () => {
-          if (!peerVerified || !pinnedAddress || req.socket?.remoteAddress !== pinnedAddress ||
-              active.aborted || res.statusCode !== expectedStatus || res.headers.location !== undefined ||
+          if (!receivedFromPinnedPeer || active.aborted || res.statusCode !== expectedStatus || res.headers.location !== undefined ||
               res.headers['content-type'] !== 'application/json; charset=utf-8' || res.headers['cache-control'] !== 'no-store' ||
               !Buffer.concat(chunks).equals(Buffer.from(response(expectedCode)))) { reject(hold()); return; }
           resolve();
