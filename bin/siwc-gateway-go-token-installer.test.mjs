@@ -24,7 +24,7 @@ async function fixture(t, overrides = {}) {
   const controller = new AbortController(), calls = [], rows = new Map(), remote = { afterDelete: false, lost: false, time: START };
   const oldExpiry = START + 600_000;
   const authority = overrides.credentialOnly ? { ...parent, channelId: 10, group: 'corely-dev-siwc' } : parent;
-  rows.set(10, { row: wire(10, label(1), oldExpiry, previousToken, authority.group), token: previousToken });
+  if (!overrides.empty) rows.set(10, { row: wire(10, label(1), oldExpiry, previousToken, authority.group), token: previousToken });
   const options = { enabled: true, stateDir: dir, authority, management: { token: pat, expiresAt: parent.expiresAt }, signal: controller.signal,
     ...(overrides.credentialOnly ? { credentialOnly: true } : {}),
     now: () => remote.time,
@@ -60,7 +60,7 @@ async function fixture(t, overrides = {}) {
         return json(good({ items, total: items.length }));
       }
       if (path === '/api/token/' && method === 'POST') {
-        const body = JSON.parse(init.body), id = Math.max(...rows.keys()) + 1, key = String(id).repeat(24);
+        const body = JSON.parse(init.body), id = Math.max(9, ...rows.keys()) + 1, key = String(id).repeat(24);
         assert.equal(body.name, label(id - 9)); assert.equal(body.group, authority.group); assert.equal(body.model_limits, MODEL);
         assert.equal(body.allow_ips, parent.allowedIp); assert.equal(body.cross_group_retry, false); assert.equal(body.remain_quota, 1);
         assert.equal(body.unlimited_quota || body.allow_user_quota_query, false);
@@ -111,6 +111,30 @@ test('two exact generations, fixed scoped bearer, actual retirement and secret-f
     const data = await readFile(join(f.dir, file), 'utf8');
     assert.ok(![pat, previousToken, result.token, next.token].some(raw => data.includes(raw)));
   }
+});
+
+test('credential-only empty bootstrap seeds once, rotates under short limits, and never journals either raw key', async t => {
+  const f = await fixture(t, { credentialOnly: true, empty: true });
+  const installer = await open(f.options);
+  assert.equal(typeof installer.seed, 'function');
+  const first = await installer.seed({ expiresAt: START + 420_000, signal: new AbortController().signal });
+  assert.equal(first.receipt.status, 'CORELY_DEV_GO_TOKEN_SEED_VERIFIED');
+  assert.equal(first.receipt.modelRequestsMade, 0);
+  const next = await installer.rotate({ generation: 1, previousTokenId: first.receipt.tokenId, previousToken: first.token,
+    previousExpiresAt: first.receipt.expiresAt, nextExpiresAt: START + 480_000, signal: new AbortController().signal });
+  assert.equal(next.receipt.predecessorRejected, true);
+  assert.equal(next.receipt.modelRequestsMade, 0);
+  assert.notEqual(next.token, first.token);
+  const files = await readdir(f.options.stateDir);
+  assert.deepEqual(files.sort().map(name => name.slice(label(1).length)), ['.intent.json','.seed.json','.commit.json','.intent.json']);
+  for (const name of files) {
+    const body = await readFile(join(f.options.stateDir, name), 'utf8');
+    assert.ok(!body.includes(pat) && !body.includes(first.token) && !body.includes(next.token));
+  }
+  installer.close();
+  const resumed = await open(f.options);
+  await assert.rejects(resumed.seed({ expiresAt: START + 420_000, signal: new AbortController().signal }), expectedHold);
+  assert.equal(f.calls.filter(([method, path]) => method === 'POST' && path === '/api/token/').length, 2);
 });
 
 test('lost mutation or stale-cache success never records a commit or repeats POST after restart', async t => {

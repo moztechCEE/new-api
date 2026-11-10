@@ -159,8 +159,54 @@ export async function openCorelyDevGoTokenInstaller(options = {}) {
     if (result.status !== 200 || !success(result.body) || !exact(result.body.data, ['key']) || !RELAY_TOKEN.test(token ?? '')) hold();
     return token;
   };
+  const stateBinding = { kind, authorityIdSha256: policy.authorityIdSha256, authorityExpiresAt: policy.expiresAt,
+    ownerId: policy.ownerId, group: policy.group, ...(credentialOnly ? { credentialOnly: true } : {}) };
+  const search = async (generation, permit, deadline) => {
+    const query = `/api/token/search?keyword=${label(generation)}&p=1&page_size=10`;
+    const response = await call(query, 'GET', permit, { deadline });
+    if (response.status !== 200 || !success(response.body) || !Array.isArray(response.body.data?.items) ||
+        response.body.data.total !== response.body.data.items.length) hold();
+    return response.body.data.items;
+  };
+  const create = async (generation, expiresAt, permit, deadline) => {
+    const result = await call('/api/token/', 'POST', permit, { deadline, body: {
+      name: label(generation), expired_time: expiresAt / 1000, group: policy.group, allow_ips: policy.allowedIp,
+      model_limits_enabled: true, model_limits: MODEL, cross_group_retry: false, allow_user_quota_query: false,
+      auto_groups: null, unlimited_quota: false, remain_quota: 1,
+    } });
+    if (result.status !== 200 || !success(result.body)) hold();
+    const rows = await search(generation, permit, deadline);
+    if (rows.length !== 1 || !scoped(rows[0], generation, expiresAt)) hold();
+    const tokenId = rows[0].id, token = await reveal(tokenId, permit, deadline);
+    if (rows[0].key !== `${token.slice(0, 4)}**********${token.slice(-4)}`) hold();
+    return { tokenId, token };
+  };
+  // A first relay credential is only bootstrapped by the isolated no-model
+  // path. Unknown writes cannot mint a second credential after a restart.
+  async function seed({ expiresAt, signal: permit } = {}) {
+    if (closed) hold();
+    if (busy) deny('GO_TOKEN_INSTALL_BUSY');
+    if (!positive(expiresAt) || expiresAt % 1000 || !(permit instanceof AbortSignal) || permit.aborted) deny('GO_TOKEN_INSTALL_INVALID');
+    busy = true;
+    try {
+      const start = clock();
+      if (expiresAt <= start + 60_000 || expiresAt > Math.min(start + 30 * 60_000, pat.expiresAt, policy.expiresAt)) hold();
+      const generation = 1, revision = await routed(permit, expiresAt);
+      await assertOrdinaryOwner(permit, expiresAt);
+      if ((await search(generation, permit, expiresAt)).length !== 0) hold();
+      await journal(generation, 'intent', { ...stateBinding, generation, nextExpiresAt: expiresAt, routeRevisionSha256: revision });
+      const { tokenId, token } = await create(generation, expiresAt, permit, expiresAt);
+      const positiveRequestIdSha256 = await probe(token, false, permit, expiresAt, new Set());
+      if (await routed(permit, expiresAt) !== revision) hold();
+      await journal(generation, 'seed', { ...stateBinding, generation, tokenId, tokenSha256: hash(token), expiresAt,
+        positiveRequestIdSha256, routeRevisionSha256: revision });
+      clock(expiresAt); permit.throwIfAborted();
+      return Object.freeze({ token, receipt: Object.freeze({ status: 'CORELY_DEV_GO_TOKEN_SEED_VERIFIED', generation, tokenId,
+        expiresAt, routeRevisionSha256: revision, credentialOnly: true, modelRequestsMade: 0 }) });
+    } catch { shutdown(); hold(); } finally { busy = false; }
+  }
   return Object.freeze({
-    close: shutdown,
+    close: shutdown, ...(credentialOnly ? { seed } : {}),
     async rotate({ generation, previousTokenId, previousToken, previousExpiresAt, nextExpiresAt, signal: permit } = {}) {
       if (closed) hold();
       if (busy) deny('GO_TOKEN_INSTALL_BUSY');
@@ -171,10 +217,9 @@ export async function openCorelyDevGoTokenInstaller(options = {}) {
       try {
         const start = clock(previousExpiresAt);
         if (previousExpiresAt > policy.expiresAt || nextExpiresAt <= start + 60_000 ||
-            nextExpiresAt > Math.min(start + 6 * 3_600_000, pat.expiresAt, policy.expiresAt)) hold();
+            nextExpiresAt > Math.min(start + (credentialOnly ? 30 * 60_000 : 6 * 3_600_000), pat.expiresAt, policy.expiresAt)) hold();
         const next = generation + 1, previousHash = hash(previousToken), probeIds = new Set();
-        const base = { kind, authorityIdSha256: policy.authorityIdSha256, authorityExpiresAt: policy.expiresAt, ownerId: policy.ownerId, group: policy.group,
-          ...(credentialOnly ? { credentialOnly: true } : {}) };
+        const base = stateBinding;
         if (generation > 1) {
           const previous = await journal(generation, 'commit');
           if (!exact(previous, [...Object.keys(base), 'generation', 'tokenId', 'tokenSha256', 'expiresAt', 'oldTokenRejected', 'denialRequestIdSha256', 'routeRevisionSha256']) ||
@@ -189,26 +234,10 @@ export async function openCorelyDevGoTokenInstaller(options = {}) {
             old.body.data.id !== previousTokenId || old.body.data.key !== `${previousToken.slice(0, 4)}**********${previousToken.slice(-4)}`) hold();
         if (await reveal(previousTokenId, permit, previousExpiresAt) !== previousToken) hold();
         await probe(previousToken, false, permit, previousExpiresAt, probeIds);
-        const query = `/api/token/search?keyword=${label(next)}&p=1&page_size=10`;
-        const search = async () => {
-          const response = await call(query, 'GET', permit, { deadline: previousExpiresAt });
-          if (response.status !== 200 || !success(response.body) || !Array.isArray(response.body.data?.items) ||
-              response.body.data.total !== response.body.data.items.length) hold();
-          return response.body.data.items;
-        };
-        if ((await search()).length !== 0) hold();
+        if ((await search(next, permit, previousExpiresAt)).length !== 0) hold();
         await journal(next, 'intent', { ...base, generation: next, previousTokenId, previousHash, previousExpiresAt, nextExpiresAt, routeRevisionSha256: revision });
-        const result = await call('/api/token/', 'POST', permit, { deadline: previousExpiresAt, body: {
-          name: label(next), expired_time: nextExpiresAt / 1000, group: policy.group, allow_ips: policy.allowedIp,
-          model_limits_enabled: true, model_limits: MODEL, cross_group_retry: false, allow_user_quota_query: false,
-          auto_groups: null, unlimited_quota: false, remain_quota: 1,
-        } });
-        if (result.status !== 200 || !success(result.body)) hold();
-        const rows = await search();
-        if (rows.length !== 1 || !scoped(rows[0], next, nextExpiresAt) || rows[0].id === previousTokenId) hold();
-        const tokenId = rows[0].id;
-        const token = await reveal(tokenId, permit, previousExpiresAt);
-        if (token === previousToken || rows[0].key !== `${token.slice(0, 4)}**********${token.slice(-4)}`) hold();
+        const { tokenId, token } = await create(next, nextExpiresAt, permit, previousExpiresAt);
+        if (tokenId === previousTokenId || token === previousToken) hold();
         await probe(token, false, permit, previousExpiresAt, probeIds);
         if (await routed(permit, previousExpiresAt) !== revision) hold();
         await assertOrdinaryOwner(permit, previousExpiresAt);
