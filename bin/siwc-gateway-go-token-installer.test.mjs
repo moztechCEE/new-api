@@ -7,7 +7,7 @@ import { openCorelyDevGoTokenInstaller as open } from './siwc-gateway-go-token-i
 
 const START = 1_800_000_000_000, MODEL = 'gpt-6.1-sol', GROUP = 'corely-siwc-fixture';
 const parent = { authorityIdSha256: 'a'.repeat(64), expiresAt: START + 2_000_000, ownerId: 9, channelId: 71, group: GROUP, allowedIp: '192.0.2.10' };
-const pat = 'nap_' + 'Z'.repeat(42) + 'A', previousToken = 'P'.repeat(48);
+const pat = 'nap_' + 'Z'.repeat(42) + 'z', previousToken = 'P'.repeat(48);
 const label = gen => `corely-siwc-${parent.authorityIdSha256.slice(0, 18)}-${gen}`;
 const good = (data) => ({ success: true, message: '', ...(data === undefined ? {} : { data }) });
 const expectedHold = error => error.code === 'GO_TOKEN_INSTALL_HELD' && error.message === error.code;

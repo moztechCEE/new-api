@@ -8,7 +8,8 @@ import { isAbsolute, join } from 'node:path';
 import { isIPv4 } from 'node:net';
 
 const BASE = 'https://newapi-dev.corely.cc', MODEL = 'gpt-6.1-sol', DAY = 86_400_000;
-const HASH = /^[a-f0-9]{64}$/u, RELAY_TOKEN = /^[A-Za-z0-9]{48}$/u, PAT = /^nap_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
+// Go issues a random alphanumeric string, not canonical base64url bytes.
+const HASH = /^[a-f0-9]{64}$/u, RELAY_TOKEN = /^[A-Za-z0-9]{48}$/u, PAT = /^nap_[A-Za-z0-9]{43}$/u;
 const REQUEST_ID = /^[a-zA-Z0-9._-]{1,128}$/u;
 const kind = 'CORELY_DEV_GO_TOKEN_JOURNAL_V1', MAX = 4096;
 const hash = input => createHash('sha256').update(input).digest('hex');

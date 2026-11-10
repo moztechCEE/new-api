@@ -9,19 +9,26 @@ import { bridgeLeafSpkiSha256, verifyCorelyDevBridgeCredentialRotation } from '.
 import { createSiwcGatewayModelTransports } from './siwc-gateway-model-port.mjs';
 
 test('bridge proof checks real pinned TLS and old-secret rejection before its original expiry, with no provider', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'bridge-credential-proof-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  // The sealed VM image does not include openssl. Its one-shot diagnostic
+  // generates this synthetic CA/keys on the host and mounts only that fixture.
+  const prebuilt = process.env.CORELY_SIWC_VM_ISOLATED_TLS_FIXTURE === '1';
+  const dir = prebuilt ? '/proof/tls' : await mkdtemp(join(tmpdir(), 'bridge-credential-proof-'));
+  if (!prebuilt) t.after(() => rm(dir, { recursive: true, force: true }));
   const openssl = (...args) => execFileSync('openssl', args, { cwd: dir, stdio: 'ignore' });
   const text = file => readFile(join(dir, file), 'utf8');
-  openssl('req', '-x509', '-newkey', 'ed25519', '-nodes', '-days', '1', '-keyout', 'ca.key', '-out', 'ca.pem',
-    '-subj', '/CN=Synthetic bridge probe CA', '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign');
-  await writeFile(join(dir, 'leaf.ext'), 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:corely-siwc-bridge\n');
+  if (!prebuilt) {
+    openssl('req', '-x509', '-newkey', 'ed25519', '-nodes', '-days', '1', '-keyout', 'ca.key', '-out', 'ca.pem',
+      '-subj', '/CN=Synthetic bridge probe CA', '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign');
+    await writeFile(join(dir, 'leaf.ext'), 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:corely-siwc-bridge\n');
+  }
   const generation = [];
   for (const i of [1, 2]) {
     const name = `leaf-${i}`;
-    openssl('req', '-new', '-newkey', 'ed25519', '-nodes', '-subj', '/CN=corely-siwc-bridge', '-keyout', `${name}.key`, '-out', `${name}.csr`);
-    openssl('x509', '-req', '-in', `${name}.csr`, '-CA', 'ca.pem', '-CAkey', 'ca.key', '-set_serial', String(i),
-      '-days', '1', '-extfile', 'leaf.ext', '-out', `${name}.pem`);
+    if (!prebuilt) {
+      openssl('req', '-new', '-newkey', 'ed25519', '-nodes', '-subj', '/CN=corely-siwc-bridge', '-keyout', `${name}.key`, '-out', `${name}.csr`);
+      openssl('x509', '-req', '-in', `${name}.csr`, '-CA', 'ca.pem', '-CAkey', 'ca.key', '-set_serial', String(i),
+        '-days', '1', '-extfile', 'leaf.ext', '-out', `${name}.pem`);
+    }
     generation.push({ cert: await text(`${name}.pem`), key: await text(`${name}.key`), secret: `SYNTHETIC_BRIDGE_KEY_${i}_`.repeat(3) });
   }
   const abort = new AbortController(), diagnostics = [];
