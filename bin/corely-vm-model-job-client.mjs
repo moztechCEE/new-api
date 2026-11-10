@@ -11,16 +11,20 @@ export const CORELY_VM_MODEL_JOB_CLIENT_ID = 'corely-vm-model-jobs-dev';
 export const CORELY_VM_HOST_ID_HASH = '89d0316d433fbf80da04c4b8ad5a2cc12daa28d8720886916ba2f6b9558519e0';
 export const CORELY_VM_VERIFICATION_URI = 'https://agent-dev.corely.cc/ops/work-candidates/vm-model-jobs/connect';
 const MAX_GRANT_MS = 86_400_000;
+const MAX_STANDING_MS = 30 * MAX_GRANT_MS;
 const MAX_POLL_WAKEUPS = 32;
 const CODES = new Set(['INVALID_OPTIONS', 'INVALID_KEY', 'ABORTED', 'AUTHORIZATION_FAILED', 'AUTHORIZATION_TIMEOUT',
   'AUTHORIZATION_DENIED', 'DEVICE_RESPONSE_INVALID', 'TOKEN_RESPONSE_INVALID', 'TOKEN_EXCHANGE_UNCERTAIN',
   'GRANT_EXPIRED', 'GRANT_CLOSED', 'RESOURCE_REQUEST_UNCERTAIN', 'RESOURCE_RESPONSE_INVALID', 'MODEL_JOB_NOT_CURRENT',
-  'ACCESS_ROTATION_BUSY', 'ACCESS_ROTATION_RECOVERY_REQUIRED']);
+  'ACCESS_ROTATION_BUSY', 'ACCESS_ROTATION_RECOVERY_REQUIRED', 'STANDING_AUTHORITY_HELD', 'STANDING_AUTHORITY_BUSY',
+  'STANDING_RENEWAL_RECOVERY_REQUIRED']);
 export class VmModelJobClientError extends Error {
   constructor(code) { super(CODES.has(code) ? code : 'INVALID_OPTIONS'); this.name = 'VmModelJobClientError'; this.code = this.message; }
 }
 const failure = code => new VmModelJobClientError(code);
 const sha256 = value => createHash('sha256').update(value).digest('base64url');
+const exact = (value, keys) => Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+const INVALID_STANDING_CHILD = Symbol('INVALID_STANDING_CHILD');
 
 function untilAborted(work, signal) {
   if (signal.aborted) {
@@ -49,7 +53,7 @@ function waitInterval(ms, signal) {
 /** Only called with this module's fixed TLS endpoints. No redirects, cookies,
  * retries, logging, unbounded bodies, or raw provider errors escape here. */
 async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, token, signal, requestTimeoutMs, limit = 16_384, kind,
-  flatResponse = false, emptyResponse = false }) {
+  flatResponse = false, emptyResponse = false, admitChildDenial = false }) {
   const controller = new AbortController(), abort = () => controller.abort(failure('ABORTED'));
   const uncertain = kind === 'token' ? 'TOKEN_EXCHANGE_UNCERTAIN' : kind === 'resource' ? 'RESOURCE_REQUEST_UNCERTAIN' : 'AUTHORIZATION_FAILED';
   const invalid = kind === 'token' ? 'TOKEN_RESPONSE_INVALID' : kind === 'resource' ? 'RESOURCE_RESPONSE_INVALID' : 'DEVICE_RESPONSE_INVALID';
@@ -83,8 +87,9 @@ async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, 
       throw failure(invalid);
     }
     if (!/^application\/json(?:\s*;|$)/i.test(response.headers?.get('content-type') ?? '') || !response.body?.getReader) throw failure(invalid);
-    reader = response.body.getReader(); const chunks = []; let size = 0;
+    reader = response.body.getReader(); const chunks = []; let size = 0, reads = 0;
     for (;;) {
+      if (admitChildDenial && ++reads > 32) throw failure(invalid);
       const part = await untilAborted(reader.read(), controller.signal); if (part.done) break;
       if (!(part.value instanceof Uint8Array) || (size += part.value.byteLength) > limit) throw failure(invalid);
       chunks.push(part.value);
@@ -92,6 +97,13 @@ async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, 
     let text, value;
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)); value = JSON.parse(text); }
     catch { throw failure(invalid); }
+    if (admitChildDenial && response.status === 401) {
+      const length = response.headers.get('content-length');
+      if (response.headers.get('cache-control') !== 'no-store' || response.headers.get('www-authenticate') !== 'DPoP error="invalid_token"' ||
+          response.headers.has('content-encoding') || (length !== null && (!/^(?:0|[1-9][0-9]*)$/.test(length) || Number(length) !== size)) ||
+          !/^\s*\{\s*"error"\s*:\s*"invalid_token"\s*\}\s*$/.test(text)) throw failure(invalid);
+      return INVALID_STANDING_CHILD;
+    }
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw failure(invalid);
     // Both OAuth responses are flat, fixed-field JSON. Reject escaped or
     // duplicate member names instead of accepting ambiguous credentials.
@@ -112,6 +124,153 @@ async function requestJson(endpoint, { fetchImpl, method = 'POST', body, proof, 
     if (reader) { try { Promise.resolve(reader.cancel()).catch(() => {}); reader.releaseLock(); } catch { /* No late result is accepted. */ } }
     else if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
   }
+}
+
+/** Separate no-model Corely DEV authority. The VM key proves possession of
+ * the key already pinned by an independently approved standing policy. It
+ * cannot approve that policy, mint a legacy grant, or access model routes. */
+export function openCorelyVmStandingAuthority(options = {}) {
+  if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(key =>
+    !['privateKey', 'expectedKeyThumbprint', 'fetchImpl', 'signal', 'now', 'monotonicNow', 'requestTimeoutMs'].includes(key))) throw failure('INVALID_OPTIONS');
+  const { privateKey, expectedKeyThumbprint, fetchImpl = globalThis.fetch, signal, now = Date.now,
+    monotonicNow = () => performance.now(), requestTimeoutMs = 15_000 } = options;
+  if (typeof fetchImpl !== 'function' || typeof now !== 'function' || typeof monotonicNow !== 'function' ||
+      (signal !== undefined && !(signal instanceof AbortSignal)) || !Number.isSafeInteger(requestTimeoutMs) ||
+      requestTimeoutMs < 10 || requestTimeoutMs > 30_000) throw failure('INVALID_OPTIONS');
+  if (signal?.aborted) throw failure('ABORTED');
+  let key = privateKey, jwk, thumbprint;
+  try {
+    if (!(key instanceof KeyObject) || key.type !== 'private' || key.asymmetricKeyType !== 'ed25519') throw failure('INVALID_KEY');
+    const value = createPublicKey(key).export({ format: 'jwk' });
+    if (value.kty !== 'OKP' || value.crv !== 'Ed25519' || !/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value.x ?? '')) throw failure('INVALID_KEY');
+    jwk = { kty: 'OKP', crv: 'Ed25519', x: value.x };
+    thumbprint = sha256(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x }));
+    if (thumbprint !== expectedKeyThumbprint) throw failure('INVALID_KEY');
+  } catch { throw failure('INVALID_KEY'); }
+
+  const controller = new AbortController();
+  let closed = false, busy = false, child = null, lastWall = -1, lastMono = -1;
+  const close = () => {
+    closed = true; child = null; key = undefined;
+    controller.abort(failure('GRANT_CLOSED')); signal?.removeEventListener('abort', close);
+  };
+  signal?.addEventListener('abort', close, { once: true });
+  const clock = () => {
+    const wall = now(), mono = monotonicNow();
+    if (!Number.isSafeInteger(wall) || wall < 0 || wall < lastWall || wall > Number.MAX_SAFE_INTEGER - MAX_STANDING_MS - requestTimeoutMs ||
+        !Number.isFinite(mono) || mono < 0 || mono < lastMono || mono > Number.MAX_SAFE_INTEGER - MAX_STANDING_MS) throw failure('STANDING_AUTHORITY_HELD');
+    lastWall = wall; lastMono = mono; return { wall, mono };
+  };
+  const request = (operation, { body, generation, token, kind = 'resource' } = {}) => {
+    if (closed || !key) throw failure('GRANT_CLOSED');
+    const endpoint = `${CORELY_VM_MODEL_JOB_ISSUER}/standing/${operation}`, method = body === undefined ? 'GET' : 'POST';
+    const header = Buffer.from(JSON.stringify({ typ: 'dpop+jwt', alg: 'EdDSA', jwk })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ htu: endpoint, htm: method, iat: Math.floor(clock().wall / 1000), jti: randomUUID(),
+      ...(generation !== undefined ? { generation } : {}), ...(token ? { ath: sha256(token) } : {}) })).toString('base64url');
+    const data = `${header}.${payload}`, proof = `${data}.${sign(null, Buffer.from(data), key).toString('base64url')}`;
+    return requestJson(endpoint, { fetchImpl, method, body, proof, token, signal: controller.signal, requestTimeoutMs, kind,
+      limit: 4096, flatResponse: true, admitChildDenial: operation === 'child-status' });
+  };
+  const within = (value, start, max) => Number.isSafeInteger(value) && value > start && value <= start + max + requestTimeoutMs;
+  const status = async () => {
+    const value = await request('status'), { wall } = clock();
+    if (closed || !exact(value, ['status', 'generation', 'standingExpiresAt', 'childExpiresAt', 'maxChildSeconds', 'keyThumbprint',
+      'vmHostIdHash', 'scope', 'syntheticOnly', 'apiFallbackEnabled', 'noPaidCredits']) || value.status !== 'CORELY_VM_STANDING_AUTHORITY_ACTIVE' ||
+        !Number.isSafeInteger(value.generation) || value.generation < 0 || value.generation >= Number.MAX_SAFE_INTEGER ||
+        !within(value.standingExpiresAt, wall, MAX_STANDING_MS) || !Number.isSafeInteger(value.maxChildSeconds) ||
+        value.maxChildSeconds < 1 || value.maxChildSeconds > MAX_GRANT_MS / 1000 ||
+        value.keyThumbprint !== thumbprint || value.vmHostIdHash !== CORELY_VM_HOST_ID_HASH || value.scope !== CORELY_VM_MODEL_JOB_SCOPE ||
+        value.syntheticOnly !== true || value.apiFallbackEnabled !== false || value.noPaidCredits !== true ||
+        (value.childExpiresAt !== null && (!within(value.childExpiresAt, wall, value.maxChildSeconds * 1000) ||
+          value.childExpiresAt > value.standingExpiresAt))) {
+      throw failure('STANDING_AUTHORITY_HELD');
+    }
+    return Object.freeze(value);
+  };
+  const verifyChild = async (token, expiresAt) => {
+    const value = await request('child-status', { token });
+    if (value === INVALID_STANDING_CHILD) return value;
+    if (closed || !exact(value, ['status', 'expiresAt', 'syntheticOnly', 'apiFallbackEnabled']) || value.status !== 'CORELY_VM_STANDING_CHILD_VALID' ||
+        value.expiresAt !== expiresAt || value.expiresAt <= clock().wall || value.syntheticOnly !== true || value.apiFallbackEnabled !== false) {
+      throw failure('STANDING_AUTHORITY_HELD');
+    }
+    return Object.freeze(value);
+  };
+  const exclusive = action => async () => {
+    if (closed) throw failure('GRANT_CLOSED');
+    if (busy) throw failure('STANDING_AUTHORITY_BUSY');
+    busy = true; let renewalDispatched = false;
+    try { return await action(() => { renewalDispatched = true; }); }
+    catch { close(); throw failure(renewalDispatched ? 'STANDING_RENEWAL_RECOVERY_REQUIRED' : 'STANDING_AUTHORITY_HELD'); }
+    finally { busy = false; }
+  };
+  return Object.freeze({
+    prepare: exclusive(async () => {
+      if (child) throw failure('STANDING_AUTHORITY_HELD');
+      const value = await request('prepare', { body: {} }), { wall } = clock();
+      if (closed || !exact(value, ['status', 'requestId', 'verification_uri_complete', 'requestExpiresAt', 'standingExpiresAt']) ||
+          value.status !== 'CORELY_VM_STANDING_CONSENT_REQUIRED' || typeof value.requestId !== 'string' ||
+          !/^vm_standing_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value.requestId) ||
+          value.verification_uri_complete !== `${CORELY_VM_VERIFICATION_URI}?requestId=${value.requestId}` ||
+          !within(value.requestExpiresAt, wall, 300_000) || !within(value.standingExpiresAt, wall, MAX_STANDING_MS) ||
+          value.requestExpiresAt >= value.standingExpiresAt) throw failure('STANDING_AUTHORITY_HELD');
+      return Object.freeze(value);
+    }),
+    status: exclusive(status),
+    renew: exclusive(async markDispatched => {
+      const before = await status();
+      // Another runner or a changed policy is not implicit consent to resume
+      // this process. A deliberate restart constructs a fresh capability.
+      if (child && (before.generation !== child.generation || before.standingExpiresAt !== child.standingExpiresAt ||
+          before.maxChildSeconds !== child.maxChildSeconds ||
+          before.childExpiresAt !== child.childExpiresAt)) throw failure('STANDING_AUTHORITY_HELD');
+      const started = clock();
+      if (child && (started.wall >= child.localExpiry || started.mono >= child.monotonicExpiry)) throw failure('STANDING_AUTHORITY_HELD');
+      markDispatched();
+      const value = await request('renew', { body: { generation: before.generation }, generation: before.generation, kind: 'token' });
+      if (!exact(value, ['access_token', 'token_type', 'expires_in', 'scope']) || typeof value.access_token !== 'string' ||
+          !/^vm_models_standing_access_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value.access_token) || value.access_token === child?.token ||
+          value.token_type !== 'DPoP' || value.scope !== CORELY_VM_MODEL_JOB_SCOPE || !Number.isSafeInteger(value.expires_in) ||
+          value.expires_in < 1 || value.expires_in > before.maxChildSeconds) throw failure('STANDING_AUTHORITY_HELD');
+      const after = await status();
+      if (after.generation !== before.generation + 1 || after.standingExpiresAt !== before.standingExpiresAt ||
+          after.maxChildSeconds !== before.maxChildSeconds ||
+          after.childExpiresAt === null) throw failure('STANDING_AUTHORITY_HELD');
+      if (await verifyChild(value.access_token, after.childExpiresAt) === INVALID_STANDING_CHILD) throw failure('STANDING_AUTHORITY_HELD');
+      let predecessorDenialVerified = false;
+      if (child) {
+        const previous = child, beforeDenial = clock();
+        if (beforeDenial.wall >= previous.localExpiry || beforeDenial.mono >= previous.monotonicExpiry ||
+            await verifyChild(previous.token, previous.childExpiresAt) !== INVALID_STANDING_CHILD) throw failure('STANDING_AUTHORITY_HELD');
+        const afterDenial = clock();
+        if (closed || afterDenial.wall >= previous.localExpiry || afterDenial.mono >= previous.monotonicExpiry) throw failure('STANDING_AUTHORITY_HELD');
+        predecessorDenialVerified = true;
+      }
+      const { wall, mono } = clock(), lifetime = value.expires_in * 1000;
+      const localExpiry = Math.min(after.childExpiresAt, started.wall + lifetime);
+      if (closed || wall >= localExpiry || mono - started.mono >= lifetime) throw failure('STANDING_AUTHORITY_HELD');
+      child = { token: value.access_token, generation: after.generation, standingExpiresAt: after.standingExpiresAt,
+        childExpiresAt: after.childExpiresAt, maxChildSeconds: after.maxChildSeconds, localExpiry, monotonicExpiry: started.mono + lifetime };
+      return Object.freeze({ status: 'CORELY_VM_STANDING_RENEWAL_VERIFIED', generation: after.generation,
+        standingExpiresAt: after.standingExpiresAt, childExpiresAt: after.childExpiresAt,
+        maxChildSeconds: after.maxChildSeconds, predecessorDenialVerified,
+        syntheticOnly: true, apiFallbackEnabled: false, noPaidCredits: true });
+    }),
+    childStatus: exclusive(async () => {
+      const { wall, mono } = clock();
+      if (!child || wall >= child.localExpiry || mono >= child.monotonicExpiry) throw failure('STANDING_AUTHORITY_HELD');
+      const value = await verifyChild(child.token, child.childExpiresAt);
+      const end = clock();
+      if (closed || end.wall >= child.localExpiry || end.mono >= child.monotonicExpiry) throw failure('STANDING_AUTHORITY_HELD');
+      if (value === INVALID_STANDING_CHILD) {
+        close();
+        return Object.freeze({ status: 'CORELY_VM_STANDING_CHILD_DENIED', errorClass: 'invalid_token',
+          freshProofUsed: true, originalChildUnexpired: true });
+      }
+      return value;
+    }),
+    close,
+  });
 }
 
 /** The caller supplies a pre-verified, protected-store Ed25519 KeyObject.

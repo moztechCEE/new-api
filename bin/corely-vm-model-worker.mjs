@@ -9,7 +9,7 @@ import { lstat, open, realpath, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { connectCorelyVmModelJobs, CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_SCOPE,
+import { connectCorelyVmModelJobs, openCorelyVmStandingAuthority, CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_SCOPE,
   CORELY_VM_MODEL_JOB_RESOURCE, CORELY_VM_VERIFICATION_URI } from './corely-vm-model-job-client.mjs';
 import { executeOneCorelyModelJob } from './siwc-local-corely-worker.mjs';
 import { createSiwcModelTransports } from './siwc-local-model-port.mjs';
@@ -148,9 +148,10 @@ async function protectedDirectory(stateDir) {
 
 /** Generation is reachable only through the explicit init-key command. A fixed
  * keyFactory seam lets offline fixtures avoid provisioning any usable VM key. */
-export async function openCorelyVmModelIdentity(stateDir, { initialize = false,
+export async function openCorelyVmModelIdentity(stateDir, { initialize = false, standingOnly = false,
   keyFactory = () => generateKeyPairSync('ed25519').privateKey } = {}) {
-  if (typeof initialize !== 'boolean' || typeof keyFactory !== 'function') fail('WORKER_OPTIONS_INVALID');
+  if (typeof initialize !== 'boolean' || typeof standingOnly !== 'boolean' || (standingOnly && initialize) ||
+      typeof keyFactory !== 'function') fail('WORKER_OPTIONS_INVALID');
   const directory = await protectedDirectory(stateDir);
   let key;
   try {
@@ -183,16 +184,17 @@ export async function openCorelyVmModelIdentity(stateDir, { initialize = false,
       keyThumbprint: record.keyThumbprint, syntheticOnly: true, apiFallbackEnabled: false });
     record = undefined;
     let closed = false;
+    const connect = async options => {
+      try {
+        if (!key || closed || hostIdHash !== CORELY_VM_HOST_ID_HASH) fail('WORKER_HOST_MISMATCH');
+        if (digest(JSON.stringify(await directory.read('host.json'))) !== hostHash ||
+            digest(JSON.stringify(await directory.read(KEY_FILE))) !== recordHash) fail('WORKER_IDENTITY_INVALID');
+        const open = standingOnly ? openCorelyVmStandingAuthority : connectCorelyVmModelJobs;
+        return await open({ ...options, privateKey: key, expectedKeyThumbprint: metadata.keyThumbprint });
+      } catch (error) { throw error instanceof VmModelWorkerError ? error : new VmModelWorkerError('WORKER_AUTHORITY_HELD'); }
+    };
     return Object.freeze({
-      receipt: () => metadata,
-      async connect(options) {
-        try {
-          if (!key || closed || hostIdHash !== CORELY_VM_HOST_ID_HASH) fail('WORKER_HOST_MISMATCH');
-          if (digest(JSON.stringify(await directory.read('host.json'))) !== hostHash ||
-              digest(JSON.stringify(await directory.read(KEY_FILE))) !== recordHash) fail('WORKER_IDENTITY_INVALID');
-          return await connectCorelyVmModelJobs({ ...options, privateKey: key, expectedKeyThumbprint: metadata.keyThumbprint });
-        } catch (error) { throw error instanceof VmModelWorkerError ? error : new VmModelWorkerError('WORKER_AUTHORITY_HELD'); }
-      },
+      receipt: () => metadata, ...(standingOnly ? { connectStanding: connect } : { connect }),
       async close() { key = undefined; if (!closed) { closed = true; await directory.close(); } },
     });
   } catch (error) {

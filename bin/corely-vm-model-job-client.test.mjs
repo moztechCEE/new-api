@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey, generateKeyPairSync, verify } from 'node:crypto';
 import { after, before, test } from 'node:test';
-import { connectCorelyVmModelJobs, VmModelJobClientError, CORELY_VM_MODEL_JOB_RESOURCE as RESOURCE,
+import { connectCorelyVmModelJobs, openCorelyVmStandingAuthority, VmModelJobClientError, CORELY_VM_MODEL_JOB_RESOURCE as RESOURCE,
   CORELY_VM_MODEL_JOB_ISSUER as ISSUER, CORELY_VM_MODEL_JOB_SCOPE as SCOPE,
   CORELY_VM_MODEL_JOB_CLIENT_ID as CLIENT, CORELY_VM_HOST_ID_HASH as HOST,
   CORELY_VM_VERIFICATION_URI as VERIFICATION } from './corely-vm-model-job-client.mjs';
+import { runCorelyVmStandingDiagnostic } from './corely-vm-standing-authority-runner.mjs';
 
 const TOKEN = `vm_models_access_${'t'.repeat(43)}`, SUCCESSOR = `vm_models_access_${'s'.repeat(43)}`, DEVICE = `vm_models_device_${'d'.repeat(43)}`;
 const REQUEST = `vm_models_${'r'.repeat(43)}`;
@@ -20,6 +21,138 @@ const deferred = () => {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 };
+
+function standingFixture({ standingMs = 7 * 86_400_000, maxChildSeconds = 86_400, loseRenewal = false, alterStatus = value => value,
+  alterChild = value => value, denialError = 'invalid_token' } = {}) {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519'), jwk = publicKey.export({ format: 'jwk' });
+  const keyThumbprint = hash(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x }));
+  const requestId = `vm_standing_${'a'.repeat(42)}A`, base = `${ISSUER}/standing/`;
+  let wall = 1_800_000_000_000, mono = 1000, active = false, generation = 0, child = null;
+  const standingExpiresAt = wall + standingMs, calls = [], jtis = new Set();
+  const clock = { now: () => wall, monotonicNow: () => mono };
+  const advance = ms => { wall += ms; mono += ms; };
+  const fetchImpl = async (endpoint, init) => {
+    const operation = endpoint.slice(base.length);
+    assert.ok(['prepare', 'status', 'renew', 'child-status'].includes(operation));
+    assert.equal(endpoint, base + operation);
+    assert.equal(init.redirect, 'error'); assert.equal(init.credentials, 'omit'); assert.equal(init.cache, 'no-store');
+    const [h, p, s] = init.headers.DPoP.split('.'), proof = JSON.parse(Buffer.from(p, 'base64url'));
+    assert.deepEqual(JSON.parse(Buffer.from(h, 'base64url')), { typ: 'dpop+jwt', alg: 'EdDSA', jwk });
+    assert.equal(verify(null, Buffer.from(`${h}.${p}`), publicKey, Buffer.from(s, 'base64url')), true);
+    assert.equal(proof.htu, endpoint); assert.equal(proof.htm, init.method); assert.equal(proof.iat, Math.floor(wall / 1000));
+    assert.equal(jtis.has(proof.jti), false); jtis.add(proof.jti); calls.push(operation);
+    assert.deepEqual(Object.keys(proof).sort(), ['htu', 'htm', 'iat', 'jti',
+      ...(operation === 'renew' ? ['generation'] : []), ...(operation === 'child-status' ? ['ath'] : [])].sort());
+    if (operation === 'child-status') {
+      assert.match(init.headers.Authorization, /^DPoP vm_models_standing_access_[A-Za-z0-9_-]{43}$/);
+      const presented = init.headers.Authorization.slice(5);
+      assert.equal(proof.ath, hash(presented)); assert.equal(init.method, 'GET'); assert.equal(init.body, undefined);
+      if (!active || presented !== child.token) return Response.json({ error: denialError }, { status: 401,
+        headers: { 'cache-control': 'no-store', 'www-authenticate': 'DPoP error="invalid_token"' } });
+      return Response.json(alterChild({ status: 'CORELY_VM_STANDING_CHILD_VALID', expiresAt: child.expiresAt, syntheticOnly: true, apiFallbackEnabled: false }));
+    }
+    assert.equal(init.headers.Authorization, undefined);
+    if (operation === 'prepare') {
+      assert.equal(init.method, 'POST'); assert.equal(init.body, '{}');
+      return Response.json({ status: 'CORELY_VM_STANDING_CONSENT_REQUIRED', requestId,
+        verification_uri_complete: `${VERIFICATION}?requestId=${requestId}`, requestExpiresAt: wall + 300_000, standingExpiresAt });
+    }
+    if (!active || wall >= standingExpiresAt) return Response.json({ error: 'invalid_token' }, { status: 401 });
+    if (operation === 'status') {
+      assert.equal(init.method, 'GET'); assert.equal(init.body, undefined);
+      return Response.json(alterStatus({ status: 'CORELY_VM_STANDING_AUTHORITY_ACTIVE', generation, standingExpiresAt,
+        childExpiresAt: child && wall < child.expiresAt ? child.expiresAt : null, maxChildSeconds, keyThumbprint,
+        vmHostIdHash: HOST, scope: SCOPE, syntheticOnly: true, apiFallbackEnabled: false, noPaidCredits: true }));
+    }
+    assert.equal(operation, 'renew'); assert.equal(init.method, 'POST');
+    assert.equal(proof.generation, generation); assert.equal(init.body, JSON.stringify({ generation }));
+    generation++;
+    child = { token: `vm_models_standing_access_${'a'.repeat(41)}${generation.toString(36)}A`,
+      expiresAt: Math.min(wall + maxChildSeconds * 1000, standingExpiresAt) };
+    if (loseRenewal) throw new Error('PRIVATE_SYNTHETIC_HTTP_FAILURE');
+    return Response.json({ access_token: child.token, token_type: 'DPoP', expires_in: Math.floor((child.expiresAt - wall) / 1000), scope: SCOPE });
+  };
+  return { ...clock, advance, calls, jtis, standingExpiresAt, approve() { active = true; }, revoke() { active = false; },
+    open: signal => openCorelyVmStandingAuthority({ privateKey, expectedKeyThumbprint: keyThumbprint, fetchImpl, signal, ...clock }) };
+}
+
+test('standing prepare is explicit; no active consent is a hard hold, not a new prompt or legacy/model fallback', async () => {
+  const f = standingFixture(), refused = f.open();
+  await assert.rejects(refused.renew(), isCode('STANDING_AUTHORITY_HELD'));
+  assert.deepEqual(f.calls, ['status']);
+  await assert.rejects(refused.prepare(), isCode('GRANT_CLOSED'));
+  const explicit = f.open(), prompt = await explicit.prepare();
+  assert.equal(prompt.status, 'CORELY_VM_STANDING_CONSENT_REQUIRED');
+  assert.equal(prompt.verification_uri_complete, `${VERIFICATION}?requestId=${prompt.requestId}`);
+  assert.equal(prompt.standingExpiresAt, f.standingExpiresAt); explicit.close();
+  assert.deepEqual(f.calls, ['status', 'prepare']);
+});
+
+test('standing runner renews in time and resumes after clean stop with only the pinned key, never a saved child or model call', async () => {
+  const f = standingFixture({ maxChildSeconds: 120 }), stop = new AbortController(), events = [], waits = [];
+  f.approve(); const client = f.open(stop.signal);
+  assert.deepEqual(Object.keys(client).sort(), ['prepare', 'status', 'renew', 'childStatus', 'close'].sort());
+  const result = await runCorelyVmStandingDiagnostic({ client, signal: stop.signal, now: f.now, monotonicNow: f.monotonicNow,
+    sleep: async ms => { waits.push(ms); f.advance(ms); },
+    onReceipt: value => { events.push(value); if (events.length === 2) stop.abort(); } });
+  assert.equal(result.reason, 'OPERATOR_STOPPED');
+  assert.deepEqual(waits, [60_000, 36_000]);
+  assert.deepEqual(events.map(value => value.generation), [1, 2]);
+  assert.deepEqual(events.map(value => value.predecessorDenialVerified), [false, true]);
+  assert.deepEqual(events.map(value => value.standingExpiresAt), [f.standingExpiresAt, f.standingExpiresAt]);
+  assert.ok(events.every(value => value.modelCalls === 0 && value.providerRequestsMade === 0 && !value.apiFallbackUsed && !value.paidCreditsUsed));
+  await assert.rejects(client.childStatus(), isCode('GRANT_CLOSED'));
+  const restarted = f.open(), recovered = await restarted.renew();
+  assert.equal(recovered.generation, 3); assert.equal(recovered.standingExpiresAt, f.standingExpiresAt);
+  assert.equal((await restarted.childStatus()).expiresAt, recovered.childExpiresAt); restarted.close();
+  assert.deepEqual(f.calls, ['status', 'renew', 'status', 'child-status', 'child-status',
+    'status', 'renew', 'status', 'child-status', 'child-status',
+    'status', 'renew', 'status', 'child-status', 'child-status']);
+  assert.equal(f.jtis.size, f.calls.length);
+  assert.doesNotMatch(JSON.stringify([events, result, recovered]), /vm_models_standing_access_|access_token|PRIVATE KEY|"jti"|"ath"/);
+});
+
+test('a fresh strict denial before the original child expiry proves only invalidation, then stops without renewing', async t => {
+  for (const valid of [true, false]) await t.test(valid ? 'invalid token' : 'wrong error class', async () => {
+    const f = standingFixture({ maxChildSeconds: 120, denialError: valid ? 'invalid_token' : 'invalid_dpop_proof' });
+    const signal = new AbortController().signal, events = [], client = f.open(signal);
+    f.approve();
+    const execution = runCorelyVmStandingDiagnostic({ client, signal, now: f.now, monotonicNow: f.monotonicNow,
+      sleep: async ms => { assert.equal(ms, 60_000); f.advance(ms); f.revoke(); }, onReceipt: value => events.push(value) });
+    if (valid) {
+      assert.equal((await execution).reason, 'CHILD_DENIED');
+      assert.equal(events.at(-1).httpStatus, 401); assert.equal(events.at(-1).errorClass, 'invalid_token');
+    } else {
+      await assert.rejects(execution, { message: 'CORELY_VM_STANDING_DIAGNOSTIC_HELD' });
+      assert.equal(events.length, 1);
+    }
+    assert.equal(f.calls.filter(value => value === 'renew').length, 1);
+    await assert.rejects(client.childStatus(), isCode('GRANT_CLOSED'));
+  });
+});
+
+test('standing parent deadline cannot be extended or renewed in a tight loop when the child already expires at that deadline', async () => {
+  const f = standingFixture({ standingMs: 600_000 }), signal = new AbortController().signal;
+  f.approve(); const events = [];
+  const result = await runCorelyVmStandingDiagnostic({ client: f.open(signal), signal, now: f.now, monotonicNow: f.monotonicNow,
+    sleep: async ms => { assert.equal(ms, 60_000); f.advance(600_000); }, onReceipt: value => events.push(value) });
+  assert.equal(result.reason, 'STANDING_EXPIRED'); assert.equal(events.length, 1);
+  assert.equal(events[0].childExpiresAt, f.standingExpiresAt); assert.equal(f.calls.filter(value => value === 'renew').length, 1);
+});
+
+test('standing renew ambiguity, successor deadline drift and child scope drift all close without retry or fallback', async t => {
+  for (const [name, change, expected] of [
+    ['lost committed result', { loseRenewal: true }, ['status', 'renew']],
+    ['standing deadline drift', { alterStatus: value => ({ ...value, standingExpiresAt: value.standingExpiresAt + value.generation }) }, ['status', 'renew', 'status']],
+    ['child paid capability drift', { alterChild: value => ({ ...value, apiFallbackEnabled: true }) }, ['status', 'renew', 'status', 'child-status']],
+  ]) await t.test(name, async () => {
+    const f = standingFixture(change), client = f.open(); f.approve();
+    await assert.rejects(client.renew(), isCode('STANDING_RENEWAL_RECOVERY_REQUIRED'));
+    await assert.rejects(client.renew(), isCode('GRANT_CLOSED'));
+    await assert.rejects(client.childStatus(), isCode('GRANT_CLOSED'));
+    assert.deepEqual(f.calls, expected);
+  });
+});
 
 function fixture(change = {}) {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
