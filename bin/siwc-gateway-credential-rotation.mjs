@@ -121,6 +121,7 @@ export function openCorelyDevGatewayCredentialRotation(options) {
     check();
     return Object.freeze({ status: draining ? 'GATEWAY_ROTATION_DRAINING' : 'GATEWAY_ROTATION_READY',
       generation: active.generation, expiresAt: active.expiresAt, parentExpiresAt: parent.expiresAt,
+      authorityIdSha256: parent.authorityIdSha256,
       syntheticOnly: true, apiFallbackEnabled: false, noPaidCredits: true });
   };
   return Object.freeze({

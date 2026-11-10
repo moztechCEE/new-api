@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { openCorelyVmStandingModelSession as open } from './corely-vm-standing-model-session.mjs';
 import { CORELY_VM_STANDING_MODEL_SCOPE } from './corely-vm-standing-model-client.mjs';
-import { CORELY_VM_MODEL_JOB_SCOPE } from './corely-vm-model-job-client.mjs';
+import { CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_SCOPE } from './corely-vm-model-job-client.mjs';
 
 const START = 1_800_000_000_000, GW = '58c3839d-11bd-4b6c-907a-c647fca28104', JOB = '22b698d7-f576-4d65-96a5-f3e1a4fc8727';
 const hash = v => createHash('sha256').update(v).digest('hex');
@@ -12,35 +12,47 @@ const held = code('STANDING_MODEL_SESSION_HELD'), closed = code('STANDING_MODEL_
 const canonical = v => typeof v === 'object' && v !== null ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canonical(v[k])])) : v;
 const flags = { syntheticOnly: true, apiFallbackEnabled: false, noPaidCredits: true };
 const parent = { parentId: `vm_models_standing_model_parent_${'a'.repeat(42)}A`, parentGeneration: 2, standingExpiresAt: START + 300_000 };
+const identity = { vmHostIdHash: CORELY_VM_HOST_ID_HASH, keyThumbprint: `${'a'.repeat(42)}A` };
 
 function fixture(options = {}) {
-  const calls = [], state = { time: START, generation: parent.parentGeneration, child: null, alias: 'info', leased: false, gateway: false };
+  const calls = [], state = { time: START, generation: parent.parentGeneration + (options.remoteExisting ? 1 : 0),
+    child: options.remoteExisting ? START + 110_000 : null, localChild: false, localEnrolled: false, remoteEnrolled: options.remoteExisting === true,
+    producerAvailable: options.producerAvailable !== false, alias: 'info', leased: false, gateway: false };
   const clock = () => state.time;
   const request = canonical({ version: 1, callId: 'synthetic-session-call', model: 'gpt-6.1-sol', workload: 'REPLY_LLM', purpose: 'semantic_reply_review',
     scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: 'synthetic-job' },
     system: 'Synthetic system', user: 'Synthetic prompt', schemaSha256: null });
   request.inputSha256 = hash(JSON.stringify(request));
   const controller = new AbortController(), credentials = Object.freeze({ placeholder: 'test-only' });
+  const modelBase = { ...identity, authMode: 'siwc_plan', syntheticOnly: true, apiFallbackEnabled: false, sendingCapability: false,
+    learningCapability: false, expiresAt: parent.standingExpiresAt };
   const authority = {
     async status() {
-      calls.push('status'); return { status: 'CORELY_VM_STANDING_MODEL_AUTHORITY_ACTIVE', scope: CORELY_VM_STANDING_MODEL_SCOPE, ...flags, ...parent,
+      calls.push('status'); return { status: 'CORELY_VM_STANDING_MODEL_AUTHORITY_ACTIVE', scope: CORELY_VM_STANDING_MODEL_SCOPE, ...flags, ...parent, ...identity,
         generation: state.generation, childExpiresAt: state.child, ...options.status };
     },
     async renew() {
       calls.push('renew'); assert.equal(state.gateway || state.leased, false);
       if (options.renewLost) throw Error('fixture');
-      const predecessorDenialVerified = state.child !== null; state.child = clock() + 120_000;
+      const predecessorDenialVerified = state.localChild; state.child = clock() + 120_000; state.localChild = true;
       return { status: 'CORELY_VM_STANDING_MODEL_RENEWAL_VERIFIED', ...flags, ...parent, generation: ++state.generation,
         childExpiresAt: state.child, predecessorDenialVerified };
     },
     async modelStatus() {
-      calls.push('modelStatus'); assert.equal(state.gateway, true);
+      calls.push('modelStatus'); assert.equal(state.gateway && state.localChild, true);
       return { status: 'SYNTHETIC_VM_MODEL_TRANSPORT_V2', contractVersion: 2, authorityProfile: 'standing-model', tenantId: 'moztech',
-        brandId: 'moztech-test', scope: CORELY_VM_MODEL_JOB_SCOPE, authMode: 'siwc_plan', enrolled: true, producerConnected: true,
-        ...flags, sendingCapability: false, learningCapability: false, expiresAt: parent.standingExpiresAt, ...options.modelStatus };
+        brandId: 'moztech-test', scope: CORELY_VM_MODEL_JOB_SCOPE, ...modelBase, enrolled: state.remoteEnrolled,
+        producerConnected: state.remoteEnrolled && state.producerAvailable, ...options.modelStatus };
+    },
+    async enrollModels() {
+      calls.push('enroll'); assert.equal(state.gateway && state.localChild && !state.localEnrolled, true);
+      if (options.enrollLost) throw Error('fixture');
+      state.localEnrolled = true; state.remoteEnrolled = true;
+      return { ...modelBase, enrolled: true, ...options.enrollment };
     },
     async claimModel(account) {
-      calls.push(`claim:${account}`); assert.equal(state.gateway, true); assert.equal(state.leased, false);
+      calls.push(`claim:${account}`); assert.equal(state.gateway && state.localChild && state.localEnrolled && state.remoteEnrolled, true);
+      assert.equal(state.leased, false);
       if (options.claimLost) throw Error('fixture');
       if (account !== state.alias) return null;
       state.leased = true;
@@ -61,7 +73,7 @@ function fixture(options = {}) {
   };
   const gateway = {
     receipt() { return { status: 'GATEWAY_ROTATION_READY', generation: 4, expiresAt: START + 290_000, parentExpiresAt: parent.standingExpiresAt,
-      ...flags, ...options.gateway }; },
+      authorityIdSha256: hash(parent.parentId), ...flags, ...options.gateway }; },
     async withLease(operation) {
       calls.push('gateway:acquire'); assert.equal(state.leased, false); state.gateway = true;
       try {
@@ -94,8 +106,11 @@ test('default off; foreign parent, paid/expired gateway and lost renewal never c
   for (const [options, expected] of [
     [{ status: { parentGeneration: parent.parentGeneration + 1 } }, ['status']],
     [{ gateway: { noPaidCredits: false } }, []], [{ gateway: { expiresAt: START + 1 } }, []],
+    [{ gateway: { authorityIdSha256: hash('unrelated-parent') } }, []],
     [{ renewLost: true }, ['status', 'renew']],
     [{ modelStatus: { apiFallbackEnabled: true } }, ['status', 'renew', 'gateway:acquire', 'modelStatus', 'gateway:exit']],
+    [{ enrollLost: true }, ['status', 'renew', 'gateway:acquire', 'modelStatus', 'enroll', 'gateway:exit']],
+    [{ enrollment: { keyThumbprint: 'not-bound' } }, ['status', 'renew', 'gateway:acquire', 'modelStatus', 'enroll', 'gateway:exit']],
   ]) {
     const f = fixture(options);
     await assert.rejects(f.session.runOnce(), held);
@@ -106,7 +121,7 @@ test('default off; foreign parent, paid/expired gateway and lost renewal never c
 
 test('gateway acquired before claims; exact Corely account; renewal only idle', async () => {
   const f = fixture(), info = await f.session.runOnce();
-  assert.deepEqual(f.calls.splice(0), ['status', 'renew', 'gateway:acquire', 'modelStatus', 'claim:info', 'generate:info', 'complete', 'gateway:exit']);
+  assert.deepEqual(f.calls.splice(0), ['status', 'renew', 'gateway:acquire', 'modelStatus', 'enroll', 'modelStatus', 'claim:info', 'generate:info', 'complete', 'gateway:exit']);
   assert.equal(info.status, 'STANDING_MODEL_LEASE_COMPLETED'); assert.equal(info.accountAlias, 'info');
   assert.equal(info.model, 'gpt-6.1-sol'); assert.equal(info.purpose, 'semantic_reply_review');
   assert.equal(info.apiFallbackEnabled || info.paidCreditsEnabled || info.sendingPerformed || info.learningPerformed, false);
@@ -130,7 +145,7 @@ test('unknown claim/generation/complete, mismatched account and cancellation can
     await assert.rejects(f.session.runOnce(), held);
     await assert.rejects(f.session.runOnce(), closed);
     assert.deepEqual(f.calls.filter(v => !v.endsWith('close') && v !== 'gateway:exit'),
-      ['status', 'renew', 'gateway:acquire', 'modelStatus', 'claim:info', ...suffix]);
+      ['status', 'renew', 'gateway:acquire', 'modelStatus', 'enroll', 'modelStatus', 'claim:info', ...suffix]);
     assert.equal(f.calls.filter(v => v === 'fail').length, 0);
   }
 });
@@ -143,6 +158,19 @@ test('concurrent work cannot renew or claim; settled stop causes only one exact 
   release();
   assert.equal((await pending).status, 'STANDING_MODEL_LEASE_TERMINAL_CONFIRMED');
   await assert.rejects(f.session.runOnce(), closed);
-  assert.deepEqual(f.calls, ['status', 'renew', 'gateway:acquire', 'modelStatus', 'claim:info', 'generate:info', 'fail',
+  assert.deepEqual(f.calls, ['status', 'renew', 'gateway:acquire', 'modelStatus', 'enroll', 'modelStatus', 'claim:info', 'generate:info', 'fail',
     'gateway:exit', 'authority:close', 'gateway:close']);
+});
+
+test('fresh client recovers an already-enrolled parent once; later lost registration never self-heals', async () => {
+  const f = fixture({ remoteExisting: true, producerAvailable: false });
+  assert.equal((await f.session.runOnce()).status, 'WAITING_FOR_CORELY_PRODUCER');
+  assert.deepEqual(f.calls.splice(0), ['status', 'renew', 'gateway:acquire', 'modelStatus', 'enroll', 'modelStatus', 'gateway:exit']);
+  f.state.producerAvailable = true;
+  assert.equal((await f.session.runOnce()).status, 'STANDING_MODEL_LEASE_COMPLETED');
+  assert.deepEqual(f.calls.splice(0), ['status', 'gateway:acquire', 'modelStatus', 'claim:info', 'generate:info', 'complete', 'gateway:exit']);
+  f.state.remoteEnrolled = false;
+  await assert.rejects(f.session.runOnce(), held);
+  await assert.rejects(f.session.runOnce(), closed);
+  assert.deepEqual(f.calls, ['status', 'gateway:acquire', 'modelStatus', 'gateway:exit', 'authority:close', 'gateway:close']);
 });

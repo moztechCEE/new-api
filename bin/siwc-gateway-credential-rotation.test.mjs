@@ -107,7 +107,8 @@ test('unwired DEV route generation enforces credential trust, a single owned lea
     assert.deepEqual(await first, { status: 'CORELY_DEV_GATEWAY_LEASE_SETTLED', generation: 1 });
     const rotated = await replacement;
     assert.equal(commits, 1); assert.equal(rotated.generation, 2); assert.equal(rotated.parentExpiresAt, f.options.authority.expiresAt);
-    assert.doesNotMatch(JSON.stringify(rotated), /SYNTHETIC_(?:GATEWAY|BRIDGE)|PRIVATE KEY|bundle|authorityId/);
+    assert.equal(rotated.authorityIdSha256, f.options.authority.authorityIdSha256);
+    assert.doesNotMatch(JSON.stringify(rotated), /SYNTHETIC_(?:GATEWAY|BRIDGE)|PRIVATE KEY|bundle|parentId/);
     await adapter.withLease(value => {
       assert.equal(value.credentials.gatewayToken, f.version(2).gatewayToken);
       return leaseAck(value);

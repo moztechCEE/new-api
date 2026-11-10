@@ -1,13 +1,15 @@
 // Unwired scheduler boundary. The operator must separately attest the model
 // standing parent and gateway installation, and give this session exclusive
-// ownership of both clients. No consent, enrollment, secret issue or I/O here.
+// ownership of both clients. The fresh authority client enrolls once on its
+// verified child; this module never opens consent or issues gateway secrets.
 import { createHash } from 'node:crypto';
 import { snapshotModelRequest, snapshotModelResult } from './corely-model-contract.mjs';
-import { CORELY_VM_MODEL_JOB_SCOPE } from './corely-vm-model-job-client.mjs';
+import { CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_SCOPE } from './corely-vm-model-job-client.mjs';
 import { CORELY_VM_STANDING_MODEL_SCOPE } from './corely-vm-standing-model-client.mjs';
 
 const LEASE_MS = 60_000, RENEW_HEADROOM_MS = 100_000, DAY_MS = 86_400_000;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+const THUMBPRINT = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 const digest = value => createHash('sha256').update(value).digest('hex');
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const held = () => fail('STANDING_MODEL_SESSION_HELD');
@@ -28,7 +30,7 @@ function bounded(signal, operation) {
 export function openCorelyVmStandingModelSession(options = {}) {
   if (options.enabled !== true) fail('STANDING_MODEL_SESSION_DISABLED');
   const { authority, gateway, generate, expectedParent, signal, now = Date.now } = options;
-  if (!['status', 'renew', 'modelStatus', 'claimModel', 'completeModel', 'failModel', 'close'].every(key => typeof authority?.[key] === 'function') ||
+  if (!['status', 'renew', 'modelStatus', 'enrollModels', 'claimModel', 'completeModel', 'failModel', 'close'].every(key => typeof authority?.[key] === 'function') ||
       !['receipt', 'withLease', 'close'].every(key => typeof gateway?.[key] === 'function') ||
       typeof generate !== 'function' || typeof now !== 'function' || !(signal instanceof AbortSignal) || signal.aborted ||
       !exact(expectedParent, ['parentId', 'parentGeneration', 'standingExpiresAt']) ||
@@ -36,7 +38,7 @@ export function openCorelyVmStandingModelSession(options = {}) {
       !Number.isSafeInteger(expectedParent.parentGeneration) || expectedParent.parentGeneration < 1 ||
       !Number.isSafeInteger(expectedParent.standingExpiresAt)) fail('STANDING_MODEL_SESSION_OPTIONS_INVALID');
   const parent = Object.freeze({ ...expectedParent }), controller = new AbortController();
-  let busy = false, closed = false, child, lastClock = -1;
+  let busy = false, closed = false, enrolled = false, child, lastClock = -1;
   const close = () => {
     if (closed) return;
     closed = true; child = undefined; controller.abort(); signal.removeEventListener('abort', close);
@@ -50,7 +52,11 @@ export function openCorelyVmStandingModelSession(options = {}) {
   };
   const sameParent = value => noPaid(value) && Object.keys(parent).every(key => value[key] === parent[key]) &&
     Number.isSafeInteger(value.generation) && value.generation >= parent.parentGeneration;
+  // Provision the gateway parent with the lowercase SHA-256 hex of the exact
+  // Corely standing parent ID, never the no-model parent or a time-only match.
+  const authorityIdSha256 = digest(parent.parentId);
   const readyGateway = value => noPaid(value) && value.status === 'GATEWAY_ROTATION_READY' &&
+    value.authorityIdSha256 === authorityIdSha256 &&
     Number.isSafeInteger(value.generation) && value.generation > 0 &&
     Number.isSafeInteger(value.expiresAt) && Number.isSafeInteger(value.parentExpiresAt) &&
     value.expiresAt > time() + LEASE_MS && value.expiresAt <= value.parentExpiresAt && value.parentExpiresAt <= parent.standingExpiresAt;
@@ -68,7 +74,8 @@ export function openCorelyVmStandingModelSession(options = {}) {
         if (!readyGateway(gateway.receipt())) held();
         const before = await step(35_000, () => authority.status());
         if (!sameParent(before) || before.status !== 'CORELY_VM_STANDING_MODEL_AUTHORITY_ACTIVE' ||
-            before.scope !== CORELY_VM_STANDING_MODEL_SCOPE ||
+            before.scope !== CORELY_VM_STANDING_MODEL_SCOPE || before.vmHostIdHash !== CORELY_VM_HOST_ID_HASH ||
+            typeof before.keyThumbprint !== 'string' || !THUMBPRINT.test(before.keyThumbprint) ||
             child && (before.generation !== child.generation || before.childExpiresAt !== child.childExpiresAt)) held();
         if (!child || child.childExpiresAt - time() <= RENEW_HEADROOM_MS) {
           const next = await step(70_000, () => authority.renew());
@@ -88,22 +95,43 @@ export function openCorelyVmStandingModelSession(options = {}) {
               !(permit.signal instanceof AbortSignal)) held();
           entered = true;
           const guard = AbortSignal.any([active, permit.signal]);
-          const status = await bounded(guard, () => authority.modelStatus(guard));
-          if (status?.status !== 'SYNTHETIC_VM_MODEL_TRANSPORT_V2' || status.contractVersion !== 2 || status.authorityProfile !== 'standing-model' ||
-              status.tenantId !== 'moztech' || status.brandId !== 'moztech-test' || status.scope !== CORELY_VM_MODEL_JOB_SCOPE ||
-              status.authMode !== 'siwc_plan' || status.enrolled !== true || status.producerConnected !== true || status.syntheticOnly !== true ||
-              status.apiFallbackEnabled !== false || status.sendingCapability !== false || status.learningCapability !== false ||
-              status.expiresAt !== parent.standingExpiresAt) held();
+          const baseKeys = ['authMode', 'syntheticOnly', 'apiFallbackEnabled', 'sendingCapability', 'learningCapability',
+            'vmHostIdHash', 'keyThumbprint', 'expiresAt'];
+          const base = value => value.authMode === 'siwc_plan' && value.syntheticOnly === true && value.apiFallbackEnabled === false &&
+            value.sendingCapability === false && value.learningCapability === false && value.expiresAt === parent.standingExpiresAt &&
+            value.vmHostIdHash === CORELY_VM_HOST_ID_HASH && value.keyThumbprint === before.keyThumbprint;
+          const readStatus = async () => {
+            const status = await bounded(guard, () => authority.modelStatus(guard));
+            if (!base(status ?? {}) || status.status !== 'SYNTHETIC_VM_MODEL_TRANSPORT_V2' || status.contractVersion !== 2 ||
+                status.authorityProfile !== 'standing-model' || status.tenantId !== 'moztech' || status.brandId !== 'moztech-test' ||
+                status.scope !== CORELY_VM_MODEL_JOB_SCOPE || typeof status.enrolled !== 'boolean' ||
+                typeof status.producerConnected !== 'boolean' || status.producerConnected && !status.enrolled) held();
+            return status;
+          };
+          let status = await readStatus();
+          if (!enrolled) {
+            const registration = await bounded(guard, () => authority.enrollModels(guard));
+            if (!exact(registration, [...baseKeys, 'enrolled']) || !base(registration) || registration.enrolled !== true) held();
+            status = await readStatus();
+            if (!status.enrolled) held();
+            enrolled = true;
+          }
+          // A disconnected producer can catch up without a new registration;
+          // loss of the registration after bootstrap must never repair itself.
+          if (!status.enrolled) held();
+          const settle = () => {
+            guard.throwIfAborted(); time();
+            return { status: 'CORELY_DEV_GATEWAY_LEASE_SETTLED', generation: permit.generation, leaseId: permit.leaseId };
+          };
+          if (!status.producerConnected) {
+            outcome = { status: 'WAITING_FOR_CORELY_PRODUCER', modelRequestsMade: 0 }; return settle();
+          }
           let lease, accountAlias;
           for (const account of ['info', 'eason']) {
             if (child.childExpiresAt - time() <= 92_000) held();
             lease = await bounded(guard, () => authority.claimModel(account, guard));
             if (lease !== null) { accountAlias = account; break; } // Polling is not an account-failure decision.
           }
-          const settle = () => {
-            guard.throwIfAborted(); time();
-            return { status: 'CORELY_DEV_GATEWAY_LEASE_SETTLED', generation: permit.generation, leaseId: permit.leaseId };
-          };
           if (lease === null) {
             outcome = { status: 'NO_SYNTHETIC_MODEL_JOB', modelRequestsMade: 0 }; return settle();
           }
