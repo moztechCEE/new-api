@@ -14,6 +14,7 @@ export const SESSION_ACCOUNTS = Object.freeze({ info: 'info@moztech.cc', eason: 
 const HOST_KIND = 'NEW_API_SIWC_DEV_HOST';
 const SESSION_KIND = 'NEW_API_SIWC_DEV_SESSION';
 const MAX_RECORD = 262144;
+const ACCESS_RENEWAL_WINDOW_MS = 60_000;
 const HOST_ID = /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CLIENT_ID = /^(?!dynamic_agent_client$)[A-Za-z0-9_-]{1,256}$/;
 const HASH = /^[0-9a-f]{64}$/;
@@ -604,7 +605,7 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       const start = clock(record);
       if (record?.state === 'reauth_required' && record.subjectHash && unavailable) return unavailable(record);
       if (!record || record.state !== 'active') fail(record?.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED');
-      if (record.expiresAt > start + 60000) return action(record);
+      if (record.expiresAt > start + ACCESS_RENEWAL_WINDOW_MS) return action(record);
       // A durable pending marker prevents rotating-token reuse after crash,
       // network ambiguity or an atomic replacement failure. Never auto-retry it.
       let refreshed;
@@ -661,7 +662,8 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       code: record.state === 'refresh_pending' ? 'REFRESH_OUTCOME_UNCERTAIN' : 'SESSION_REAUTH_REQUIRED' };
     if (!refresh) {
       const metadata = sessionMetadata(record);
-      return record.expiresAt <= time + 60000 || ownedPending ? Object.freeze({ ...metadata, state: 'renewal_due' }) : metadata;
+      return record.expiresAt <= time + ACCESS_RENEWAL_WINDOW_MS || ownedPending
+        ? Object.freeze({ ...metadata, state: 'renewal_due' }) : metadata;
     }
     try { return await withFreshRecord(alias, record => sessionMetadata(record), signal); }
     catch (error) {
@@ -702,13 +704,23 @@ export function createPersistentPlanSessions(store, { fetchImpl = globalThis.fet
       }, signal);
     },
     async status() {
+      // This is an inspection of persisted authorization, not a refresh,
+      // provider readiness check, plan-credit setting, or model receipt.
       const accounts = [];
       for (const alias of ['info', 'eason']) {
         const record = await store.read(alias);
-        accounts.push(record ? sessionMetadata(record) : { alias, expectedAccount: account(alias), state: 'not_connected' });
+        const observedAt = clock(record);
+        const accessExpiryState = !record || record.state === 'disconnected' ? 'not_connected'
+          : record.state !== 'active' ? 'held'
+          : record.expiresAt <= observedAt ? 'expired'
+          : record.expiresAt - observedAt <= ACCESS_RENEWAL_WINDOW_MS ? 'renewal_due' : 'fresh';
+        accounts.push(Object.freeze({ ...(record ? sessionMetadata(record)
+          : { alias, expectedAccount: account(alias), state: 'not_connected' }), accessExpiryState, observedAt }));
       }
       return Object.freeze({ vm: VM_NAME, runtime: 'DEV_SYNTHETIC_ONLY', hostIdHash: digest(store.host.hostId),
-        accounts, accountOrder: ['info', 'eason'], apiFallbackEnabled: false, corelyRelayConnected: false,
+        accounts: Object.freeze(accounts), accountOrder: ['info', 'eason'], apiFallbackEnabled: false, corelyRelayConnected: false,
+        inspectionKind: 'PERSISTED_SESSION_ONLY', modelRequestsMade: 0, inferenceVerified: false,
+        providerPlanControlsVerified: false, exactDebitAmountVerified: false,
         sendingCapability: false, learningCapability: false });
     },
     async maintain(signal, options) {

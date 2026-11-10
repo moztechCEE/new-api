@@ -64,6 +64,50 @@ const retainedWithoutTokens = (record, state) => Object.fromEntries(Object.entri
   .filter(([key]) => !['accessToken', 'refreshToken', 'idToken', 'nonce', 'expiresAt', 'scopes'].includes(key)));
 const catalog = () => Response.json({ models: [{ slug: MODEL, visibility: 'list' }] });
 
+test('VM status reports access expiry independently for both accounts without refreshing or proving use', async t => {
+  const { vm } = await transferred(t, ['info', 'eason']);
+  const info = await vm.read('info'), eason = await vm.read('eason');
+  await vm.write('eason', { ...eason, expiresAt: info.expiresAt + 120000 });
+  const before = await Promise.all(['info', 'eason'].map(alias => vm.read(alias)));
+  let checkedAt = info.expiresAt - 60001, providerRequests = 0;
+  const sessions = createPersistentPlanSessions(vm, { now: () => checkedAt, fetchImpl: async () => {
+    providerRequests++; throw new Error('NETWORK_DISABLED_IN_TEST');
+  } });
+  for (const [time, infoExpiryState] of [[info.expiresAt - 60001, 'fresh'], [info.expiresAt - 60000, 'renewal_due'],
+    [info.expiresAt - 1, 'renewal_due'], [info.expiresAt, 'expired']]) {
+    checkedAt = time;
+    const view = await sessions.status();
+    assert.deepEqual(view.accounts.map(account => [account.alias, account.state, account.accessExpiryState, account.observedAt]),
+      [['info', 'active', infoExpiryState, time], ['eason', 'active', 'fresh', time]]);
+    assert.equal(view.inspectionKind, 'PERSISTED_SESSION_ONLY');
+    assert.equal(view.corelyRelayConnected, false);
+    assert.equal(view.inferenceVerified, false);
+    assert.equal(view.providerPlanControlsVerified, false);
+    assert.equal(view.exactDebitAmountVerified, false);
+    assert.equal(view.apiFallbackEnabled, false);
+    assert.equal(view.modelRequestsMade, 0);
+    assert.doesNotMatch(JSON.stringify(view), /synthetic-.*-(?:access|refresh)|accessToken|refreshToken|clientId|subjectHash|idToken|nonce/);
+  }
+  assert.deepEqual(await Promise.all(['info', 'eason'].map(alias => vm.read(alias))), before);
+  assert.equal(providerRequests, 0);
+});
+
+test('VM status never labels a quarantined or missing account as ready', async t => {
+  const { vm } = await transferred(t);
+  const info = await vm.read('info');
+  const sessions = createPersistentPlanSessions(vm, { now: () => NOW + 2000, fetchImpl: async () => {
+    assert.fail('Status must not refresh or use a provider');
+  } });
+  await vm.write('info', { ...info, state: 'refresh_pending' });
+  assert.deepEqual((await sessions.status()).accounts.map(account => [account.state, account.accessExpiryState]),
+    [['refresh_pending', 'held'], ['not_connected', 'not_connected']]);
+  await vm.write('info', retainedWithoutTokens(info, 'reauth_required'));
+  assert.deepEqual((await sessions.status()).accounts.map(account => [account.state, account.accessExpiryState]),
+    [['reauth_required', 'held'], ['not_connected', 'not_connected']]);
+  const regressed = createPersistentPlanSessions(vm, { now: () => info.updatedAt - 1 });
+  await assert.rejects(regressed.status(), code('SESSION_CLOCK_INVALID'));
+});
+
 test('explicit per-account catalog uses only its app-owned session and never performs inference or fallback', async t => {
   const { vm } = await transferred(t, ['info', 'eason']);
   const calls = [];
