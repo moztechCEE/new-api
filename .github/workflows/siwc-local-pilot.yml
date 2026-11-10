@@ -107,6 +107,8 @@ jobs:
           node --check bin/siwc-gateway-bridge-credential-probe.test.mjs
           node --check bin/siwc-gateway-go-token-installer.mjs
           node --check bin/siwc-gateway-go-token-installer.test.mjs
+          node --check bin/siwc-gateway-go-loopback.mjs
+          node --check bin/siwc-gateway-go-loopback.test.mjs
           node --check bin/siwc-local-corely-worker.mjs
           node --check bin/corely-model-contract.mjs
           node --check bin/corely-model-contract-local-regression.test.mjs
@@ -135,7 +137,7 @@ jobs:
           node --check bin/codex-local-gateway-model-port.mjs
           node --check bin/codex-local-gateway-model-port.test.mjs
       - name: Run synthetic offline protocol regression
-        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs bin/siwc-gateway-model-port.test.mjs bin/siwc-gateway-credential-rotation.test.mjs bin/siwc-gateway-bridge-credential-probe.test.mjs bin/siwc-gateway-go-token-installer.test.mjs
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs bin/siwc-gateway-model-port.test.mjs bin/siwc-gateway-credential-rotation.test.mjs bin/siwc-gateway-bridge-credential-probe.test.mjs bin/siwc-gateway-go-token-installer.test.mjs bin/siwc-gateway-go-loopback.test.mjs
       - name: Run synthetic offline harness and standing-authority regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/codex-local-gateway-model-port.test.mjs bin/corely-model-contract-local-regression.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-standing-model-client.test.mjs bin/corely-vm-standing-model-session.test.mjs bin/corely-vm-model-worker.test.mjs bin/corely-vm-model-worker-authority-probe.test.mjs
       - name: Build and smoke-test the private VM runtime without network or credentials

@@ -6,6 +6,7 @@ import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { isIPv4 } from 'node:net';
+import { corelyDevGoTokenLoopbackBinding } from './siwc-gateway-go-loopback.mjs';
 
 const BASE = 'https://newapi-dev.corely.cc', MODEL = 'gpt-6.1-sol', DAY = 86_400_000;
 // Go issues a random alphanumeric string, not canonical base64url bytes.
@@ -25,16 +26,20 @@ const success = value => value?.success === true && value.message === '';
 
 export async function openCorelyDevGoTokenInstaller(options = {}) {
   if (options.enabled !== true) deny('GO_TOKEN_INSTALL_DISABLED');
-  const { stateDir, authority, management, fetchImpl, verifyRoute, signal, now = Date.now } = options;
+  const { stateDir, authority, management, fetchImpl, verifyRoute, signal, credentialOnly = false, now = Date.now } = options;
+  const loopback = corelyDevGoTokenLoopbackBinding(fetchImpl);
   if (!exact(authority, ['authorityIdSha256', 'expiresAt', 'ownerId', 'group', 'allowedIp', 'channelId']) ||
       !HASH.test(authority.authorityIdSha256) || !positive(authority.expiresAt) || !positive(authority.ownerId) || !positive(authority.channelId) ||
-      typeof authority.group !== 'string' || !/^corely-siwc-[a-z0-9-]{1,32}$/u.test(authority.group) || !isIPv4(authority.allowedIp) ||
+      typeof credentialOnly !== 'boolean' || (credentialOnly ?
+        authority.group !== 'corely-dev-siwc' || authority.channelId !== 10 || !loopback ||
+          loopback.authorityIdSha256 !== authority.authorityIdSha256 || loopback.ownerId !== authority.ownerId || loopback.allowedIp !== authority.allowedIp :
+        typeof authority.group !== 'string' || !/^corely-siwc-[a-z0-9-]{1,32}$/u.test(authority.group) || loopback) || !isIPv4(authority.allowedIp) ||
       !exact(management, ['token', 'expiresAt']) || !PAT.test(management.token) || !positive(management.expiresAt) ||
       management.expiresAt > authority.expiresAt || !isAbsolute(stateDir ?? '') || typeof fetchImpl !== 'function' ||
       typeof verifyRoute !== 'function' || typeof now !== 'function' || !(signal instanceof AbortSignal) || signal.aborted) hold();
   const policy = Object.freeze({ ...authority }), pat = Object.freeze({ ...management });
   const started = now();
-  if (!positive(started) || started >= pat.expiresAt || policy.expiresAt - started > 30 * DAY) hold();
+  if (!positive(started) || started >= pat.expiresAt || policy.expiresAt - started > (credentialOnly ? 2 * 3_600_000 : 30 * DAY)) hold();
   let wall = started, busy = false, closed = false;
   const active = new AbortController();
   const shutdown = () => { closed = true; active.abort(); signal.removeEventListener('abort', shutdown); };
@@ -116,12 +121,14 @@ export async function openCorelyDevGoTokenInstaller(options = {}) {
     bound.throwIfAborted();
     const at = clock(deadline);
     if (!exact(proof, ['authorityIdSha256', 'ownerId', 'group', 'channelId', 'allowedIp', 'model', 'revisionSha256', 'verifiedAt',
-      'ordinaryOwner', 'sameOwnerAcrossTokenIds', 'apiFallbackEnabled', 'paidCreditsEnabled', 'bodyPassthrough', 'headerPassthrough', 'retryCount', 'groupRatio']) ||
+      'ordinaryOwner', 'sameOwnerAcrossTokenIds', 'apiFallbackEnabled', 'paidCreditsEnabled', 'bodyPassthrough', 'headerPassthrough', 'retryCount', 'groupRatio',
+      ...(credentialOnly ? ['credentialOnly', 'inferenceDisabled'] : [])]) ||
         proof.authorityIdSha256 !== policy.authorityIdSha256 || proof.ownerId !== policy.ownerId || proof.group !== policy.group ||
         proof.channelId !== policy.channelId || proof.allowedIp !== policy.allowedIp || proof.model !== MODEL || !HASH.test(proof.revisionSha256) ||
         !positive(proof.verifiedAt) || proof.verifiedAt < checked - 5000 || proof.verifiedAt > at ||
         proof.ordinaryOwner !== true || proof.sameOwnerAcrossTokenIds !== true || proof.apiFallbackEnabled !== false || proof.paidCreditsEnabled !== false ||
-        proof.bodyPassthrough !== true || proof.headerPassthrough !== false || proof.retryCount !== 0 || proof.groupRatio !== 0) hold();
+        proof.bodyPassthrough !== !credentialOnly || proof.headerPassthrough !== false || proof.retryCount !== 0 || proof.groupRatio !== 0 ||
+        credentialOnly && (proof.credentialOnly !== true || proof.inferenceDisabled !== true)) hold();
     return proof.revisionSha256;
   }, permit);
   const probe = async (token, rejected, permit, deadline, probeIds) => {
@@ -166,7 +173,8 @@ export async function openCorelyDevGoTokenInstaller(options = {}) {
         if (previousExpiresAt > policy.expiresAt || nextExpiresAt <= start + 60_000 ||
             nextExpiresAt > Math.min(start + 6 * 3_600_000, pat.expiresAt, policy.expiresAt)) hold();
         const next = generation + 1, previousHash = hash(previousToken), probeIds = new Set();
-        const base = { kind, authorityIdSha256: policy.authorityIdSha256, authorityExpiresAt: policy.expiresAt, ownerId: policy.ownerId, group: policy.group };
+        const base = { kind, authorityIdSha256: policy.authorityIdSha256, authorityExpiresAt: policy.expiresAt, ownerId: policy.ownerId, group: policy.group,
+          ...(credentialOnly ? { credentialOnly: true } : {}) };
         if (generation > 1) {
           const previous = await journal(generation, 'commit');
           if (!exact(previous, [...Object.keys(base), 'generation', 'tokenId', 'tokenSha256', 'expiresAt', 'oldTokenRejected', 'denialRequestIdSha256', 'routeRevisionSha256']) ||
@@ -213,7 +221,8 @@ export async function openCorelyDevGoTokenInstaller(options = {}) {
           oldTokenRejected: true, denialRequestIdSha256, routeRevisionSha256: revision });
         clock(previousExpiresAt); permit.throwIfAborted();
         return Object.freeze({ token, receipt: Object.freeze({ status: 'CORELY_DEV_GO_TOKEN_REPLACEMENT_VERIFIED', generation: next, tokenId,
-          expiresAt: nextExpiresAt, predecessorRejected: true, routeRevisionSha256: revision, modelRequestsMade: 0 }) });
+          expiresAt: nextExpiresAt, predecessorRejected: true, routeRevisionSha256: revision, modelRequestsMade: 0,
+          ...(credentialOnly ? { credentialOnly: true } : {}) }) });
       } catch { shutdown(); hold(); } finally { busy = false; }
     },
   });

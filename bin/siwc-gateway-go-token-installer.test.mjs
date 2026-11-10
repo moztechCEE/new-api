@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { openCorelyDevGoTokenInstaller as open } from './siwc-gateway-go-token-installer.mjs';
+import { openCorelyDevGoTokenLoopback } from './siwc-gateway-go-loopback.mjs';
 
 const START = 1_800_000_000_000, MODEL = 'gpt-6.1-sol', GROUP = 'corely-siwc-fixture';
 const parent = { authorityIdSha256: 'a'.repeat(64), expiresAt: START + 2_000_000, ownerId: 9, channelId: 71, group: GROUP, allowedIp: '192.0.2.10' };
@@ -12,9 +13,9 @@ const label = gen => `corely-siwc-${parent.authorityIdSha256.slice(0, 18)}-${gen
 const good = (data) => ({ success: true, message: '', ...(data === undefined ? {} : { data }) });
 const expectedHold = error => error.code === 'GO_TOKEN_INSTALL_HELD' && error.message === error.code;
 const masked = key => `${key.slice(0, 4)}**********${key.slice(-4)}`;
-const wire = (id, name, expiry, key) => ({
+const wire = (id, name, expiry, key, group = GROUP) => ({
   id, name, key: masked(key), user_id: parent.ownerId, status: 1, expired_time: expiry / 1000, model_limits_enabled: true, model_limits: MODEL,
-  group: GROUP, allow_ips: parent.allowedIp, cross_group_retry: false, auto_groups: null, unlimited_quota: false, remain_quota: 1, allow_user_quota_query: false,
+  group, allow_ips: parent.allowedIp, cross_group_retry: false, auto_groups: null, unlimited_quota: false, remain_quota: 1, allow_user_quota_query: false,
 });
 
 async function fixture(t, overrides = {}) {
@@ -22,13 +23,16 @@ async function fixture(t, overrides = {}) {
   t.after(() => rm(dir, { force: true, recursive: true }));
   const controller = new AbortController(), calls = [], rows = new Map(), remote = { afterDelete: false, lost: false, time: START };
   const oldExpiry = START + 600_000;
-  rows.set(10, { row: wire(10, label(1), oldExpiry, previousToken), token: previousToken });
-  const options = { enabled: true, stateDir: dir, authority: parent, management: { token: pat, expiresAt: parent.expiresAt }, signal: controller.signal,
+  const authority = overrides.credentialOnly ? { ...parent, channelId: 10, group: 'corely-dev-siwc' } : parent;
+  rows.set(10, { row: wire(10, label(1), oldExpiry, previousToken, authority.group), token: previousToken });
+  const options = { enabled: true, stateDir: dir, authority, management: { token: pat, expiresAt: parent.expiresAt }, signal: controller.signal,
+    ...(overrides.credentialOnly ? { credentialOnly: true } : {}),
     now: () => remote.time,
-    verifyRoute: async () => ({ authorityIdSha256: parent.authorityIdSha256, ownerId: parent.ownerId, channelId: parent.channelId,
-      allowedIp: parent.allowedIp, group: GROUP, model: MODEL, revisionSha256: 'b'.repeat(64), verifiedAt: remote.time,
+    verifyRoute: async () => ({ authorityIdSha256: parent.authorityIdSha256, ownerId: parent.ownerId, channelId: authority.channelId,
+      allowedIp: parent.allowedIp, group: authority.group, model: MODEL, revisionSha256: 'b'.repeat(64), verifiedAt: remote.time,
       ordinaryOwner: true, sameOwnerAcrossTokenIds: true, apiFallbackEnabled: false, paidCreditsEnabled: false, groupRatio: 0,
-      bodyPassthrough: true, headerPassthrough: false, retryCount: 0, ...overrides.route }),
+      bodyPassthrough: !overrides.credentialOnly, headerPassthrough: false, retryCount: 0,
+      ...(overrides.credentialOnly ? { credentialOnly: true, inferenceDisabled: true } : {}), ...overrides.route }),
     async fetchImpl(url, init) {
       const target = new URL(url); assert.equal(target.origin, 'https://newapi-dev.corely.cc');
       assert.equal(init.redirect, 'error'); assert.equal(init.credentials, 'omit'); assert.equal(init.cache, 'no-store');
@@ -48,7 +52,7 @@ async function fixture(t, overrides = {}) {
       assert.equal(bearer, `Bearer ${pat}`); assert.equal(init.headers['New-Api-User'], String(parent.ownerId));
       if (path === '/api/user/self') {
         assert.equal(method, 'GET');
-        return json(good({ id: parent.ownerId, role: overrides.role ?? 1, status: 1, group: GROUP }));
+        return json(good({ id: parent.ownerId, role: overrides.role ?? 1, status: 1, group: authority.group }));
       }
       if (path === '/api/token/search') {
         assert.equal(method, 'GET'); assert.equal(target.searchParams.get('page_size'), '10');
@@ -57,10 +61,10 @@ async function fixture(t, overrides = {}) {
       }
       if (path === '/api/token/' && method === 'POST') {
         const body = JSON.parse(init.body), id = Math.max(...rows.keys()) + 1, key = String(id).repeat(24);
-        assert.equal(body.name, label(id - 9)); assert.equal(body.group, GROUP); assert.equal(body.model_limits, MODEL);
+        assert.equal(body.name, label(id - 9)); assert.equal(body.group, authority.group); assert.equal(body.model_limits, MODEL);
         assert.equal(body.allow_ips, parent.allowedIp); assert.equal(body.cross_group_retry, false); assert.equal(body.remain_quota, 1);
         assert.equal(body.unlimited_quota || body.allow_user_quota_query, false);
-        rows.set(id, { row: wire(id, body.name, body.expired_time * 1000, key), token: key });
+        rows.set(id, { row: wire(id, body.name, body.expired_time * 1000, key, authority.group), token: key });
         if (overrides.lostCreate) { remote.lost = true; throw new Error('synthetic lost response'); }
         return json(good());
       }
@@ -72,6 +76,17 @@ async function fixture(t, overrides = {}) {
       assert.equal(method, 'GET'); return json(good(row.row));
     },
   };
+  if (overrides.credentialOnly) {
+    const logical = options.fetchImpl;
+    options.fetchImpl = openCorelyDevGoTokenLoopback({ enabled: true, authorityIdSha256: authority.authorityIdSha256, ownerId: authority.ownerId,
+      allowedIp: authority.allowedIp, async requestImpl(url, init) {
+        assert.equal(new URL(url).origin, 'http://127.0.0.1:3000');
+        assert.equal(Object.keys(init.headers).some(key => key.toLowerCase() === 'host'), false);
+        const response = await logical(url.replace('http://127.0.0.1:3000', 'https://newapi-dev.corely.cc'),
+          { ...init, cache: 'no-store', credentials: 'omit', redirect: 'error' });
+        return { url, status: response.status, headers: response.headers, body: response.body };
+      } });
+  }
   const input = { generation: 1, previousTokenId: 10, previousToken, previousExpiresAt: oldExpiry,
     nextExpiresAt: START + 900_000, signal: controller.signal };
   return { dir, input, options, calls, remote, rows };
@@ -129,4 +144,21 @@ test('two simultaneous installer owners share one durable generation CAS', async
   assert.equal(replies.filter(reply => reply.status === 'rejected' && expectedHold(reply.reason)).length, 1);
   assert.equal(f.calls.filter(([method, path]) => method === 'POST' && path === '/api/token/').length, 1);
   a.close(); b.close();
+});
+
+test('the legacy inert lane requires a bound loopback-only installer and cannot relax standing route proof', async t => {
+  const f = await fixture(t, { credentialOnly: true });
+  for (const options of [
+    { ...f.options, credentialOnly: false },
+    { ...f.options, fetchImpl: async () => assert.fail('unbound transport called') },
+    { ...f.options, authority: { ...f.options.authority, channelId: 9 } },
+    { ...f.options, authority: { ...f.options.authority, expiresAt: START + 2 * 3_600_000 + 1 } },
+  ]) await assert.rejects(open(options), expectedHold);
+  const valid = await open(f.options);
+  assert.equal((await valid.rotate(f.input)).receipt.credentialOnly, true); valid.close();
+  for (const overrides of [{ credentialOnly: true, route: { bodyPassthrough: true } }, { route: { bodyPassthrough: false } },
+    { credentialOnly: true, route: { inferenceDisabled: false } }]) {
+    const bad = await fixture(t, overrides), installer = await open(bad.options);
+    await assert.rejects(installer.rotate(bad.input), expectedHold); assert.deepEqual(bad.calls, []);
+  }
 });
