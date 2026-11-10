@@ -25,6 +25,7 @@ on:
       - 'relay/channel/api_request.go'
       - 'relay/channel/api_request_test.go'
       - 'router/channel-router.go'
+      - 'router/corely_siwc_gateway_token_wire_test.go'
       - '.dockerignore'
   pull_request:
     paths:
@@ -49,6 +50,7 @@ on:
       - 'relay/channel/api_request.go'
       - 'relay/channel/api_request_test.go'
       - 'router/channel-router.go'
+      - 'router/corely_siwc_gateway_token_wire_test.go'
       - '.dockerignore'
   workflow_dispatch:
 
@@ -76,6 +78,8 @@ jobs:
         run: go test ./controller -run '^TestCodexLocalAttestation' -count=1
       - name: Forward caller cancellation to real upstream HTTP requests
         run: go test ./relay/channel -run '^Test(RelayRequestsInheritClientCancellation|NewTaskAPIRequestInheritsClientCancellation)$' -count=1
+      - name: Real Go isolated ordinary-owner gateway token wire and retirement
+        run: go test ./router -run '^TestCorelySIWCOrdinaryOwnerGatewayTokenInstallerWire$' -count=1 -v
   local-protocol:
     runs-on: ubuntu-latest
     timeout-minutes: 5
