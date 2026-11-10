@@ -23,11 +23,13 @@ const PROMPT_FILE = 'corely-vm-model-consent.json';
 const LOCK_FILE = 'corely-vm-model-worker.lock';
 const GATEWAY_FILE = 'corely-vm-model-gateway.json';
 const MAX_RECORD = 16_384;
+const ACCESS_ROTATION_INTERVAL_MS = 15 * 60_000;
+const ACCESS_ROTATION_TIMEOUT_MS = 30_000;
 const CODES = new Set(['WORKER_OPTIONS_INVALID', 'WORKER_STORAGE_INVALID', 'WORKER_STORAGE_NOT_PRIVATE',
   'WORKER_IDENTITY_NOT_INITIALIZED', 'WORKER_IDENTITY_INVALID', 'WORKER_HOST_MISMATCH', 'WORKER_ALREADY_RUNNING',
   'WORKER_CLEANUP_UNCONFIRMED', 'WORKER_AUTHORITY_HELD', 'WORKER_PRODUCER_NOT_READY', 'WORKER_EVENT_UNCONFIRMED',
   'WORKER_SESSION_HELD', 'WORKER_EXECUTION_HELD', 'WORKER_GATEWAY_INVALID', 'WORKER_GATEWAY_UNAVAILABLE',
-  'WORKER_OPERATION_TIMEOUT', 'WORKER_ABORTED', 'WORKER_FAILED']);
+  'WORKER_OPERATION_TIMEOUT', 'WORKER_ACCESS_ROTATION_HELD', 'WORKER_ABORTED', 'WORKER_FAILED']);
 export class VmModelWorkerError extends Error {
   constructor(code) { super(CODES.has(code) ? code : 'WORKER_FAILED'); this.name = 'VmModelWorkerError'; this.code = this.message; }
 }
@@ -380,18 +382,28 @@ export function assertCorelyVmModelSessionMaintenance(maintenance, now = Date.no
 /** Single-flight consumer. Corely owns producer admission and account fallback;
  * this loop cannot create work, approve a draft, send, learn, or retry ambiguity. */
 export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt = async () => {}, sleep = (ms, signal) => delay(ms, undefined, { signal }),
-  pollIntervalMs = 1000, maxJobs = 1000, maxIdlePolls = 86400, producerWaitMs = 60000, maintainSessions = async () => {} } = {}) {
+  pollIntervalMs = 1000, maxJobs = 1000, maxIdlePolls = 86400, producerWaitMs = 60000, maintainSessions = async () => {},
+  idleAccessRotation = false, monotonicNow = () => performance.now() } = {}) {
   if (!client || !['receipt', 'enrollModels', 'modelStatus', 'claimModel', 'completeModel', 'failModel', 'close'].every(key => typeof client[key] === 'function') ||
       !(signal instanceof AbortSignal) || typeof onReceipt !== 'function' || typeof sleep !== 'function' || typeof maintainSessions !== 'function' ||
+      typeof idleAccessRotation !== 'boolean' || typeof monotonicNow !== 'function' ||
+      (idleAccessRotation && typeof client.rotateAccess !== 'function') ||
       !Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1000 || pollIntervalMs > 30000 ||
       !Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 1000 || !Number.isSafeInteger(maxIdlePolls) || maxIdlePolls < 1 || maxIdlePolls > 86400 ||
       !Number.isSafeInteger(producerWaitMs) || producerWaitMs < 1000 || producerWaitMs > 60000) fail('WORKER_OPTIONS_INVALID');
-  let completed = 0, idle = 0, currentLease = null;
+  let completed = 0, idle = 0, currentLease = null, originalGrantExpiry, nextRotationAt, lastRotationClock = -1;
+  const readRotationClock = () => {
+    const clock = monotonicNow();
+    if (!Number.isFinite(clock) || clock < 0 || clock < lastRotationClock || clock > Number.MAX_SAFE_INTEGER - ACCESS_ROTATION_INTERVAL_MS) {
+      fail('WORKER_ACCESS_ROTATION_HELD');
+    }
+    lastRotationClock = clock; return clock;
+  };
   const emit = value => bounded(Promise.resolve().then(() => onReceipt(value)), signal, 5000, 'WORKER_EVENT_UNCONFIRMED');
   const guarded = Object.freeze({
     async modelStatus(active) {
       const status = await client.modelStatus(active);
-      if (!readyStatus(status)) fail('WORKER_AUTHORITY_HELD');
+      if (!readyStatus(status) || (idleAccessRotation && status.expiresAt !== originalGrantExpiry)) fail('WORKER_AUTHORITY_HELD');
       return status;
     },
     async claimModel(...args) {
@@ -409,7 +421,7 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
     },
   });
   try {
-    signal.throwIfAborted(); const receipt = client.receipt();
+    signal.throwIfAborted(); const receipt = client.receipt(), originalClientExpiry = receipt.expiresAt;
     if (receipt.scope !== CORELY_VM_MODEL_JOB_SCOPE || receipt.resource !== CORELY_VM_MODEL_JOB_RESOURCE ||
         receipt.syntheticOnly !== true || receipt.apiFallbackEnabled !== false || receipt.sendingCapability !== false || receipt.learningCapability !== false) fail('WORKER_AUTHORITY_HELD');
     await bounded(client.enrollModels(signal), signal, 30000);
@@ -418,7 +430,12 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
     try {
       for (;;) {
         const status = await bounded(client.modelStatus(readinessSignal), readinessSignal, 30000);
-        if (readyStatus(status)) break;
+        if (readyStatus(status)) {
+          if (idleAccessRotation && (!Number.isSafeInteger(originalClientExpiry) || originalClientExpiry <= Date.now() ||
+              !Number.isSafeInteger(status.expiresAt) || status.expiresAt <= Date.now())) fail('WORKER_AUTHORITY_HELD');
+          originalGrantExpiry = status.expiresAt;
+          break;
+        }
         if (status?.status !== 'SYNTHETIC_VM_MODEL_TRANSPORT_V2' || status.contractVersion !== 2 || status.producerConnected !== false) fail('WORKER_AUTHORITY_HELD');
         if (remaining <= 0) fail('WORKER_PRODUCER_NOT_READY');
         const wait = Math.min(remaining, pollIntervalMs); remaining -= wait;
@@ -428,7 +445,9 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
       if (readinessDeadline.aborted && !signal.aborted) fail('WORKER_PRODUCER_NOT_READY');
       throw error;
     }
+    if (idleAccessRotation) nextRotationAt = readRotationClock() + ACCESS_ROTATION_INTERVAL_MS;
     await emit(Object.freeze({ status: 'CORELY_VM_MODEL_WORKER_READY', contractVersion: 2, syntheticOnly: true,
+      ...(idleAccessRotation ? { idleAccessRotationEnabled: true } : {}),
       model: MODEL, apiFallbackUsed: false, sendingPerformed: false, learningPerformed: false }));
     for (;;) {
       signal.throwIfAborted();
@@ -437,6 +456,27 @@ export async function runCorelyVmModelWorker({ client, ports, signal, onReceipt 
       if (result.status === 'NO_SYNTHETIC_MODEL_JOB') {
         if (++idle >= maxIdlePolls) return Object.freeze({ status: 'CORELY_VM_MODEL_WORKER_STOPPED', reason: 'IDLE_LIMIT', completed,
           apiFallbackUsed: false, sendingPerformed: false, learningPerformed: false });
+        // Wait for both fixed-account claims and all local bookkeeping to
+        // settle. No timer runs in parallel with work or can open consent.
+        if (idleAccessRotation && readRotationClock() >= nextRotationAt) {
+          try {
+            if (currentLease !== null || Date.now() >= originalGrantExpiry || client.receipt().expiresAt !== originalClientExpiry) {
+              fail('WORKER_ACCESS_ROTATION_HELD');
+            }
+            const active = AbortSignal.any([signal, AbortSignal.timeout(ACCESS_ROTATION_TIMEOUT_MS)]);
+            const rotated = await bounded(Promise.resolve().then(() => {
+              active.throwIfAborted();
+              return client.rotateAccess(active);
+            }), signal, ACCESS_ROTATION_TIMEOUT_MS, 'WORKER_ACCESS_ROTATION_HELD');
+            if (active.aborted || !exact(rotated, ['status', 'expiresAt']) || rotated.status !== 'CORELY_VM_MODEL_JOB_ACCESS_ROTATED' ||
+                rotated.expiresAt !== originalGrantExpiry || client.receipt().expiresAt !== originalClientExpiry || Date.now() >= originalGrantExpiry) {
+              fail('WORKER_ACCESS_ROTATION_HELD');
+            }
+            nextRotationAt = readRotationClock() + ACCESS_ROTATION_INTERVAL_MS;
+          } catch { fail('WORKER_ACCESS_ROTATION_HELD'); }
+          await emit(Object.freeze({ status: 'CORELY_VM_MODEL_WORKER_ACCESS_ROTATED', originalGrantExpiresAt: originalGrantExpiry,
+            apiFallbackUsed: false, sendingPerformed: false, learningPerformed: false }));
+        }
         await bounded(sleep(pollIntervalMs, signal), signal, pollIntervalMs + 5000);
         continue;
       }
@@ -506,14 +546,16 @@ export async function runCorelyVmModelWorkerWithSessions({ sessions, client, con
   finally { owner.abort(); await maintenance; }
 }
 
-export function parseVmModelWorkerCommand(argv) {
+export function parseVmModelWorkerCommand(argv, env = process.env) {
   if (!Array.isArray(argv) || argv.length !== 3 || !['init-key', 'status', 'run', 'run-gateway'].includes(argv[0]) || argv[1] !== '--state-dir' ||
       typeof argv[2] !== 'string' || !isAbsolute(argv[2]) || resolve(argv[2]) !== argv[2]) fail('WORKER_OPTIONS_INVALID');
-  return Object.freeze({ command: argv[0], stateDir: argv[2] });
+  const rotation = env.CORELY_DEV_VM_IDLE_ACCESS_ROTATION;
+  if (rotation !== undefined && (rotation !== '1' || argv[0] !== 'run-gateway')) fail('WORKER_OPTIONS_INVALID');
+  return Object.freeze({ command: argv[0], stateDir: argv[2], ...(rotation === '1' ? { idleAccessRotation: true } : {}) });
 }
 
 export async function runVmModelWorkerCommand(argv) {
-  const { command, stateDir } = parseVmModelWorkerCommand(argv);
+  const { command, stateDir, idleAccessRotation } = parseVmModelWorkerCommand(argv);
   assertIsolatedSessionEnvironment();
   const safe = value => process.stdout.write(`${JSON.stringify(value)}\n`);
   const identity = await openCorelyVmModelIdentity(stateDir, { initialize: command === 'init-key' });
@@ -534,7 +576,7 @@ export async function runVmModelWorkerCommand(argv) {
     // Gateway failure stops inference, but leaves at most one bounded terminal
     // notification possible. SIGINT/SIGTERM still closes authority immediately.
     safe(await runCorelyVmModelWorkerWithSessions({ sessions, ports: gateway?.ports ?? createSiwcModelTransports(sessions),
-      signal: active, authoritySignal: controller.signal, connect: async authority => {
+      signal: active, authoritySignal: controller.signal, idleAccessRotation, connect: async authority => {
         const client = await identity.connect({ signal: authority, onAuthorize: async value => {
           safe(await lifecycle.presentConsent(value));
         } });

@@ -415,6 +415,106 @@ function workerFixture({ purposes = ['support_decision', 'reply_generation', 'se
   return { options, controller, events, claims, generated, completions, failures, sleeps, closed: () => closed };
 }
 
+function enableIdleRotation(f) {
+  const expiresAt = Date.now() + 3_600_000, { client } = f.options, { receipt, modelStatus } = client;
+  let elapsed = 0, clockReads = 0;
+  const attempts = [];
+  f.options.idleAccessRotation = true;
+  f.options.monotonicNow = () => { clockReads++; return elapsed; };
+  client.receipt = () => ({ ...receipt(), expiresAt });
+  client.modelStatus = async (...args) => ({ ...await modelStatus(...args), expiresAt });
+  client.rotateAccess = async signal => {
+    assert.ok(signal instanceof AbortSignal); assert.equal(signal.aborted, false);
+    attempts.push({ claims: f.claims.length, elapsed });
+    return { status: 'CORELY_VM_MODEL_JOB_ACCESS_ROTATED', expiresAt };
+  };
+  return { expiresAt, attempts, clockReads: () => clockReads, advance: ms => { elapsed += ms; } };
+}
+
+test('opt-in rotation waits for the fixed interval and both empty claims; default-off never calls it', async t => {
+  for (const enabled of [false, true]) await t.test(enabled ? 'enabled' : 'default off', async () => {
+    const f = workerFixture({ purposes: [] }), rotation = enableIdleRotation(f);
+    if (!enabled) delete f.options.idleAccessRotation;
+    const increments = [899_999, 1, 899_999, 1, 0];
+    f.options.maxIdlePolls = 6;
+    f.options.sleep = async () => rotation.advance(increments.shift());
+    assert.equal((await runCorelyVmModelWorker(f.options)).reason, 'IDLE_LIMIT');
+    assert.deepEqual(f.claims, Array.from({ length: 6 }, () => ['info', 'eason']).flat());
+    assert.deepEqual(rotation.attempts, enabled ? [{ claims: 6, elapsed: 900_000 }, { claims: 10, elapsed: 1_800_000 }] : []);
+    assert.equal(f.events[0].idleAccessRotationEnabled, enabled ? true : undefined);
+    assert.deepEqual(f.events.slice(1), enabled ? Array.from({ length: 2 }, () => ({
+      status: 'CORELY_VM_MODEL_WORKER_ACCESS_ROTATED', originalGrantExpiresAt: rotation.expiresAt,
+      apiFallbackUsed: false, sendingPerformed: false, learningPerformed: false,
+    })) : []);
+    assert.equal(f.generated.length, 0); assert.equal(f.closed(), 1);
+  });
+});
+
+test('a due rotation waits for claim, generation and completion; unresolved completion never reaches rotation', async t => {
+  for (const unresolved of [false, true]) await t.test(unresolved ? 'unresolved' : 'settled', async () => {
+    const f = workerFixture({ purposes: ['reply_generation'] }), rotation = enableIdleRotation(f);
+    f.options.maxJobs = 2;
+    let enterClaim, releaseClaim, enterGenerate, releaseGenerate, enterComplete, releaseComplete;
+    const enteredClaim = new Promise(resolve => { enterClaim = resolve; }), claiming = new Promise(resolve => { releaseClaim = resolve; });
+    const enteredGenerate = new Promise(resolve => { enterGenerate = resolve; }), generating = new Promise(resolve => { releaseGenerate = resolve; });
+    const enteredComplete = new Promise(resolve => { enterComplete = resolve; }), completing = new Promise(resolve => { releaseComplete = resolve; });
+    const info = f.options.ports.info, { claimModel, completeModel } = f.options.client;
+    f.options.client.claimModel = async (...args) => {
+      const lease = await claimModel(...args);
+      if (lease) { enterClaim(); await claiming; }
+      return lease;
+    };
+    f.options.ports = { ...f.options.ports, info: { ...info, async generate(...args) {
+      enterGenerate(); await generating; return info.generate(...args);
+    } } };
+    f.options.client.completeModel = async (...args) => {
+      enterComplete(); await completing;
+      if (unresolved) throw new Error('PRIVATE_UNRESOLVED_COMPLETION');
+      return completeModel(...args);
+    };
+    const running = runCorelyVmModelWorker(f.options);
+    await enteredClaim; rotation.advance(900_000);
+    assert.deepEqual(f.claims, ['info']); assert.equal(rotation.attempts.length, 0);
+    releaseClaim(); await enteredGenerate; assert.equal(rotation.attempts.length, 0);
+    releaseGenerate(); await enteredComplete; assert.equal(rotation.attempts.length, 0);
+    releaseComplete();
+    if (unresolved) {
+      await assert.rejects(running, code('WORKER_EXECUTION_HELD'));
+      assert.deepEqual(f.claims, ['info']); assert.equal(rotation.attempts.length, 0);
+    } else {
+      assert.equal((await running).reason, 'IDLE_LIMIT');
+      assert.deepEqual(rotation.attempts, [{ claims: 3, elapsed: 900_000 }]);
+      assert.equal(f.completions.length, 1);
+      assert.deepEqual(f.events.map(event => event.status), ['CORELY_VM_MODEL_WORKER_READY', 'CORELY_SYNTHETIC_MODEL_JOB_COMPLETED',
+        'CORELY_VM_MODEL_WORKER_ACCESS_ROTATED']);
+    }
+    assert.equal(f.closed(), 1);
+  });
+});
+
+test('rotation uncertainty, deadline drift and abort close the worker with no retry or new claim', async t => {
+  for (const kind of ['uncertain', 'issuer deadline changed', 'client deadline changed', 'abort']) await t.test(kind, async () => {
+    const f = workerFixture({ purposes: [] }), rotation = enableIdleRotation(f), rotate = f.options.client.rotateAccess;
+    f.options.maxIdlePolls = 5;
+    f.options.sleep = async () => rotation.advance(900_000);
+    f.options.client.rotateAccess = async signal => {
+      const value = await rotate(signal);
+      if (kind === 'issuer deadline changed') return { ...value, expiresAt: value.expiresAt + 1 };
+      if (kind === 'client deadline changed') {
+        const receipt = f.options.client.receipt();
+        f.options.client.receipt = () => ({ ...receipt, expiresAt: receipt.expiresAt + 1 });
+        return value;
+      }
+      if (kind === 'abort') { f.controller.abort(); return value; }
+      throw new Error('PRIVATE_ROTATION_RESPONSE');
+    };
+    await assert.rejects(runCorelyVmModelWorker(f.options), code(kind === 'abort' ? 'WORKER_ABORTED' : 'WORKER_ACCESS_ROTATION_HELD'));
+    assert.equal(rotation.attempts.length, 1); assert.deepEqual(f.claims, ['info', 'eason', 'info', 'eason']);
+    assert.equal(f.events.length, 1); assert.equal(f.closed(), 1); assert.equal(f.generated.length, 0);
+    assert.doesNotMatch(JSON.stringify(f.events), /PRIVATE_ROTATION_RESPONSE/);
+  });
+});
+
 test('resident loop serially completes evidence selection, decision, generation and independent review through real bound model helpers', async () => {
   const purposes = ['semantic_evidence_selection', 'support_decision', 'reply_generation', 'semantic_reply_review'];
   const f = workerFixture({ purposes }), result = await runCorelyVmModelWorker(f.options);
@@ -596,7 +696,7 @@ test('resident wiring maintains safe per-account health while fresh Corely conse
       usage: { input_tokens: 21, output_tokens: 8, total_tokens: 29 },
     } })}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
   } });
-  const f = workerFixture({ purposes: ['reply_generation'] }), health = [];
+  const f = workerFixture({ purposes: ['reply_generation'] }), health = [], rotation = enableIdleRotation(f);
   const result = await runCorelyVmModelWorkerWithSessions({ ...f.options, client: undefined, sessions,
     ports: createSiwcModelTransports(sessions), connect: async authority => {
       connectStarted = true; assert.equal(authority.aborted, false); await waiting; return f.options.client;
@@ -604,6 +704,8 @@ test('resident wiring maintains safe per-account health while fresh Corely conse
       f.events.push(event);
       if (event.status === 'SESSION_ACCOUNT_MAINTENANCE') {
         assert.equal(connectStarted, true); assert.equal(modelRoutes, 0); assert.equal(f.claims.length, 0);
+        rotation.advance(900_000);
+        assert.equal(rotation.clockReads(), 0); assert.equal(rotation.attempts.length, 0);
         health.push(event); if (health.length === 2) releaseConsent();
       }
     } });
@@ -771,4 +873,17 @@ test('idle bounds stop without spending model allowance, and CLI accepts no cred
     { cwd: process.cwd(), env: { PATH: '/usr/bin:/bin', HOME: tmpdir() }, encoding: 'utf8', timeout: 5000 });
   assert.equal(child.status, 1); assert.doesNotMatch(child.stdout + child.stderr, /PRIVATE_ARG|PRIVATE KEY|access_token|refresh_token|Error:/);
   assert.equal(JSON.parse(child.stdout).code, 'WORKER_OPTIONS_INVALID');
+});
+
+test('only exact run-gateway opt-in enables idle rotation, with no configurable cadence or new CLI flags', () => {
+  const argv = ['run-gateway', '--state-dir', '/state'], optIn = { CORELY_DEV_VM_IDLE_ACCESS_ROTATION: '1' };
+  assert.deepEqual(parseVmModelWorkerCommand(argv, {}), { command: 'run-gateway', stateDir: '/state' });
+  assert.deepEqual(parseVmModelWorkerCommand(argv, optIn), { command: 'run-gateway', stateDir: '/state', idleAccessRotation: true });
+  for (const command of ['run', 'status', 'init-key']) {
+    assert.throws(() => parseVmModelWorkerCommand([command, ...argv.slice(1)], optIn), code('WORKER_OPTIONS_INVALID'));
+  }
+  for (const value of ['0', '', 'true', '900000']) {
+    assert.throws(() => parseVmModelWorkerCommand(argv, { CORELY_DEV_VM_IDLE_ACCESS_ROTATION: value }), code('WORKER_OPTIONS_INVALID'));
+  }
+  assert.throws(() => parseVmModelWorkerCommand([...argv, '--rotation-ms', '1'], optIn), code('WORKER_OPTIONS_INVALID'));
 });
