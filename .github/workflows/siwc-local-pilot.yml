@@ -10,6 +10,7 @@ on:
       - 'bin/corely-model-contract-local-regression.test.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-standing-model-client*.mjs'
+      - 'bin/corely-vm-standing-model-session*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/corely-vm-standing-authority-runner.mjs'
       - 'bin/codex-harness-*.mjs'
@@ -33,6 +34,7 @@ on:
       - 'bin/corely-model-contract-local-regression.test.mjs'
       - 'bin/corely-vm-model-job-client*.mjs'
       - 'bin/corely-vm-standing-model-client*.mjs'
+      - 'bin/corely-vm-standing-model-session*.mjs'
       - 'bin/corely-vm-model-worker*.mjs'
       - 'bin/corely-vm-standing-authority-runner.mjs'
       - 'bin/codex-harness-*.mjs'
@@ -104,6 +106,8 @@ jobs:
           node --check bin/corely-vm-model-job-client.test.mjs
           node --check bin/corely-vm-standing-model-client.mjs
           node --check bin/corely-vm-standing-model-client.test.mjs
+          node --check bin/corely-vm-standing-model-session.mjs
+          node --check bin/corely-vm-standing-model-session.test.mjs
           node --check bin/corely-vm-model-worker.mjs
           node --check bin/corely-vm-model-worker.test.mjs
           node --check bin/corely-vm-model-worker-authority-probe.mjs
@@ -125,7 +129,7 @@ jobs:
       - name: Run synthetic offline protocol regression
         run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/siwc-local-runtime.test.mjs bin/siwc-local-sessions.test.mjs bin/siwc-gateway-model-port.test.mjs bin/siwc-gateway-credential-rotation.test.mjs
       - name: Run synthetic offline harness and standing-authority regression
-        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/codex-local-gateway-model-port.test.mjs bin/corely-model-contract-local-regression.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-standing-model-client.test.mjs bin/corely-vm-model-worker.test.mjs bin/corely-vm-model-worker-authority-probe.test.mjs
+        run: env -i PATH="$PATH" HOME="$RUNNER_TEMP" node --test bin/codex-harness-*.test.mjs bin/codex-local-gateway-model-port.test.mjs bin/corely-model-contract-local-regression.test.mjs bin/corely-vm-model-job-client.test.mjs bin/corely-vm-standing-model-client.test.mjs bin/corely-vm-standing-model-session.test.mjs bin/corely-vm-model-worker.test.mjs bin/corely-vm-model-worker-authority-probe.test.mjs
       - name: Build and smoke-test the private VM runtime without network or credentials
         if: matrix.node == '22'
         run: |
