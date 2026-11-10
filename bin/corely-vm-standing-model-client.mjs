@@ -9,6 +9,7 @@ import { snapshotModelRequest, snapshotModelResult } from './corely-model-contra
 export const CORELY_VM_STANDING_MODEL_SCOPE = 'corely:dev-vm-standing-model-jobs';
 export const CORELY_VM_STANDING_MODEL_ISSUER = `${CORELY_VM_MODEL_JOB_ISSUER}/standing-model`;
 const MAX_CHILD_MS = 86_400_000, MAX_PARENT_MS = 30 * MAX_CHILD_MS, MAX_MODEL_BODY = 1024 * 1024;
+const MAX_BROKER_LEASE_MS = 60_000, CLAIM_CLOCK_MARGIN_MS = 2_000;
 const REQUEST_ID = /^vm_standing_model_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 const PARENT_ID = /^vm_models_standing_model_parent_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 const CHILD_TOKEN = /^vm_models_standing_model_access_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
@@ -20,12 +21,16 @@ const exact = (value, fields) => value !== null && typeof value === 'object' && 
   Object.keys(value).length === fields.length && fields.every(field => Object.hasOwn(value, field));
 const codes = new Set(['STANDING_MODEL_DISABLED', 'STANDING_MODEL_OPTIONS_INVALID', 'STANDING_MODEL_KEY_INVALID',
   'STANDING_MODEL_CLOSED', 'STANDING_MODEL_BUSY', 'STANDING_MODEL_HELD', 'STANDING_MODEL_RECOVERY_REQUIRED',
-  'STANDING_MODEL_EXECUTION_TERMINAL', 'STANDING_MODEL_DISPATCH_DISABLED', 'STANDING_MODEL_LEASE_NOT_CURRENT']);
+  'STANDING_MODEL_EXECUTION_TERMINAL', 'STANDING_MODEL_DISPATCH_DISABLED', 'STANDING_MODEL_LEASE_NOT_CURRENT',
+  'STANDING_MODEL_RENEWAL_REQUIRED']);
 export class StandingModelClientError extends Error {
   constructor(code) { super(codes.has(code) ? code : 'STANDING_MODEL_HELD'); this.name = 'StandingModelClientError'; this.code = this.message; }
 }
 const failure = code => new StandingModelClientError(code);
 const hold = () => { throw failure('STANDING_MODEL_HELD'); };
+const checkOperationSignal = signal => {
+  if (signal !== undefined && !(signal instanceof AbortSignal)) throw failure('STANDING_MODEL_OPTIONS_INVALID');
+};
 
 // JSON.parse discards duplicate members. Check every decoded member name
 // (including escaped aliases) before using a remote receipt or lease.
@@ -95,6 +100,11 @@ async function fixedJson(endpoint, { method, body, jwt, token, fetchImpl, signal
         /^\s*\{\s*"error"\s*:\s*"invalid_token"\s*\}\s*$/u.test(text)) return DENIED;
     if (response.status !== 200 || !value || typeof value !== 'object' || Array.isArray(value)) hold();
     return value;
+  } catch (error) {
+    if (error instanceof StandingModelClientError && error.code === 'STANDING_MODEL_EXECUTION_TERMINAL') throw error;
+    // Once HTTP might have been dispatched, a dependency cannot manufacture a
+    // local nonterminal/busy result and allow renewal over unresolved work.
+    hold();
   } finally {
     clearTimeout(timer);
     if (reader) { try { void Promise.resolve(reader.cancel()).catch(() => {}); reader.releaseLock(); } catch { /* Nothing retained. */ } }
@@ -140,7 +150,7 @@ export function openCorelyVmStandingModelAuthority(options = {}) {
   };
   const request = async (family, name, { body, token, generation, operationSignal, limit = 4096 } = {}) => {
     if (closed || !key) throw failure('STANDING_MODEL_CLOSED');
-    if (operationSignal !== undefined && !(operationSignal instanceof AbortSignal)) throw failure('STANDING_MODEL_OPTIONS_INVALID');
+    checkOperationSignal(operationSignal);
     const active = operationSignal ? AbortSignal.any([controller.signal, operationSignal]) : controller.signal;
     active.throwIfAborted();
     const endpoint = `${family === 'authority' ? CORELY_VM_STANDING_MODEL_ISSUER : CORELY_VM_MODEL_JOB_RESOURCE}/${name}`;
@@ -191,7 +201,7 @@ export function openCorelyVmStandingModelAuthority(options = {}) {
     try { return await action(() => { renewalDispatched = true; }, ...args); }
     catch (error) {
       if (error instanceof StandingModelClientError && ['STANDING_MODEL_BUSY', 'STANDING_MODEL_DISPATCH_DISABLED',
-        'STANDING_MODEL_OPTIONS_INVALID', 'STANDING_MODEL_LEASE_NOT_CURRENT'].includes(error.code)) throw error;
+        'STANDING_MODEL_OPTIONS_INVALID', 'STANDING_MODEL_LEASE_NOT_CURRENT', 'STANDING_MODEL_RENEWAL_REQUIRED'].includes(error.code)) throw error;
       close();
       if (error instanceof StandingModelClientError && error.code === 'STANDING_MODEL_EXECUTION_TERMINAL') throw error;
       throw failure(renewalDispatched ? 'STANDING_MODEL_RECOVERY_REQUIRED' : 'STANDING_MODEL_HELD');
@@ -275,12 +285,20 @@ export function openCorelyVmStandingModelAuthority(options = {}) {
       requireDispatch();
       if (!enrolled || !['info', 'eason'].includes(accountAlias)) throw failure('STANDING_MODEL_OPTIONS_INVALID');
       if (leases.size) throw failure('STANDING_MODEL_BUSY');
+      // Never create an untrackable remote lease near the child deadline. The
+      // broker can lease for up to 60 s; budget the bounded HTTP round trip and
+      // two seconds for clock/rounded-expiry differences on both local clocks.
+      const started = clock(), needed = MAX_BROKER_LEASE_MS + requestTimeoutMs + CLAIM_CLOCK_MARGIN_MS;
+      if (!live(child, started)) hold();
+      if (Math.min(child.wallDeadline - started.wall, child.monoDeadline - started.mono) <= needed) {
+        throw failure('STANDING_MODEL_RENEWAL_REQUIRED');
+      }
       const value = await modelRequest('claim', { accountAlias }, operationSignal, MAX_MODEL_BODY);
       if (!exact(value, ['authMode', 'lease']) || value.authMode !== 'siwc_plan') hold();
       if (value.lease === null) return null;
       const lease = value.lease;
       if (!exact(lease, ['leaseId', 'accountAlias', 'expiresAt', 'request']) || typeof lease.leaseId !== 'string' || !UUID.test(lease.leaseId) || lease.accountAlias !== accountAlias ||
-          !future(lease.expiresAt, clock().wall, 60_000) || lease.expiresAt > child.wallDeadline) hold();
+          !future(lease.expiresAt, clock().wall, MAX_BROKER_LEASE_MS) || lease.expiresAt > child.wallDeadline) hold();
       const request = snapshotModelRequest(lease.request);
       if (!['DECISION_LLM', 'REPLY_LLM'].includes(request.workload) || request.purpose === 'image_analysis') hold();
       const owned = Object.freeze({ leaseId: lease.leaseId, accountAlias, expiresAt: lease.expiresAt, request });
@@ -288,6 +306,7 @@ export function openCorelyVmStandingModelAuthority(options = {}) {
     }),
     completeModel: exclusive(async (_mark, leaseId, input, operationSignal) => {
       requireDispatch();
+      checkOperationSignal(operationSignal);
       const lease = leases.get(leaseId);
       if (!lease || lease.expiresAt <= clock().wall) throw failure('STANDING_MODEL_LEASE_NOT_CURRENT');
       const result = snapshotModelResult(input, lease.request, lease.accountAlias, 'siwc_plan');
@@ -300,6 +319,7 @@ export function openCorelyVmStandingModelAuthority(options = {}) {
     }),
     failModel: exclusive(async (_mark, leaseId, operationSignal) => {
       requireDispatch();
+      checkOperationSignal(operationSignal);
       const lease = leases.get(leaseId);
       if (!lease || lease.expiresAt <= clock().wall) throw failure('STANDING_MODEL_LEASE_NOT_CURRENT');
       leases.delete(leaseId);

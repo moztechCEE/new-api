@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { CORELY_VM_HOST_ID_HASH, CORELY_VM_MODEL_JOB_RESOURCE, CORELY_VM_MODEL_JOB_SCOPE,
   CORELY_VM_VERIFICATION_URI } from './corely-vm-model-job-client.mjs';
 import { CORELY_VM_STANDING_MODEL_ISSUER as ISSUER, CORELY_VM_STANDING_MODEL_SCOPE as SCOPE,
-  openCorelyVmStandingModelAuthority as open } from './corely-vm-standing-model-client.mjs';
+  openCorelyVmStandingModelAuthority as open, StandingModelClientError } from './corely-vm-standing-model-client.mjs';
 
 const START = 1_800_000_000_000, INITIAL_PARENT_EXPIRY = START + 86_400_000 * 30;
 const id = (prefix, digit) => `${prefix}_${digit.repeat(42)}A`;
@@ -155,6 +155,56 @@ test('opted-in model lease binds same child, parent expiry, synthetic request an
   await assert.rejects(f.client.claimModel('info'), isError('STANDING_MODEL_CLOSED'));
 });
 
+test('claim requires full child headroom on both clocks before any request, and a successful renewal reopens claim', async () => {
+  for (const clock of ['now', 'mono']) {
+    const f = fixture({ enableModelDispatch: true }); await f.client.renew(); await f.client.enrollModels();
+    // At 77 s (60 s max lease + 15 s HTTP + 2 s margin) only one clock
+    // is short; a still-healthy other clock cannot admit the request.
+    f.state[clock] += 43_000;
+    const count = f.events.length;
+    await assert.rejects(f.client.claimModel('eason'), isError('STANDING_MODEL_RENEWAL_REQUIRED'));
+    assert.equal(f.events.length, count, 'no claim or other HTTP request');
+    assert.equal((await f.client.renew()).predecessorDenialVerified, true);
+    assert.equal((await f.client.claimModel('eason')).accountAlias, 'eason');
+    assert.equal(f.events.filter(route => route === 'model:claim').length, 1);
+  }
+});
+
+test('renew is blocked before any HTTP when a claim, a lease, or a completion is active', async () => {
+  const f = fixture({ enableModelDispatch: true }); await f.client.renew(); await f.client.enrollModels();
+  let started, release;
+  const seen = new Promise(resolve => { started = resolve; });
+  const delayed = new Promise(resolve => { release = resolve; });
+  f.state.intercept = route => {
+    if (route !== 'model:claim') return null;
+    started(); return delayed.then(() => json({ authMode: 'siwc_plan', lease: null }));
+  };
+  const pendingClaim = f.client.claimModel('eason'); await Promise.race([seen, pendingClaim]);
+  let count = f.events.length;
+  await assert.rejects(f.client.renew(), isError('STANDING_MODEL_BUSY'));
+  assert.equal(f.events.length, count);
+  release(); assert.equal(await pendingClaim, null);
+  f.state.intercept = null;
+  const lease = await f.client.claimModel('eason'); count = f.events.length;
+  await assert.rejects(f.client.completeModel(lease.leaseId, f.result, {}), isError('STANDING_MODEL_OPTIONS_INVALID'));
+  await assert.rejects(f.client.renew(), isError('STANDING_MODEL_BUSY'));
+  assert.equal(f.events.length, count, 'invalid local options did not discard the outstanding lease');
+
+  const completeSeen = new Promise(resolve => { started = resolve; });
+  const completeDelayed = new Promise(resolve => { release = resolve; });
+  f.state.intercept = (route, { body }) => {
+    if (route !== 'model:complete') return null;
+    started(); return completeDelayed.then(() => json({ accepted: true, replayed: false, callId: lease.request.callId,
+      resultSha256: hash(JSON.stringify(body.result), 'hex') }));
+  };
+  const pendingComplete = f.client.completeModel(lease.leaseId, f.result); await Promise.race([completeSeen, pendingComplete]);
+  count = f.events.length;
+  await assert.rejects(f.client.renew(), isError('STANDING_MODEL_BUSY'));
+  assert.equal(f.events.length, count, 'busy guard still held after local lease consumed');
+  release(); assert.equal((await pendingComplete).accepted, true);
+  assert.equal((await f.client.renew()).predecessorDenialVerified, true);
+});
+
 test('invalid legacy model profile, child expiry and lost result never retry or advance', async () => {
   const f = fixture(); await f.client.renew();
   f.state.intercept = route => route === 'model:status' ? json({ status: 'SYNTHETIC_VM_MODEL_TRANSPORT_V2', contractVersion: 2 }) : null;
@@ -164,7 +214,10 @@ test('invalid legacy model profile, child expiry and lost result never retry or 
   assert.ok(!expiry.events.includes('model:claim'));
   const lost = fixture({ enableModelDispatch: true }); await lost.client.renew(); await lost.client.enrollModels();
   const lease = await lost.client.claimModel('eason');
-  lost.state.intercept = route => { if (route === 'model:complete') throw new Error('secret transport detail'); return null; };
+  lost.state.intercept = route => {
+    if (route === 'model:complete') throw new StandingModelClientError('STANDING_MODEL_RENEWAL_REQUIRED');
+    return null;
+  };
   await assert.rejects(lost.client.completeModel(lease.leaseId, lost.result), isError('STANDING_MODEL_HELD'));
   await assert.rejects(lost.client.completeModel(lease.leaseId, lost.result), isError('STANDING_MODEL_CLOSED'));
   assert.equal(lost.events.filter(x => x === 'model:complete').length, 1);
