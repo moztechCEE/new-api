@@ -14,7 +14,8 @@ const MAX_GRANT_MS = 86_400_000;
 const MAX_POLL_WAKEUPS = 32;
 const CODES = new Set(['INVALID_OPTIONS', 'INVALID_KEY', 'ABORTED', 'AUTHORIZATION_FAILED', 'AUTHORIZATION_TIMEOUT',
   'AUTHORIZATION_DENIED', 'DEVICE_RESPONSE_INVALID', 'TOKEN_RESPONSE_INVALID', 'TOKEN_EXCHANGE_UNCERTAIN',
-  'GRANT_EXPIRED', 'GRANT_CLOSED', 'RESOURCE_REQUEST_UNCERTAIN', 'RESOURCE_RESPONSE_INVALID', 'MODEL_JOB_NOT_CURRENT']);
+  'GRANT_EXPIRED', 'GRANT_CLOSED', 'RESOURCE_REQUEST_UNCERTAIN', 'RESOURCE_RESPONSE_INVALID', 'MODEL_JOB_NOT_CURRENT',
+  'ACCESS_ROTATION_BUSY', 'ACCESS_ROTATION_RECOVERY_REQUIRED']);
 export class VmModelJobClientError extends Error {
   constructor(code) { super(CODES.has(code) ? code : 'INVALID_OPTIONS'); this.name = 'VmModelJobClientError'; this.code = this.message; }
 }
@@ -215,9 +216,14 @@ export async function connectCorelyVmModelJobs(options = {}) {
     if (transaction.signal.aborted && transaction.signal.reason instanceof VmModelJobClientError) throw transaction.signal.reason;
     throw failure('AUTHORIZATION_FAILED');
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
-  let closed = false, held = false, stopping = false, authorityExpiresAt;
+  let closed = false, held = false, stopping = false, authorityExpiresAt, rotation;
+  let activeOperations = 0;
   const leases = new Map();
-  const close = () => { closed = true; token = ''; leases.clear(); signal?.removeEventListener('abort', close); };
+  const close = () => {
+    closed = true; token = ''; leases.clear();
+    rotation?.abort(failure('GRANT_CLOSED'));
+    signal?.removeEventListener('abort', close);
+  };
   signal?.addEventListener('abort', close, { once: true });
   const live = (terminal = false, cleanup = false) => {
     if (signal?.aborted) { close(); throw failure('ABORTED'); }
@@ -238,28 +244,105 @@ export async function connectCorelyVmModelJobs(options = {}) {
     } catch (error) { held = true; throw error; }
   };
   const bindingValid = value => value.vmHostIdHash === CORELY_VM_HOST_ID_HASH && value.keyThumbprint === keyThumbprint;
+  const checkAuthority = value => {
+    if (Object.keys(value).length !== 13 || value.status !== 'CORELY_VM_MODEL_JOB_AUTHORITY_VALID' ||
+        value.scope !== CORELY_VM_MODEL_JOB_SCOPE || value.resource !== CORELY_VM_MODEL_JOB_RESOURCE ||
+        value.tenantId !== 'moztech' || value.brandId !== 'moztech-test' || !bindingValid(value) ||
+        value.syntheticOnly !== true || typeof value.modelTransportEnabled !== 'boolean' ||
+        value.apiFallbackEnabled !== false || value.sendingCapability !== false || value.learningCapability !== false ||
+        !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs ||
+        (authorityExpiresAt !== undefined && value.expiresAt !== authorityExpiresAt)) throw failure('RESOURCE_RESPONSE_INVALID');
+    return value;
+  };
+  const checkModelStatus = value => {
+    // V1 explicitly has no producer. The hosted synthetic producer is a
+    // paired V2 contract, not permission to accept a bare boolean flip or
+    // extra fields from an unknown service/version.
+    const legacy = Object.keys(value).length === 14 && value.status === 'SYNTHETIC_VM_MODEL_TRANSPORT' && value.producerConnected === false;
+    const hosted = Object.keys(value).length === 15 && value.status === 'SYNTHETIC_VM_MODEL_TRANSPORT_V2' &&
+      value.contractVersion === 2 && typeof value.producerConnected === 'boolean';
+    if ((!legacy && !hosted) || value.scope !== CORELY_VM_MODEL_JOB_SCOPE ||
+        value.tenantId !== 'moztech' || value.brandId !== 'moztech-test' || value.authMode !== 'siwc_plan' || value.syntheticOnly !== true ||
+        typeof value.enrolled !== 'boolean' || value.apiFallbackEnabled !== false ||
+        value.sendingCapability !== false || value.learningCapability !== false || !bindingValid(value) || !Number.isSafeInteger(value.expiresAt) ||
+        value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs) throw failure('RESOURCE_RESPONSE_INVALID');
+    return value;
+  };
+  // Count the whole operation, not merely its fetch: claim must have
+  // installed the lease, and complete/fail must have validated the receipt.
+  const track = operation => async (...args) => {
+    if (rotation) throw failure('ACCESS_ROTATION_BUSY');
+    activeOperations++;
+    try { return await operation(...args); }
+    finally { activeOperations--; }
+  };
   live();
   return Object.freeze({
-    receipt() { live(); return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CONNECTED', scope: CORELY_VM_MODEL_JOB_SCOPE,
-      resource: CORELY_VM_MODEL_JOB_RESOURCE, vmHostIdHash: CORELY_VM_HOST_ID_HASH, keyThumbprint, expiresAt,
-      syntheticOnly: true, apiFallbackEnabled: false, sendingCapability: false, learningCapability: false }); },
-    async authorityStatus(operationSignal) {
+    receipt() {
+      if (rotation) throw failure('ACCESS_ROTATION_BUSY');
+      live();
+      return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CONNECTED', scope: CORELY_VM_MODEL_JOB_SCOPE,
+        resource: CORELY_VM_MODEL_JOB_RESOURCE, vmHostIdHash: CORELY_VM_HOST_ID_HASH, keyThumbprint, expiresAt,
+        syntheticOnly: true, apiFallbackEnabled: false, sendingCapability: false, learningCapability: false });
+    },
+    authorityStatus: track(async operationSignal => {
       try {
-        const value = await resource('oauth/status', undefined, operationSignal, { limit: 4096, flatResponse: true });
-        if (Object.keys(value).length !== 13 || value.status !== 'CORELY_VM_MODEL_JOB_AUTHORITY_VALID' ||
-            value.scope !== CORELY_VM_MODEL_JOB_SCOPE || value.resource !== CORELY_VM_MODEL_JOB_RESOURCE ||
-            value.tenantId !== 'moztech' || value.brandId !== 'moztech-test' || !bindingValid(value) ||
-            value.syntheticOnly !== true || typeof value.modelTransportEnabled !== 'boolean' ||
-            value.apiFallbackEnabled !== false || value.sendingCapability !== false || value.learningCapability !== false ||
-            !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs ||
-            (authorityExpiresAt !== undefined && value.expiresAt !== authorityExpiresAt)) throw failure('RESOURCE_RESPONSE_INVALID');
+        const value = checkAuthority(await resource('oauth/status', undefined, operationSignal, { limit: 4096, flatResponse: true }));
         // This is only the current Corely grant. It neither verifies provider
         // login/model/quota nor changes the original local grant deadline.
         authorityExpiresAt = value.expiresAt;
         return Object.freeze({ ...value });
       } catch (error) { held = true; throw error; }
+    }),
+    async rotateAccess(operationSignal) {
+      if (rotation || activeOperations || leases.size) throw failure('ACCESS_ROTATION_BUSY');
+      live();
+      if (operationSignal !== undefined && !(operationSignal instanceof AbortSignal)) throw failure('INVALID_OPTIONS');
+      if (operationSignal?.aborted) throw failure('ABORTED');
+      rotation = new AbortController();
+      const active = operationSignal ? AbortSignal.any([rotation.signal, operationSignal]) : rotation.signal;
+      const request = (endpoint, method, access, body) => {
+        live();
+        if (active.aborted) throw failure('ABORTED');
+        return requestJson(endpoint, { fetchImpl, method, body, proof: proof(endpoint, method, access), token: access,
+          signal: active, requestTimeoutMs, kind: 'resource', limit: 4096, flatResponse: true });
+      };
+      const equalStatus = (previous, next) => Object.entries(previous).every(([key, value]) => next[key] === value);
+      const authorityEndpoint = `${CORELY_VM_MODEL_JOB_ISSUER}/status`, modelEndpoint = `${CORELY_VM_MODEL_JOB_RESOURCE}/status`;
+      try {
+        const predecessor = token;
+        const before = checkAuthority(await request(authorityEndpoint, 'GET', predecessor));
+        const beforeModel = before.modelTransportEnabled ? checkModelStatus(await request(modelEndpoint, 'GET', predecessor)) : undefined;
+        if (beforeModel && beforeModel.expiresAt !== before.expiresAt) throw failure('RESOURCE_RESPONSE_INVALID');
+        const next = await request(`${CORELY_VM_MODEL_JOB_ISSUER}/rotate`, 'POST', predecessor, {});
+        // This relative duration is rounded on the issuer's clock. Only the
+        // two authenticated absolute expiries and the original local grant
+        // clocks determine whether the successor can be installed or used.
+        if (Object.keys(next).length !== 4 || typeof next.access_token !== 'string' ||
+            !/^vm_models_access_[A-Za-z0-9_-]{43}$/.test(next.access_token) || next.access_token === predecessor ||
+            next.token_type !== 'DPoP' || next.scope !== CORELY_VM_MODEL_JOB_SCOPE || !Number.isSafeInteger(next.expires_in) ||
+            next.expires_in < 1 || next.expires_in > MAX_GRANT_MS / 1000) throw failure('RESOURCE_RESPONSE_INVALID');
+        const after = checkAuthority(await request(authorityEndpoint, 'GET', next.access_token));
+        if (!equalStatus(before, after)) throw failure('RESOURCE_RESPONSE_INVALID');
+        if (beforeModel) {
+          const afterModel = checkModelStatus(await request(modelEndpoint, 'GET', next.access_token));
+          if (!equalStatus(beforeModel, afterModel)) throw failure('RESOURCE_RESPONSE_INVALID');
+        }
+        live();
+        if (readClock() >= before.expiresAt || active.aborted) throw failure('GRANT_CLOSED');
+        // No new local timer or grant: only replace the opaque credential.
+        // The server's durable transaction keeps the internal owner unchanged.
+        token = next.access_token;
+        authorityExpiresAt = before.expiresAt;
+        return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_ACCESS_ROTATED', expiresAt: before.expiresAt });
+      } catch {
+        // A lost response may have consumed the predecessor. Never replay it
+        // or use an unverified successor, even for automatic cleanup.
+        close();
+        throw failure('ACCESS_ROTATION_RECOVERY_REQUIRED');
+      } finally { rotation = undefined; }
     },
-    async revokeAuthority(operationSignal) {
+    revokeAuthority: track(async operationSignal => {
       // A second terminal call must not close or steal the first one's in-flight
       // receipt. Held authority may only be used for this fixed cleanup route.
       if (closed || stopping) throw failure('GRANT_CLOSED');
@@ -277,30 +360,16 @@ export async function connectCorelyVmModelJobs(options = {}) {
         return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'UNKNOWN',
           reason: error instanceof VmModelJobClientError ? error.code : 'RESOURCE_REQUEST_UNCERTAIN' });
       } finally { close(); }
-    },
-    async modelStatus(operationSignal) {
-      const value = await resource('status', undefined, operationSignal);
-      // V1 explicitly has no producer. The hosted synthetic producer is a
-      // paired V2 contract, not permission to accept a bare boolean flip or
-      // extra fields from an unknown service/version.
-      const legacy = Object.keys(value).length === 14 && value.status === 'SYNTHETIC_VM_MODEL_TRANSPORT' && value.producerConnected === false;
-      const hosted = Object.keys(value).length === 15 && value.status === 'SYNTHETIC_VM_MODEL_TRANSPORT_V2' &&
-        value.contractVersion === 2 && typeof value.producerConnected === 'boolean';
-      if ((!legacy && !hosted) || value.scope !== CORELY_VM_MODEL_JOB_SCOPE ||
-          value.tenantId !== 'moztech' || value.brandId !== 'moztech-test' || value.authMode !== 'siwc_plan' || value.syntheticOnly !== true ||
-          typeof value.enrolled !== 'boolean' || value.apiFallbackEnabled !== false ||
-          value.sendingCapability !== false || value.learningCapability !== false || !bindingValid(value) || !Number.isSafeInteger(value.expiresAt) ||
-          value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs) throw failure('RESOURCE_RESPONSE_INVALID');
-      return Object.freeze({ ...value });
-    },
-    async enrollModels(operationSignal) {
+    }),
+    modelStatus: track(async operationSignal => Object.freeze({ ...checkModelStatus(await resource('status', undefined, operationSignal)) })),
+    enrollModels: track(async operationSignal => {
       const value = await resource('enroll', {}, operationSignal);
       if (Object.keys(value).length !== 9 || value.enrolled !== true || value.authMode !== 'siwc_plan' || value.syntheticOnly !== true ||
           value.apiFallbackEnabled !== false || value.sendingCapability !== false || value.learningCapability !== false || !bindingValid(value) ||
           !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= readClock() || value.expiresAt > expiresAt + requestTimeoutMs) throw failure('RESOURCE_RESPONSE_INVALID');
       return Object.freeze({ ...value });
-    },
-    async claimModel(accountAlias, operationSignal) {
+    }),
+    claimModel: track(async (accountAlias, operationSignal) => {
       live(); if (!['info', 'eason'].includes(accountAlias)) throw failure('INVALID_OPTIONS');
       for (const [id, lease] of leases) if (lease.expiresAt <= readClock()) leases.delete(id);
       if (leases.size >= 32) throw failure('MODEL_JOB_NOT_CURRENT');
@@ -315,8 +384,8 @@ export async function connectCorelyVmModelJobs(options = {}) {
       let request; try { request = snapshotModelRequest(lease.request); } catch { throw failure('RESOURCE_RESPONSE_INVALID'); }
       const owned = Object.freeze({ leaseId: lease.leaseId, accountAlias, expiresAt: lease.expiresAt, request });
       leases.set(owned.leaseId, owned); return owned;
-    },
-    async completeModel(leaseId, input, operationSignal) {
+    }),
+    completeModel: track(async (leaseId, input, operationSignal) => {
       live(); const lease = leases.get(leaseId);
       if (!lease || lease.expiresAt <= readClock()) throw failure('MODEL_JOB_NOT_CURRENT');
       let result; try { result = snapshotModelResult(input, lease.request, lease.accountAlias, 'siwc_plan'); }
@@ -329,8 +398,8 @@ export async function connectCorelyVmModelJobs(options = {}) {
       if (lease.expiresAt <= readClock() || Object.keys(value).length !== 4 || value.accepted !== true || typeof value.replayed !== 'boolean' ||
           value.callId !== lease.request.callId || value.resultSha256 !== expected) throw failure('RESOURCE_RESPONSE_INVALID');
       return Object.freeze({ ...value });
-    },
-    async failModel(leaseId, operationSignal) {
+    }),
+    failModel: track(async (leaseId, operationSignal) => {
       live(); const lease = leases.get(leaseId);
       if (!lease || lease.expiresAt <= readClock()) throw failure('MODEL_JOB_NOT_CURRENT');
       // Only an owned, still-leased call can stop this grant. A failed or lost
@@ -345,7 +414,7 @@ export async function connectCorelyVmModelJobs(options = {}) {
             value.reason !== 'EXECUTION_UNAVAILABLE') throw failure('RESOURCE_RESPONSE_INVALID');
         return Object.freeze({ held: true, reason: 'EXECUTION_UNAVAILABLE' });
       } finally { close(); }
-    },
+    }),
     close() { close(); return Object.freeze({ status: 'CORELY_VM_MODEL_JOB_GRANT_CLOSED', remoteRevocation: 'NOT_PERFORMED' }); },
   });
 }

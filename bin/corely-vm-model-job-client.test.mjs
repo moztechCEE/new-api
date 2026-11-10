@@ -6,7 +6,7 @@ import { connectCorelyVmModelJobs, VmModelJobClientError, CORELY_VM_MODEL_JOB_RE
   CORELY_VM_MODEL_JOB_CLIENT_ID as CLIENT, CORELY_VM_HOST_ID_HASH as HOST,
   CORELY_VM_VERIFICATION_URI as VERIFICATION } from './corely-vm-model-job-client.mjs';
 
-const TOKEN = `vm_models_access_${'t'.repeat(43)}`, DEVICE = `vm_models_device_${'d'.repeat(43)}`;
+const TOKEN = `vm_models_access_${'t'.repeat(43)}`, SUCCESSOR = `vm_models_access_${'s'.repeat(43)}`, DEVICE = `vm_models_device_${'d'.repeat(43)}`;
 const REQUEST = `vm_models_${'r'.repeat(43)}`;
 const realFetch = globalThis.fetch;
 before(() => { globalThis.fetch = () => { throw new Error('ALL_EXTERNAL_NETWORK_DISABLED'); }; });
@@ -15,12 +15,17 @@ const isCode = code => error => error instanceof VmModelJobClientError && error.
 const canonical = value => value && typeof value === 'object' ? Array.isArray(value) ? value.map(canonical)
   : Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
 const hash = value => createHash('sha256').update(value).digest('base64url');
+const deferred = () => {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+};
 
 function fixture(change = {}) {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const jwk = publicKey.export({ format: 'jwk' });
   const thumbprint = hash(JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: jwk.x }));
-  let clock = 1_800_000_000_000, monotonic = 1000, consented = false, completeCount = 0;
+  let clock = 1_800_000_000_000, monotonic = 1000, consented = false, completeCount = 0, activeToken = TOKEN;
   const grantExpiry = clock + 86_400_000, calls = [], waits = [], proofs = new Set();
   const content = { version: 1, callId: 'synthetic-vm-model-call', workload: 'REPLY_LLM', purpose: 'reply_generation', model: 'gpt-6.1-sol',
     scope: { tenantId: 'moztech', brandId: 'moztech-test', synthetic: true, jobId: 'server-synthetic-job' },
@@ -74,20 +79,25 @@ function fixture(change = {}) {
         const value = { access_token: TOKEN, token_type: 'DPoP', expires_in: Math.floor((grantExpiry - clock) / 1000), scope: SCOPE };
         return change.token?.(value, init) ?? Response.json(value);
       }
-      if (url === `${ISSUER}/status` || url === `${ISSUER}/revoke`) {
-        assert.equal(init.headers.Authorization, `DPoP ${TOKEN}`); assertProof(init.headers.DPoP, url, init.method, TOKEN);
+      if ([`${ISSUER}/status`, `${ISSUER}/revoke`, `${ISSUER}/rotate`].includes(url)) {
+        assert.equal(init.headers.Authorization, `DPoP ${activeToken}`); assertProof(init.headers.DPoP, url, init.method, activeToken);
         if (url.endsWith('/status')) {
           assert.equal(init.method, 'GET'); assert.equal(init.body, undefined); assert.equal(init.headers['Content-Type'], undefined);
-          return change.authority?.(authority(), init) ?? Response.json(authority());
+          return change.authority?.(authority(), init, activeToken) ?? Response.json(authority());
         }
         assert.equal(init.method, 'POST'); assert.equal(init.headers['Content-Type'], 'application/json');
-        assert.deepEqual(JSON.parse(init.body), {});
+        assert.equal(init.body, '{}');
+        if (url.endsWith('/rotate')) {
+          activeToken = SUCCESSOR;
+          const value = { access_token: activeToken, token_type: 'DPoP', expires_in: Math.floor((grantExpiry - clock) / 1000), scope: SCOPE };
+          return change.rotate?.(value, init) ?? Response.json(value);
+        }
         return change.revoke?.(init) ?? new Response(null, { status: 200 });
       }
       assert.ok(['status', 'enroll', 'claim', 'complete', 'fail'].some(operation => url === `${RESOURCE}/${operation}`), 'no arbitrary URL, customer, provider, API, or producer call');
       const op = url.slice(RESOURCE.length + 1);
-      assert.equal(init.headers.Authorization, `DPoP ${TOKEN}`); assertProof(init.headers.DPoP, url, init.method, TOKEN);
-      if (change.resource) return change.resource(op, init, status());
+      assert.equal(init.headers.Authorization, `DPoP ${activeToken}`); assertProof(init.headers.DPoP, url, init.method, activeToken);
+      if (change.resource) return change.resource(op, init, status(), activeToken);
       if (op === 'status') { assert.equal(init.method, 'GET'); assert.equal(init.body, undefined); return Response.json(status()); }
       assert.equal(init.method, 'POST'); const body = JSON.parse(init.body);
       if (op === 'enroll') {
@@ -111,7 +121,7 @@ function fixture(change = {}) {
 
 test('offline device + sender-constrained grant completes only one bound synthetic lease without exposing credentials', async () => {
   const f = fixture(), client = await connectCorelyVmModelJobs(f.options);
-  assert.deepEqual(Object.keys(client).sort(), ['receipt', 'authorityStatus', 'revokeAuthority', 'modelStatus', 'enrollModels', 'claimModel', 'completeModel', 'failModel', 'close'].sort());
+  assert.deepEqual(Object.keys(client).sort(), ['receipt', 'authorityStatus', 'rotateAccess', 'revokeAuthority', 'modelStatus', 'enrollModels', 'claimModel', 'completeModel', 'failModel', 'close'].sort());
   const receipt = client.receipt(); assert.equal(receipt.apiFallbackEnabled, false); assert.equal(receipt.keyThumbprint, f.thumbprint);
   assert.doesNotMatch(JSON.stringify(receipt), /vm_models_access_|vm_models_device_|Synthetic generated|PRIVATE KEY/);
   assert.equal((await client.modelStatus()).producerConnected, false); assert.equal((await client.enrollModels()).enrolled, true);
@@ -182,6 +192,124 @@ test('authority status cannot silently renew or shorten the same original server
     await assert.rejects(client.authorityStatus(), isCode('RESOURCE_RESPONSE_INVALID'));
     assert.equal((await client.revokeAuthority()).remoteRevocation, 'CONFIRMED');
   }
+});
+
+test('idle rotation proves the successor on the same Corely authority and keeps the original grant and enrollment deadlines', async t => {
+  for (const modelTransportEnabled of [false, true]) await t.test(`transport ${modelTransportEnabled}`, async () => {
+    const f = fixture({ authority: value => Response.json({ ...value, modelTransportEnabled }),
+      rotate: value => Response.json({ ...value, expires_in: value.expires_in + 2 }) });
+    const client = await connectCorelyVmModelJobs(f.options), localExpiry = client.receipt().expiresAt;
+    // The issuer rounds on its own clock, which may be two seconds behind
+    // the VM. The matching absolute deadline, not this TTL, controls access.
+    f.advance(61_251);
+    const receipt = await client.rotateAccess();
+    assert.deepEqual(receipt, { status: 'CORELY_VM_MODEL_JOB_ACCESS_ROTATED', expiresAt: f.authority().expiresAt });
+    assert.equal(Object.isFrozen(receipt), true);
+    assert.doesNotMatch(JSON.stringify(receipt), /vm_models_access_|grantId|PRIVATE KEY/);
+    assert.deepEqual(f.calls.slice(2).map(({ url, method }) => [url, method]), [
+      [`${ISSUER}/status`, 'GET'], ...(modelTransportEnabled ? [[`${RESOURCE}/status`, 'GET']] : []),
+      [`${ISSUER}/rotate`, 'POST'], [`${ISSUER}/status`, 'GET'],
+      ...(modelTransportEnabled ? [[`${RESOURCE}/status`, 'GET']] : []),
+    ]);
+    assert.equal((await client.authorityStatus()).expiresAt, receipt.expiresAt);
+    assert.equal(client.receipt().expiresAt, localExpiry);
+    f.advanceMonotonic(86_400_000 - 5_000 - 61_251);
+    await assert.rejects(client.authorityStatus(), isCode('GRANT_EXPIRED'));
+  });
+});
+
+test('rotation neither starts over in-flight operations or owned work, nor permits concurrent calls with either token', async () => {
+  const preflight = deferred(), rotateStarted = deferred(), released = deferred(), finishRotation = deferred();
+  let blockStatus = true;
+  const f = fixture({ authority: async value => {
+    if (blockStatus) { blockStatus = false; preflight.resolve(); await released.promise; }
+    return Response.json(value);
+  }, rotate: async value => { rotateStarted.resolve(value); await finishRotation.promise; return Response.json(value); } });
+  const client = await connectCorelyVmModelJobs(f.options);
+  const read = client.authorityStatus(); await preflight.promise;
+  await assert.rejects(client.rotateAccess(), isCode('ACCESS_ROTATION_BUSY'));
+  released.resolve(); await read;
+  const lease = await client.claimModel('info');
+  await assert.rejects(client.rotateAccess(), isCode('ACCESS_ROTATION_BUSY'));
+  await client.completeModel(lease.leaseId, f.result);
+  const stop = new AbortController(); stop.abort();
+  await assert.rejects(client.rotateAccess(stop.signal), isCode('ABORTED'));
+  assert.equal(f.calls.filter(call => call.url.endsWith('/rotate')).length, 0);
+  const pending = client.rotateAccess(); await rotateStarted.promise;
+  const count = f.calls.length;
+  assert.throws(() => client.receipt(), isCode('ACCESS_ROTATION_BUSY'));
+  for (const operation of [() => client.rotateAccess(), () => client.authorityStatus(), () => client.modelStatus(),
+    () => client.enrollModels(), () => client.claimModel('info'), () => client.completeModel(lease.leaseId, f.result),
+    () => client.failModel(lease.leaseId), () => client.revokeAuthority()]) await assert.rejects(operation(), isCode('ACCESS_ROTATION_BUSY'));
+  assert.equal(f.calls.length, count);
+  finishRotation.resolve();
+  assert.equal((await pending).status, 'CORELY_VM_MODEL_JOB_ACCESS_ROTATED');
+  assert.equal((await client.revokeAuthority()).remoteRevocation, 'CONFIRMED');
+});
+
+test('rotation never retries a possibly consumed credential or exposes an unverified successor', async t => {
+  for (const [name, rotate] of [
+    ['transport lost', () => { throw new Error('SYNTHETIC_PRIVATE_ERROR'); }],
+    ['same token', value => Response.json({ ...value, access_token: TOKEN })],
+    ['token not a string', value => Response.json({ ...value, access_token: [SUCCESSOR] })],
+    ['downgrade', value => Response.json({ ...value, token_type: 'Bearer' })],
+    ['widened scope', value => Response.json({ ...value, scope: 'other' })],
+    ['over 24-hour lifetime', value => Response.json({ ...value, expires_in: 86_401 })],
+    ['extra refresh credential', value => Response.json({ ...value, refresh_token: 'SYNTHETIC_PRIVATE_ERROR' })],
+    ['duplicate', value => new Response(JSON.stringify(value).replace('"token_type":"DPoP"', '"token_type":"Bearer","token_type":"DPoP"'), { headers: { 'content-type': 'application/json' } })],
+    ['redirect', value => { const response = Response.json(value); Object.defineProperty(response, 'redirected', { value: true }); return response; }],
+  ]) await t.test(name, async () => {
+    const f = fixture({ rotate }), client = await connectCorelyVmModelJobs(f.options);
+    await assert.rejects(client.rotateAccess(), isCode('ACCESS_ROTATION_RECOVERY_REQUIRED'));
+    assert.deepEqual(f.calls.slice(2).map(value => value.url), [`${ISSUER}/status`, `${ISSUER}/rotate`]);
+    await assert.rejects(client.rotateAccess(), isCode('GRANT_CLOSED'));
+    await assert.rejects(client.revokeAuthority(), isCode('GRANT_CLOSED'));
+    assert.equal(f.calls.length, 4);
+  });
+});
+
+test('rotation does not mutate an unverified predecessor, or fall back after an unverified successor', async t => {
+  await t.test('invalid predecessor authority never reaches rotation', async () => {
+    const f = fixture({ authority: value => Response.json({ ...value, tenantId: 'foreign' }) });
+    const client = await connectCorelyVmModelJobs(f.options);
+    await assert.rejects(client.rotateAccess(), isCode('ACCESS_ROTATION_RECOVERY_REQUIRED'));
+    await assert.rejects(client.rotateAccess(), isCode('GRANT_CLOSED'));
+    assert.deepEqual(f.calls.slice(2).map(value => value.url), [`${ISSUER}/status`]);
+  });
+  for (const [name, change] of [
+    ['changed server expiry', { authority: (value, _init, token) => Response.json({ ...value, expiresAt: value.expiresAt + (token === SUCCESSOR ? 1 : 0) }) }],
+    ['changed host', { authority: (value, _init, token) => Response.json({ ...value, vmHostIdHash: token === SUCCESSOR ? '0'.repeat(64) : HOST }) }],
+    ['transport changed', { authority: (value, _init, token) => Response.json({ ...value, modelTransportEnabled: token === SUCCESSOR }) }],
+    ['enrollment disappeared', { authority: value => Response.json({ ...value, modelTransportEnabled: true }),
+      resource: (op, _init, value, token) => {
+        assert.equal(op, 'status'); return Response.json({ ...value, enrolled: token !== SUCCESSOR });
+      } }],
+    ['successor rejected', { authority: (value, _init, token) => Response.json(value, { status: token === SUCCESSOR ? 401 : 200 }) }],
+  ]) await t.test(name, async () => {
+    const f = fixture(change), client = await connectCorelyVmModelJobs(f.options);
+    await assert.rejects(client.rotateAccess(), isCode('ACCESS_ROTATION_RECOVERY_REQUIRED'));
+    const count = f.calls.length;
+    assert.equal(f.calls.filter(call => call.url.endsWith('/rotate')).length, 1);
+    await assert.rejects(client.authorityStatus(), isCode('GRANT_CLOSED'));
+    await assert.rejects(client.rotateAccess(), isCode('GRANT_CLOSED'));
+    assert.equal(f.calls.length, count);
+  });
+});
+
+test('abort, explicit close, and absolute expiry never install a late rotation response', async t => {
+  for (const state of ['aborted', 'closed', 'expired']) await t.test(state, async () => {
+    const started = deferred(), released = deferred();
+    const f = fixture({ rotate: async value => { started.resolve(); await released.promise; return Response.json(value); } });
+    const operation = new AbortController(), client = await connectCorelyVmModelJobs(f.options);
+    const rotation = client.rotateAccess(operation.signal); await started.promise;
+    if (state === 'aborted') operation.abort();
+    if (state === 'closed') client.close();
+    if (state === 'expired') f.advanceMonotonic(86_400_000);
+    released.resolve();
+    await assert.rejects(rotation, isCode('ACCESS_ROTATION_RECOVERY_REQUIRED'));
+    assert.deepEqual(f.calls.slice(2).map(value => value.url), [`${ISSUER}/status`, `${ISSUER}/rotate`]);
+    await assert.rejects(client.claimModel('info'), isCode('GRANT_CLOSED'));
+  });
 });
 
 test('explicit revocation confirms only a complete empty 200 receipt and closes all local capabilities', async t => {
